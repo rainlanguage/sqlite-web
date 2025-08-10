@@ -1,8 +1,9 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { browser } from '$app/environment';
+    import init, { DatabaseConnection } from 'sqlite-worker';
     
-    let db: any = null;
+    let db: DatabaseConnection | null = null;
     let users: any[] = $state([]);
     let newUserName = $state('');
     let newUserEmail = $state('');
@@ -15,10 +16,7 @@
         try {
             status = 'Loading SQLite Worker...';
             
-            // Import our SQLite worker
-            const { default: init, DatabaseConnection } = await import('sqlite-worker');
-            
-            status = 'Initializing WASM...';
+            // Initialize the WASM module
             await init();
             
             status = 'Creating database connection...';

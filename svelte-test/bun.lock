@@ -5,7 +5,6 @@
       "name": "svelte-test",
       "dependencies": {
         "sqlite-worker": "../pkg/sqlite-worker-0.1.0.tgz",
-        "sqlite-worker": "../pkg/sqlite-worker-0.1.0.tgz",
       },
       "devDependencies": {
         "@sveltejs/adapter-auto": "^6.0.0",

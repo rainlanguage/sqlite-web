@@ -1,10 +1,10 @@
-use sqlite_wasm_rs::{self as ffi, sahpool_vfs::install as install_opfs_vfs};
+use sqlite_wasm_rs::export::{*, install_opfs_sahpool};
 use std::ffi::{CStr, CString};
 use wasm_bindgen::prelude::*;
 
 // Real SQLite database using sqlite-wasm-rs FFI
 pub struct SQLiteDatabase {
-    db: *mut ffi::sqlite3,
+    db: *mut sqlite3,
 }
 
 unsafe impl Send for SQLiteDatabase {}
@@ -15,7 +15,7 @@ impl SQLiteDatabase {
         web_sys::console::log_1(&"[Worker] Initializing SQLite with OPFS...".into());
 
         // Install OPFS VFS and set as default
-        install_opfs_vfs(None, true)
+        install_opfs_sahpool(None, true)
             .await
             .map_err(|e| JsValue::from_str(&format!("Failed to install OPFS VFS: {:?}", e)))?;
 
@@ -24,17 +24,17 @@ impl SQLiteDatabase {
         let db_name = CString::new("opfs-sahpool:worker.db").unwrap();
 
         let ret = unsafe {
-            ffi::sqlite3_open_v2(
+            sqlite3_open_v2(
                 db_name.as_ptr(),
                 &mut db as *mut _,
-                ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
                 std::ptr::null(),
             )
         };
 
-        if ret != ffi::SQLITE_OK {
+        if ret != SQLITE_OK {
             let error_msg = unsafe {
-                let ptr = ffi::sqlite3_errmsg(db);
+                let ptr = sqlite3_errmsg(db);
                 if !ptr.is_null() {
                     CStr::from_ptr(ptr).to_string_lossy().into_owned()
                 } else {
@@ -62,7 +62,7 @@ impl SQLiteDatabase {
 
         // Prepare statement
         let ret = unsafe {
-            ffi::sqlite3_prepare_v2(
+            sqlite3_prepare_v2(
                 self.db,
                 sql_cstr.as_ptr(),
                 -1,
@@ -71,9 +71,9 @@ impl SQLiteDatabase {
             )
         };
 
-        if ret != ffi::SQLITE_OK {
+        if ret != SQLITE_OK {
             let error_msg = unsafe {
-                let ptr = ffi::sqlite3_errmsg(self.db);
+                let ptr = sqlite3_errmsg(self.db);
                 if !ptr.is_null() {
                     CStr::from_ptr(ptr).to_string_lossy().into_owned()
                 } else {
@@ -89,16 +89,16 @@ impl SQLiteDatabase {
         let mut first_row = true;
 
         loop {
-            let step_result = unsafe { ffi::sqlite3_step(stmt) };
+            let step_result = unsafe { sqlite3_step(stmt) };
 
             match step_result {
-                ffi::SQLITE_ROW => {
+                SQLITE_ROW => {
                     if first_row {
                         // Get column names
-                        let col_count = unsafe { ffi::sqlite3_column_count(stmt) };
+                        let col_count = unsafe { sqlite3_column_count(stmt) };
                         for i in 0..col_count {
                             let col_name = unsafe {
-                                let ptr = ffi::sqlite3_column_name(stmt, i);
+                                let ptr = sqlite3_column_name(stmt, i);
                                 if !ptr.is_null() {
                                     CStr::from_ptr(ptr).to_string_lossy().into_owned()
                                 } else {
@@ -112,24 +112,24 @@ impl SQLiteDatabase {
 
                     // Get row data
                     let mut row_obj = std::collections::HashMap::new();
-                    let col_count = unsafe { ffi::sqlite3_column_count(stmt) };
+                    let col_count = unsafe { sqlite3_column_count(stmt) };
 
                     for i in 0..col_count {
-                        let col_type = unsafe { ffi::sqlite3_column_type(stmt, i) };
+                        let col_type = unsafe { sqlite3_column_type(stmt, i) };
                         let value = match col_type {
-                            ffi::SQLITE_INTEGER => {
-                                let val = unsafe { ffi::sqlite3_column_int64(stmt, i) };
+                            SQLITE_INTEGER => {
+                                let val = unsafe { sqlite3_column_int64(stmt, i) };
                                 serde_json::Value::Number(serde_json::Number::from(val))
                             }
-                            ffi::SQLITE_FLOAT => {
-                                let val = unsafe { ffi::sqlite3_column_double(stmt, i) };
+                            SQLITE_FLOAT => {
+                                let val = unsafe { sqlite3_column_double(stmt, i) };
                                 serde_json::Value::Number(
                                     serde_json::Number::from_f64(val)
                                         .unwrap_or(serde_json::Number::from(0)),
                                 )
                             }
-                            ffi::SQLITE_TEXT => {
-                                let ptr = unsafe { ffi::sqlite3_column_text(stmt, i) };
+                            SQLITE_TEXT => {
+                                let ptr = unsafe { sqlite3_column_text(stmt, i) };
                                 if !ptr.is_null() {
                                     let text = unsafe {
                                         CStr::from_ptr(ptr as *const i8)
@@ -141,8 +141,8 @@ impl SQLiteDatabase {
                                     serde_json::Value::Null
                                 }
                             }
-                            ffi::SQLITE_BLOB => {
-                                let len = unsafe { ffi::sqlite3_column_bytes(stmt, i) };
+                            SQLITE_BLOB => {
+                                let len = unsafe { sqlite3_column_bytes(stmt, i) };
                                 serde_json::Value::String(format!("<blob {} bytes>", len))
                             }
                             _ => serde_json::Value::Null,
@@ -155,10 +155,10 @@ impl SQLiteDatabase {
 
                     results.push(serde_json::Value::Object(row_obj.into_iter().collect()));
                 }
-                ffi::SQLITE_DONE => break,
+                SQLITE_DONE => break,
                 _ => {
                     let error_msg = unsafe {
-                        let ptr = ffi::sqlite3_errmsg(self.db);
+                        let ptr = sqlite3_errmsg(self.db);
                         if !ptr.is_null() {
                             CStr::from_ptr(ptr).to_string_lossy().into_owned()
                         } else {
@@ -166,7 +166,7 @@ impl SQLiteDatabase {
                         }
                     };
                     unsafe {
-                        ffi::sqlite3_finalize(stmt);
+                        sqlite3_finalize(stmt);
                     }
                     return Err(format!("Query execution failed: {}", error_msg));
                 }
@@ -175,7 +175,7 @@ impl SQLiteDatabase {
 
         // Cleanup
         unsafe {
-            ffi::sqlite3_finalize(stmt);
+            sqlite3_finalize(stmt);
         }
 
         // Return results
@@ -186,7 +186,7 @@ impl SQLiteDatabase {
             Ok("[]".to_string())
         } else {
             // For non-SELECT queries, return changes count
-            let changes = unsafe { ffi::sqlite3_changes(self.db) };
+            let changes = unsafe { sqlite3_changes(self.db) };
             Ok(format!(
                 "Query executed successfully. Rows affected: {}",
                 changes
@@ -199,7 +199,7 @@ impl Drop for SQLiteDatabase {
     fn drop(&mut self) {
         if !self.db.is_null() {
             unsafe {
-                ffi::sqlite3_close(self.db);
+                sqlite3_close(self.db);
             }
         }
     }

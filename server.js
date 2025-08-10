@@ -1,6 +1,6 @@
 // Simple static file server using Bun
 const server = Bun.serve({
-  port: 3000,
+  port: 3001,
   fetch(req) {
     const url = new URL(req.url);
     let filePath = url.pathname;
