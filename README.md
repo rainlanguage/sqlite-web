@@ -11,6 +11,279 @@ A production-ready WebAssembly SQLite implementation that runs entirely in the b
 - **Type-Safe Results** - JSON-formatted query results with proper column typing
 - **Zero External Dependencies** - Complete WASM module embedded in workers
 - **ES6 Module Support** - Modern import/export syntax for easy integration
+- **Modular Architecture** - Clean separation of concerns with focused modules
+
+## 📁 File Structure & Module Breakdown
+
+The codebase is organized into focused, single-responsibility modules:
+
+```
+src/
+├── lib.rs              # Main API - DatabaseConnection (100 lines)
+├── worker.rs           # Worker entry point & message handling (70 lines)
+├── messages.rs         # Message type definitions (50 lines)
+├── database.rs         # SQLite FFI implementation (175 lines)
+├── coordination.rs     # Worker state & leader election (175 lines)
+└── worker_template.rs  # JavaScript template generation (45 lines)
+```
+
+### Core Modules Explained
+
+#### 🔌 `lib.rs` - Main Thread API
+The public interface exposed to JavaScript applications.
+
+**Key Components:**
+- `DatabaseConnection` struct - Main API class
+- Worker creation with embedded WASM code
+- Promise-based query interface
+- Message handling for worker responses
+
+**Core Functionality:**
+```rust
+pub struct DatabaseConnection {
+    worker: Worker,                                           // Web Worker instance  
+    pending_queries: Rc<RefCell<Vec<(js_sys::Function, js_sys::Function)>>>, // Promise callbacks
+}
+
+impl DatabaseConnection {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Result<DatabaseConnection, JsValue>       // Creates worker with embedded WASM
+    
+    #[wasm_bindgen]
+    pub fn query(&self, sql: &str) -> js_sys::Promise         // Executes SQL and returns Promise
+}
+```
+
+**What it does:**
+1. Generates self-contained worker code using `worker_template::generate_self_contained_worker()`
+2. Creates a Blob URL from the worker code
+3. Spawns a Web Worker from the Blob URL
+4. Sets up message handling for query responses
+5. Provides the public `query()` method that sends SQL to the worker
+
+---
+
+#### 🔧 `worker.rs` - Worker Entry Point
+Minimal entry point that initializes the worker context.
+
+**Key Components:**
+- `worker_main()` - Entry function called by the worker template
+- Main thread message handling
+- Worker state initialization and coordination
+
+**Core Functionality:**
+```rust
+#[wasm_bindgen]
+pub fn worker_main() -> Result<(), JsValue> {
+    let state = Rc::new(WorkerState::new()?);         // Create worker state
+    state.setup_channel_listener();                   // Listen for inter-worker messages
+    spawn_local(async move {                          // Attempt leadership in background
+        state_clone.attempt_leadership().await;
+    });
+    // Setup main thread message handler...
+}
+```
+
+**What it does:**
+1. Creates a `WorkerState` instance for this worker
+2. Sets up BroadcastChannel listener for inter-worker communication  
+3. Attempts to become the database leader using Web Locks API
+4. Handles messages from the main thread (query requests)
+5. Delegates actual work to the coordination and database modules
+
+---
+
+#### 📨 `messages.rs` - Message Type Definitions
+Centralized message types for all communication channels.
+
+**Key Components:**
+- Inter-worker communication via BroadcastChannel
+- Main thread ↔ Worker communication
+- Query promise management
+
+**Core Types:**
+```rust
+// BroadcastChannel messages between workers
+pub enum ChannelMessage {
+    NewLeader { leader_id: String },               // Announce new database leader
+    QueryRequest { query_id: String, sql: String }, // Route query to leader
+    QueryResponse { query_id: String, result: Option<String>, error: Option<String> }, // Return results
+}
+
+// Messages from main thread
+pub enum WorkerMessage {
+    ExecuteQuery { sql: String },                  // Execute SQL query
+}
+
+// Messages to main thread  
+pub enum MainThreadMessage {
+    QueryResult { result: Option<String>, error: Option<String> }, // Query results
+    WorkerReady,                                   // Worker initialized
+}
+
+// Promise callback storage
+pub struct PendingQuery {
+    pub resolve: Function,                         // Success callback
+    pub reject: Function,                          // Error callback
+}
+```
+
+**What it does:**
+1. Defines all message types with Serde serialization
+2. Provides type safety for inter-process communication
+3. Handles promise callback storage for async queries
+4. Enables structured communication between main thread and workers
+
+---
+
+#### 🗄️ `database.rs` - SQLite Implementation
+Direct SQLite database operations using FFI bindings.
+
+**Key Components:**
+- OPFS (Origin Private File System) integration
+- Raw SQLite FFI operations
+- Query execution with typed results
+- Resource cleanup and memory management
+
+**Core Functionality:**
+```rust
+pub struct SQLiteDatabase {
+    db: *mut ffi::sqlite3,                         // Raw SQLite database pointer
+}
+
+impl SQLiteDatabase {
+    pub async fn initialize_opfs() -> Result<Self, JsValue> {
+        install_opfs_vfs(None, true).await?;      // Install OPFS virtual file system
+        // Open database with OPFS persistence...
+        let ret = unsafe { ffi::sqlite3_open_v2(...) };
+    }
+    
+    pub async fn exec(&self, sql: &str) -> Result<String, String> {
+        // Prepare statement
+        let ret = unsafe { ffi::sqlite3_prepare_v2(...) };
+        
+        // Execute and collect results
+        loop {
+            match unsafe { ffi::sqlite3_step(stmt) } {
+                ffi::SQLITE_ROW => {
+                    // Extract typed column data...
+                    let value = match col_type {
+                        ffi::SQLITE_INTEGER => serde_json::Value::Number(...),
+                        ffi::SQLITE_FLOAT => serde_json::Value::Number(...),
+                        ffi::SQLITE_TEXT => serde_json::Value::String(...),
+                        // ... handle all SQLite types
+                    };
+                }
+                ffi::SQLITE_DONE => break,
+            }
+        }
+        // Return JSON-serialized results...
+    }
+}
+```
+
+**What it does:**
+1. **OPFS Integration**: Sets up persistent storage that survives browser sessions
+2. **SQLite FFI**: Direct calls to SQLite C API through WebAssembly
+3. **Prepared Statements**: Compiles SQL for efficient repeated execution
+4. **Type Mapping**: Converts SQLite types (INTEGER, FLOAT, TEXT, BLOB) to JSON values
+5. **Memory Management**: Proper cleanup of SQLite resources via Drop trait
+6. **Result Formatting**: Returns JSON for SELECT queries, affected row counts for DML
+
+---
+
+#### 👑 `coordination.rs` - Worker Coordination & Leadership
+Manages multi-worker coordination, leader election, and query routing.
+
+**Key Components:**
+- Worker state management
+- Leader election using Web Locks API
+- BroadcastChannel communication
+- Query routing and timeout handling
+
+**Core Functionality:**
+```rust
+pub struct WorkerState {
+    pub worker_id: String,                         // Unique worker identifier
+    pub is_leader: Rc<RefCell<bool>>,             // Leadership status
+    pub db: Rc<RefCell<Option<SQLiteDatabase>>>,  // Database instance (only leader)
+    pub channel: BroadcastChannel,                // Inter-worker communication
+    pub pending_queries: Rc<RefCell<HashMap<String, PendingQuery>>>, // Query callbacks
+}
+
+impl WorkerState {
+    pub async fn attempt_leadership(&self) {
+        // Use Web Locks API for exclusive database access
+        let handler = Closure::once(move |_lock: JsValue| -> Promise {
+            *is_leader.borrow_mut() = true;
+            // Initialize database and hold lock forever...
+            Promise::new(&mut |_, _| {})           // Never resolve = permanent lock
+        });
+        navigator.locks.request("sqlite-database", { mode: "exclusive" }, handler);
+    }
+    
+    pub async fn execute_query(&self, sql: String) -> Result<String, String> {
+        if *self.is_leader.borrow() {
+            // Execute directly on local database
+            self.db.borrow().as_ref().unwrap().exec(&sql).await
+        } else {
+            // Route query to leader via BroadcastChannel
+            let query_id = Uuid::new_v4().to_string();
+            let msg = ChannelMessage::QueryRequest { query_id, sql };
+            self.channel.post_message(&serde_wasm_bindgen::to_value(&msg)?);
+            // Wait for response with timeout...
+        }
+    }
+}
+```
+
+**What it does:**
+1. **Leader Election**: Uses Web Locks API to ensure only one worker accesses the database
+2. **State Management**: Tracks worker ID, leadership status, and database connection
+3. **Query Routing**: Leaders execute queries locally, followers route to leader
+4. **BroadcastChannel**: Facilitates communication between workers in different tabs
+5. **Timeout Handling**: Prevents hung queries with 5-second timeout
+6. **Failover**: If leader dies, lock is released and another worker can become leader
+
+---
+
+#### 📝 `worker_template.rs` - Worker Code Generation
+Generates the JavaScript code that runs inside the Web Worker.
+
+**Key Components:**
+- Dynamic WASM loading template
+- Worker initialization sequence
+- Error handling for failed loads
+
+**Core Functionality:**
+```rust
+pub fn generate_self_contained_worker() -> String {
+    format!(r#"
+    // JavaScript code template
+    async function initializeWorker() {{
+        const baseUrl = self.location.origin;
+        const wasmModuleUrl = `${{baseUrl}}/pkg/sqlite_worker.js`;
+        
+        // Dynamic import of WASM module
+        const wasmModule = await import(wasmModuleUrl);
+        await wasmModule.default();              // Initialize WASM
+        
+        wasmModule.worker_main();                // Call Rust entry point
+        self.postMessage({{ type: 'worker-ready' }});
+    }}
+    
+    initializeWorker();
+    "#)
+}
+```
+
+**What it does:**
+1. **Template Generation**: Creates JavaScript code as a string
+2. **Dynamic Loading**: Uses absolute URLs to import WASM modules
+3. **WASM Initialization**: Calls the WASM default export to initialize
+4. **Rust Entry Point**: Calls `worker_main()` to start the Rust worker logic
+5. **Ready Signal**: Notifies main thread when worker is fully initialized
+6. **Error Handling**: Catches and reports initialization failures
 
 ## 🏗️ Architecture
 
