@@ -84,8 +84,8 @@ echo "🔄 Assembling final worker..."
   # Start with the template (everything before JS_GLUE_PLACEHOLDER)
   sed '/JS_GLUE_PLACEHOLDER/,$d' src/embedded_worker.js
   
-  # Add the JS glue code
-  cat pkg/sqlite_worker.js
+  # Add the JS glue code (convert exports to regular variables for worker context)
+  sed 's/^export function /function /; s/^export class /class /; s/^export { initSync };/self.initSync = initSync;/; s/^export default __wbg_init;/self.wasm_bindgen = __wbg_init;/; s/import\.meta\.url/self.location.href/g' pkg/sqlite_worker.js
   
   # Add the rest of the template (everything after JS_GLUE_PLACEHOLDER)
   sed '1,/JS_GLUE_PLACEHOLDER/d' src/embedded_worker.js

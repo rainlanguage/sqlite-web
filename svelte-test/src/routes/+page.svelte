@@ -144,11 +144,16 @@
         <div class="users-section">
             <div class="users-header">
                 <h3>Users ({users.length})</h3>
-                {#if users.length > 0}
-                    <button class="clear-btn" onclick={clearAll} disabled={isLoading}>
-                        Clear All
+                <div class="header-buttons">
+                    <button class="refresh-btn" onclick={loadUsers} disabled={isLoading}>
+                        {isLoading ? 'Loading...' : 'Refresh'}
                     </button>
-                {/if}
+                    {#if users.length > 0}
+                        <button class="clear-btn" onclick={clearAll} disabled={isLoading}>
+                            Clear All
+                        </button>
+                    {/if}
+                </div>
             </div>
 
             {#if isLoading}
@@ -179,17 +184,6 @@
             </div>
         </div>
 
-        <div class="info-box">
-            <h4>🎯 Features Demonstrated:</h4>
-            <ul>
-                <li>✅ Browser-native SQLite with OPFS persistence</li>
-                <li>✅ Multi-tab coordination with leader election</li>
-                <li>✅ Type-safe results with JSON serialization</li>
-                <li>✅ Real-time reactive UI updates</li>
-                <li>✅ Constraint handling (unique emails)</li>
-            </ul>
-            <p><strong>Try:</strong> Open multiple tabs to see multi-worker coordination in action!</p>
-        </div>
     {:else if status.includes('Failed')}
         <div class="error-state">
             <h3>❌ Initialization Failed</h3>
@@ -298,6 +292,30 @@
     .users-header h3 {
         margin: 0;
         color: #495057;
+    }
+
+    .header-buttons {
+        display: flex;
+        gap: 8px;
+    }
+
+    .refresh-btn {
+        background: #28a745;
+        color: white;
+        padding: 6px 12px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 12px;
+    }
+
+    .refresh-btn:hover:not(:disabled) {
+        background: #218838;
+    }
+
+    .refresh-btn:disabled {
+        background: #6c757d;
+        cursor: not-allowed;
     }
 
     .clear-btn {
@@ -470,6 +488,10 @@
             flex-direction: column;
             gap: 10px;
             align-items: stretch;
+        }
+
+        .header-buttons {
+            justify-content: center;
         }
     }
 </style>
