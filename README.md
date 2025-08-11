@@ -13,18 +13,33 @@ A production-ready WebAssembly SQLite implementation that runs entirely in the b
 - **ES6 Module Support** - Modern import/export syntax for easy integration
 - **Modular Architecture** - Clean separation of concerns with focused modules
 
-## 📁 File Structure & Module Breakdown
+## 📁 Project Structure & Module Breakdown
 
-The codebase is organized into focused, single-responsibility modules:
+The project consists of a Rust WebAssembly SQLite worker with a Svelte frontend integration:
 
 ```
-src/
-├── lib.rs              # Main API - DatabaseConnection (100 lines)
-├── worker.rs           # Worker entry point & message handling (70 lines)
-├── messages.rs         # Message type definitions (50 lines)
-├── database.rs         # SQLite FFI implementation (175 lines)
-├── coordination.rs     # Worker state & leader election (175 lines)
-└── worker_template.rs  # JavaScript template generation (45 lines)
+├── src/                        # Rust SQLite Worker (WASM)
+│   ├── lib.rs                  # Main API - DatabaseConnection (100 lines)
+│   ├── worker.rs               # Worker entry point & message handling (70 lines)
+│   ├── messages.rs             # Message type definitions (50 lines)
+│   ├── database.rs             # SQLite FFI implementation (175 lines)
+│   ├── coordination.rs         # Worker state & leader election (175 lines)
+│   └── worker_template.rs      # JavaScript template generation (45 lines)
+├── pkg/                        # Generated WASM package
+│   ├── sqlite_worker.js        # WASM bindings
+│   ├── sqlite_worker_bg.wasm   # WebAssembly binary
+│   └── sqlite_worker.d.ts      # TypeScript definitions
+├── svelte-test/                # Frontend Integration Example
+│   ├── src/
+│   │   ├── routes/
+│   │   │   ├── +page.svelte    # Main application page
+│   │   │   └── +layout.svelte  # Layout component
+│   │   └── lib/                # Shared utilities
+│   ├── package.json            # Svelte project config
+│   └── README.md               # Svelte-specific documentation
+├── server.js                   # Development server (Bun)
+├── test.html                   # Standalone test page
+└── test-embedded.html          # Alternative test implementation
 ```
 
 ### Core Modules Explained
@@ -441,6 +456,10 @@ cargo build
 
 # Generate WASM package for browser
 wasm-pack build --target web
+
+# Install frontend dependencies (Svelte)
+cd svelte-test
+bun install  # or npm install
 ```
 
 ### Production Build
@@ -450,11 +469,20 @@ cargo build --release --features embed_wasm
 
 # Generate optimized WASM package
 wasm-pack build --target web --release
+
+# Build frontend application
+cd svelte-test
+bun run build  # or npm run build
 ```
 
 ### Build Features
 - **`embed_wasm`** - Enables compile-time WASM embedding (currently unused due to circular dependency)
 - **`precompiled`** - Uses pre-built SQLite WASM instead of compiling from source
+
+### Development Workflow
+1. Build the WASM package: `wasm-pack build --target web`
+2. Start the development server: `bun server.js`
+3. For Svelte development: `cd svelte-test && bun run dev`
 
 ## 🖥️ Usage
 
@@ -610,13 +638,24 @@ The included `test.html` provides a comprehensive testing interface:
 - **Custom SQL** - Direct SQL execution with result display
 - **Error Scenarios** - Constraint violations, syntax errors, type mismatches
 
+### Svelte Integration Testing
+The `svelte-test/` directory contains a full SvelteKit application demonstrating integration:
+
+- **Framework Integration** - Shows how to use the SQLite worker in a modern frontend framework
+- **TypeScript Support** - Demonstrates type-safe usage with TypeScript definitions
+- **Component Architecture** - Example of integrating database operations in Svelte components
+- **Development Environment** - Hot reload and development server setup
+
 ### Test Commands
 ```bash
-# Start development server
+# Test standalone HTML page
 bun server.js
-
-# Open browser
 open http://localhost:3000
+
+# Test Svelte integration
+cd svelte-test
+bun run dev
+open http://localhost:5173
 ```
 
 ## 🔍 Troubleshooting
