@@ -219,7 +219,6 @@ mod tests {
         let db_error = SQLiteWasmDatabaseError::JsError(JsValue::from_str("Test error"));
         let js_value = JsValue::from(db_error);
 
-        // Should be a JsError object
         assert!(js_value.is_object());
     }
 
@@ -235,14 +234,13 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_sqlite_wasm_database_error_display() {
         let db_error = SQLiteWasmDatabaseError::JsError(JsValue::from_str("Display test"));
-        let error_string = format!("{}", db_error);
+        let error_string = format!("{db_error}");
 
         assert!(error_string.contains("JavaScript error"));
     }
 
     #[wasm_bindgen_test]
     fn test_sqlite_wasm_database_serialization() {
-        // Test that we can serialize the struct (should be empty)
         let db = SQLiteWasmDatabase::new().expect("Should create database");
         let serialized = serde_json::to_string(&db);
 
@@ -253,7 +251,6 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_sqlite_wasm_database_deserialization() {
-        // Test that we can deserialize (should create a new instance)
         let json_str = "{}";
         let result: Result<SQLiteWasmDatabase, _> = serde_json::from_str(json_str);
 
@@ -262,21 +259,13 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_sqlite_wasm_database_creation() {
-        // Test that database creation doesn't panic
         let result = SQLiteWasmDatabase::new();
 
-        // In browser environment, this should work
-        // In test environment without proper web worker support, it might fail
-        // But it shouldn't panic
         match result {
             Ok(_db) => {
-                // Success - worker was created successfully
-                assert!(true);
             }
             Err(e) => {
-                // Error is acceptable in test environment
-                // Just ensure the error is meaningful
-                let error_msg = format!("{:?}", e);
+                let error_msg = format!("{e:?}");
                 assert!(!error_msg.is_empty());
             }
         }
@@ -284,22 +273,15 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_query_message_format() {
-        // Test that we format query messages correctly
-        // This is more of an integration test that requires worker setup
 
         if let Ok(db) = SQLiteWasmDatabase::new() {
-            // Test with a simple query - this may fail in test environment
-            // but we can at least test that the method exists and handles errors gracefully
             let result = db.query("SELECT 1").await;
 
             match result {
                 Ok(_) => {
-                    // Success case - query worked
-                    assert!(true);
-                }
+                    }
                 Err(e) => {
-                    // Error case - should still be meaningful
-                    let error_msg = format!("{:?}", e);
+                    let error_msg = format!("{e:?}");
                     assert!(!error_msg.is_empty());
                 }
             }
@@ -308,13 +290,11 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_error_propagation_chain() {
-        // Test that errors propagate correctly through the chain
         let serde_error = serde_wasm_bindgen::Error::new("Test serde error");
         let db_error = SQLiteWasmDatabaseError::SerdeError(serde_error);
 
         match db_error {
             SQLiteWasmDatabaseError::SerdeError(_) => {
-                assert!(true); // Correct variant
             }
             _ => panic!("Expected SerdeError variant"),
         }
@@ -325,11 +305,9 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_worker_template_generation() {
-        // Test that worker template generation doesn't panic
         let worker_code = generate_self_contained_worker();
 
         assert!(!worker_code.is_empty());
-        // Should contain some expected JavaScript patterns
         assert!(
             worker_code.contains("importScripts")
                 || worker_code.contains("import")

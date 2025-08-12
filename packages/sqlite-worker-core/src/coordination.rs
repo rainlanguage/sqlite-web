@@ -239,23 +239,42 @@ mod tests {
     fn test_worker_state_creation_and_uniqueness() {
         let results: Vec<_> = (0..5).map(|_| WorkerState::new()).collect();
         let workers: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
-        
+
         assert!(!workers.is_empty(), "Should create at least one worker");
-        
+
         let state = &workers[0];
         assert!(!state.worker_id.is_empty(), "Worker ID should not be empty");
-        assert!(state.worker_id.contains('-'), "Worker ID should be valid UUID format");
-        assert!(!*state.is_leader.borrow(), "New workers should not start as leader");
-        assert!(state.db.borrow().is_none(), "Database should be uninitialized");
-        assert!(state.pending_queries.borrow().is_empty(), "Should have no pending queries");
-        
+        assert!(
+            state.worker_id.contains('-'),
+            "Worker ID should be valid UUID format"
+        );
+        assert!(
+            !*state.is_leader.borrow(),
+            "New workers should not start as leader"
+        );
+        assert!(
+            state.db.borrow().is_none(),
+            "Database should be uninitialized"
+        );
+        assert!(
+            state.pending_queries.borrow().is_empty(),
+            "Should have no pending queries"
+        );
+
         if workers.len() >= 2 {
             let mut ids = std::collections::HashSet::new();
             for worker in &workers {
-                assert!(ids.insert(worker.worker_id.clone()), 
-                    "Worker ID {} should be unique", worker.worker_id);
+                assert!(
+                    ids.insert(worker.worker_id.clone()),
+                    "Worker ID {} should be unique",
+                    worker.worker_id
+                );
                 assert_eq!(worker.worker_id.len(), 36, "UUID should be 36 characters");
-                assert_eq!(worker.worker_id.chars().filter(|&c| c == '-').count(), 4, "UUID should have 4 dashes");
+                assert_eq!(
+                    worker.worker_id.chars().filter(|&c| c == '-').count(),
+                    4,
+                    "UUID should have 4 dashes"
+                );
             }
             assert_eq!(ids.len(), workers.len(), "All worker IDs should be unique");
         }
@@ -265,10 +284,10 @@ mod tests {
     fn test_leadership_state_management() {
         if let Ok(state) = WorkerState::new() {
             assert!(!*state.is_leader.borrow(), "Should start as follower");
-            
+
             *state.is_leader.borrow_mut() = true;
             assert!(*state.is_leader.borrow(), "Should become leader");
-            
+
             *state.is_leader.borrow_mut() = false;
             assert!(!*state.is_leader.borrow(), "Should become follower again");
         }
@@ -278,42 +297,46 @@ mod tests {
     fn test_pending_queries_management() {
         if let Ok(state) = WorkerState::new() {
             let pending_queries = Rc::clone(&state.pending_queries);
-            
+
             assert_eq!(pending_queries.borrow().len(), 0);
-            
+
             let test_queries = vec!["query-a", "query-b", "query-c", "query-d", "query-e"];
             {
                 let mut queries = pending_queries.borrow_mut();
                 for query_id in &test_queries {
-                    let resolve = Function::new_no_args(&format!("return 'resolved-{}';", query_id));
+                    let resolve =
+                        Function::new_no_args(&format!("return 'resolved-{}';", query_id));
                     let reject = Function::new_no_args(&format!("return 'rejected-{}';", query_id));
                     queries.insert(query_id.to_string(), PendingQuery { resolve, reject });
                 }
             }
-            
+
             assert_eq!(pending_queries.borrow().len(), test_queries.len());
             for query_id in &test_queries {
                 assert!(pending_queries.borrow().contains_key(*query_id));
             }
-            
+
             for (i, query_id) in test_queries.iter().enumerate() {
                 if i % 2 == 0 {
                     let removed = pending_queries.borrow_mut().remove(*query_id);
                     assert!(removed.is_some(), "Should remove query {}", query_id);
                 }
             }
-            
+
             let remaining_count = test_queries.len() - (test_queries.len() + 1) / 2;
             assert_eq!(pending_queries.borrow().len(), remaining_count);
-            
+
             pending_queries.borrow_mut().clear();
             assert_eq!(pending_queries.borrow().len(), 0);
-            
+
             {
                 let mut queries = pending_queries.borrow_mut();
                 let resolve = Function::new_no_args("return 'post-cleanup';");
                 let reject = Function::new_no_args("return 'rejected';");
-                queries.insert("post-cleanup-test".to_string(), PendingQuery { resolve, reject });
+                queries.insert(
+                    "post-cleanup-test".to_string(),
+                    PendingQuery { resolve, reject },
+                );
             }
             assert_eq!(pending_queries.borrow().len(), 1);
             assert!(pending_queries.borrow().contains_key("post-cleanup-test"));
@@ -331,32 +354,44 @@ mod tests {
     async fn test_execute_query_leader_vs_follower_paths() {
         if let Ok(leader_state) = WorkerState::new() {
             *leader_state.is_leader.borrow_mut() = true;
-            
+
             let test_queries = vec![
-                "", 
-                "SELECT 1", 
+                "",
+                "SELECT 1",
                 "INSERT INTO test VALUES (1, 'hello')",
                 "SELECT 'test with spaces and symbols: !@#$%^&*()'",
                 "SELECT 'Hello 世界 🌍'",
             ];
-            
+
             for query in test_queries {
                 let result = leader_state.execute_query(query.to_string()).await;
                 match result {
-                    Err(msg) => assert_eq!(msg, "Database not initialized", 
-                        "Leader should get DB init error for query: {}", query),
-                    Ok(_) => panic!("Expected database not initialized error for query: {}", query),
+                    Err(msg) => assert_eq!(
+                        msg, "Database not initialized",
+                        "Leader should get DB init error for query: {}",
+                        query
+                    ),
+                    Ok(_) => panic!(
+                        "Expected database not initialized error for query: {}",
+                        query
+                    ),
                 }
             }
         }
-        
+
         if let Ok(follower_state) = WorkerState::new() {
-            assert!(!*follower_state.is_leader.borrow(), "Should start as follower");
-            
+            assert!(
+                !*follower_state.is_leader.borrow(),
+                "Should start as follower"
+            );
+
             let result = follower_state.execute_query("SELECT 1".to_string()).await;
             match result {
-                Err(msg) => assert!(msg.contains("timeout") || msg.contains("Query timeout"), 
-                    "Follower should timeout, got: {}", msg),
+                Err(msg) => assert!(
+                    msg.contains("timeout") || msg.contains("Query timeout"),
+                    "Follower should timeout, got: {}",
+                    msg
+                ),
                 Ok(_) => panic!("Expected timeout error for follower"),
             }
         }
@@ -373,17 +408,20 @@ mod tests {
     async fn test_attempt_leadership_behavior() {
         if let Ok(state) = WorkerState::new() {
             assert!(!*state.is_leader.borrow(), "Should start as follower");
-            assert!(state.db.borrow().is_none(), "Database should be uninitialized");
-            
+            assert!(
+                state.db.borrow().is_none(),
+                "Database should be uninitialized"
+            );
+
             state.attempt_leadership().await;
         }
-        
+
         let workers: Vec<_> = (0..3).filter_map(|_| WorkerState::new().ok()).collect();
         if workers.len() >= 2 {
             for worker in &workers {
                 assert!(!*worker.is_leader.borrow(), "All should start as followers");
             }
-            
+
             for worker in &workers {
                 worker.attempt_leadership().await;
             }
@@ -395,19 +433,31 @@ mod tests {
         if let Ok(state) = WorkerState::new() {
             let is_leader_clone = Rc::clone(&state.is_leader);
             let pending_clone = Rc::clone(&state.pending_queries);
-            
+
             assert_eq!(*state.is_leader.borrow(), *is_leader_clone.borrow());
-            assert_eq!(state.pending_queries.borrow().len(), pending_clone.borrow().len());
-            
+            assert_eq!(
+                state.pending_queries.borrow().len(),
+                pending_clone.borrow().len()
+            );
+
             *state.is_leader.borrow_mut() = true;
-            assert!(*is_leader_clone.borrow(), "Changes should be visible through cloned Rc");
-            
+            assert!(
+                *is_leader_clone.borrow(),
+                "Changes should be visible through cloned Rc"
+            );
+
             {
                 let resolve = Function::new_no_args("return 'resolved';");
                 let reject = Function::new_no_args("return 'rejected';");
-                pending_clone.borrow_mut().insert("test-ref".to_string(), PendingQuery { resolve, reject });
+                pending_clone
+                    .borrow_mut()
+                    .insert("test-ref".to_string(), PendingQuery { resolve, reject });
             }
-            assert_eq!(state.pending_queries.borrow().len(), 1, "Should see changes through original Rc");
+            assert_eq!(
+                state.pending_queries.borrow().len(),
+                1,
+                "Should see changes through original Rc"
+            );
         }
     }
 }

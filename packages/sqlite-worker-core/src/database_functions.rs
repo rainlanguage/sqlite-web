@@ -15,7 +15,7 @@ unsafe extern "C" fn rain_math_process(
     if argc != 2 {
         sqlite3_result_error(
             context,
-            "rain_math_process() requires exactly 2 arguments\0".as_ptr() as *const c_char,
+            c"rain_math_process() requires exactly 2 arguments".as_ptr(),
             -1,
         );
         return;
@@ -40,17 +40,17 @@ unsafe extern "C" fn rain_math_process(
     let input1_u256 = match U256::from_str(&input1_str) {
         Ok(u) => u,
         Err(e) => {
-            let error_msg = format!("Failed to parse first argument as U256: {}\0", e);
+            let error_msg = format!("Failed to parse first argument as U256: {e}\0");
             sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
     };
 
     // Convert strings to Float using rain-math-float
-    let float1 = match Float::from_hex(&format!("{:#066x}", input1_u256)) {
+    let float1 = match Float::from_hex(&format!("{input1_u256:#066x}")) {
         Ok(f) => f,
         Err(e) => {
-            let error_msg = format!("Failed to parse first argument as Float: {}\0", e);
+            let error_msg = format!("Failed to parse first argument as Float: {e}\0");
             sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
@@ -59,16 +59,16 @@ unsafe extern "C" fn rain_math_process(
     let input2_u256 = match U256::from_str(&input2_str) {
         Ok(u) => u,
         Err(e) => {
-            let error_msg = format!("Failed to parse second argument as U256: {}\0", e);
+            let error_msg = format!("Failed to parse second argument as U256: {e}\0");
             sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
     };
 
-    let float2 = match Float::from_hex(&format!("{:#066x}", input2_u256)) {
+    let float2 = match Float::from_hex(&format!("{input2_u256:#066x}")) {
         Ok(f) => f,
         Err(e) => {
-            let error_msg = format!("Failed to parse second argument as Float: {}\0", e);
+            let error_msg = format!("Failed to parse second argument as Float: {e}\0");
             sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
@@ -78,7 +78,7 @@ unsafe extern "C" fn rain_math_process(
     let result = match float1.add(float2) {
         Ok(r) => r,
         Err(e) => {
-            let error_msg = format!("Failed to add Float values: {}\0", e);
+            let error_msg = format!("Failed to add Float values: {e}\0");
             sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
@@ -88,7 +88,7 @@ unsafe extern "C" fn rain_math_process(
     let result_str = match result.format() {
         Ok(s) => s,
         Err(e) => {
-            let error_msg = format!("Failed to format result as string: {}\0", e);
+            let error_msg = format!("Failed to format result as string: {e}\0");
             sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
@@ -99,7 +99,7 @@ unsafe extern "C" fn rain_math_process(
         context,
         result_cstring.as_ptr(),
         result_cstring.as_bytes().len() as c_int,
-        Some(std::mem::transmute(-1isize)), // SQLITE_TRANSIENT
+        Some(std::mem::transmute::<isize, unsafe extern "C" fn(*mut std::ffi::c_void)>(-1isize)), // SQLITE_TRANSIENT
     );
 }
 
@@ -137,11 +137,9 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_u256_hex_conversion() {
-        // Test the hex conversion logic used in rain_math_process
         let test_value = U256::from(12345u64);
-        let hex_str = format!("{:#066x}", test_value);
+        let hex_str = format!("{test_value:#066x}");
 
-        // Should be 66 characters (0x + 64 hex digits)
         assert_eq!(hex_str.len(), 66);
         assert!(hex_str.starts_with("0x"));
         assert!(hex_str.contains("3039")); // 12345 in hex is 0x3039
@@ -169,9 +167,8 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_rain_float_integration_valid_inputs() {
-        // Test that we can create Float from valid U256 hex strings
         let u256_val = U256::from(42u64);
-        let hex_str = format!("{:#066x}", u256_val);
+        let hex_str = format!("{u256_val:#066x}");
 
         let float_result = Float::from_hex(&hex_str);
         assert!(
@@ -182,7 +179,6 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_rain_float_integration_invalid_hex() {
-        // Test error handling for invalid hex strings
         let invalid_hex = "0xinvalid";
         let float_result = Float::from_hex(invalid_hex);
         assert!(float_result.is_err(), "Should fail for invalid hex string");
@@ -190,12 +186,11 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_rain_float_addition() {
-        // Test that Float addition works as expected
         let val1 = U256::from(10u64);
         let val2 = U256::from(20u64);
 
-        let hex1 = format!("{:#066x}", val1);
-        let hex2 = format!("{:#066x}", val2);
+        let hex1 = format!("{val1:#066x}");
+        let hex2 = format!("{val2:#066x}");
 
         let float1 = Float::from_hex(&hex1).expect("Should create float1");
         let float2 = Float::from_hex(&hex2).expect("Should create float2");
@@ -203,7 +198,6 @@ mod tests {
         let result = float1.add(float2);
         assert!(result.is_ok(), "Float addition should succeed");
 
-        // Format the result and check it represents 30
         let formatted = result.unwrap().format();
         assert!(formatted.is_ok(), "Should be able to format result");
         assert_eq!(formatted.unwrap(), "30", "Result should be 30");
@@ -211,18 +205,15 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_error_messages_for_edge_cases() {
-        // Test that error messages are meaningful for edge cases
         let max_u256 = U256::MAX;
-        let hex_str = format!("{:#066x}", max_u256);
+        let hex_str = format!("{max_u256:#066x}");
 
-        // This should work fine - MAX U256 should be valid
         let float_result = Float::from_hex(&hex_str);
         assert!(float_result.is_ok(), "MAX U256 should be valid for Float");
     }
 
     #[wasm_bindgen_test]
     fn test_cstring_conversion() {
-        // Test that our string conversions work correctly for SQLite
         let test_string = "test string with spaces and symbols!@#$%";
         let c_string_result = CString::new(test_string);
         assert!(
@@ -236,7 +227,6 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_cstring_with_null_bytes() {
-        // Test edge case - strings with null bytes should fail
         let string_with_null = "test\0string";
         let c_string_result = CString::new(string_with_null);
         assert!(

@@ -56,18 +56,19 @@ mod tests {
     use super::*;
     use wasm_bindgen_test::*;
 
-    // These tests don't require browser environment - just serde functionality
     wasm_bindgen_test_configure!(run_in_browser);
 
-    fn assert_serialization_roundtrip<T: Serialize + for<'a> Deserialize<'a> + PartialEq + std::fmt::Debug>(
+    fn assert_serialization_roundtrip<
+        T: Serialize + for<'a> Deserialize<'a> + PartialEq + std::fmt::Debug,
+    >(
         msg: T,
         expected_type: &str,
         additional_checks: impl Fn(&str),
     ) {
         let json = serde_json::to_string(&msg).expect("Should serialize");
-        assert!(json.contains(&format!("\"type\":\"{}\"", expected_type)));
+        assert!(json.contains(&format!("\"type\":\"{expected_type}\"")));
         additional_checks(&json);
-        
+
         let deserialized: T = serde_json::from_str(&json).expect("Should deserialize");
         assert_eq!(msg, deserialized);
     }
@@ -156,7 +157,6 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_edge_cases() {
-        // Empty strings
         let empty_leader = ChannelMessage::NewLeader {
             leader_id: String::new(),
         };
@@ -172,7 +172,6 @@ mod tests {
             assert!(json.contains("\"sql\":\"\""));
         });
 
-        // Special characters
         let special_chars = ChannelMessage::QueryRequest {
             query_id: "query\"with\"quotes".to_string(),
             sql: "SELECT 'test\nwith\nnewlines'".to_string(),
@@ -183,7 +182,10 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_invalid_deserialization() {
         let test_cases = vec![
-            (r#"{"type": "unknown-type", "data": "test"}"#, "unknown message type"),
+            (
+                r#"{"type": "unknown-type", "data": "test"}"#,
+                "unknown message type",
+            ),
             (r#"{"invalid": "json"}"#, "missing type field"),
             (r#"{"type": "new-leader"}"#, "missing required fields"),
             (r#"invalid json"#, "malformed JSON"),

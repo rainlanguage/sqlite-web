@@ -26,8 +26,5 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn worker_main_does_not_panic() {
-        // Basic smoke test to ensure worker_main doesn't panic on setup
-        // The actual worker logic runs in async context, this just tests basic initialization
-        assert!(true); // worker_main() should not panic
     }
 }
