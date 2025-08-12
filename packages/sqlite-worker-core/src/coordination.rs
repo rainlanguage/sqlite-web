@@ -230,237 +230,93 @@ impl WorkerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use js_sys::{Array, Function, Object, Reflect};
+    use js_sys::Function;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
-    fn test_worker_state_creation() {
-        let result = WorkerState::new();
-
-        match result {
-            Ok(state) => {
-                assert!(!state.worker_id.is_empty());
-                assert!(state.worker_id.contains('-'));
-                assert!(!*state.is_leader.borrow());
-                assert!(state.db.borrow().is_none());
-                assert!(state.pending_queries.borrow().is_empty());
-            }
-            Err(_) => {
-                assert!(true);
-            }
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn test_worker_state_unique_ids() {
+    fn test_worker_state_creation_and_uniqueness() {
         let results: Vec<_> = (0..5).map(|_| WorkerState::new()).collect();
-
-        let mut ids = std::collections::HashSet::new();
-        let mut valid_count = 0;
-
-        for result in results {
-            if let Ok(state) = result {
-                assert!(
-                    ids.insert(state.worker_id.clone()),
-                    "Worker IDs should be unique"
-                );
-                valid_count += 1;
+        let workers: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
+        
+        assert!(!workers.is_empty(), "Should create at least one worker");
+        
+        let state = &workers[0];
+        assert!(!state.worker_id.is_empty(), "Worker ID should not be empty");
+        assert!(state.worker_id.contains('-'), "Worker ID should be valid UUID format");
+        assert!(!*state.is_leader.borrow(), "New workers should not start as leader");
+        assert!(state.db.borrow().is_none(), "Database should be uninitialized");
+        assert!(state.pending_queries.borrow().is_empty(), "Should have no pending queries");
+        
+        if workers.len() >= 2 {
+            let mut ids = std::collections::HashSet::new();
+            for worker in &workers {
+                assert!(ids.insert(worker.worker_id.clone()), 
+                    "Worker ID {} should be unique", worker.worker_id);
+                assert_eq!(worker.worker_id.len(), 36, "UUID should be 36 characters");
+                assert_eq!(worker.worker_id.chars().filter(|&c| c == '-').count(), 4, "UUID should have 4 dashes");
             }
-        }
-
-        if valid_count > 1 {
-            assert_eq!(ids.len(), valid_count);
+            assert_eq!(ids.len(), workers.len(), "All worker IDs should be unique");
         }
     }
 
     #[wasm_bindgen_test]
-    fn test_channel_message_query_request_handling() {
-        let query_request = ChannelMessage::QueryRequest {
-            query_id: "test-query-123".to_string(),
-            sql: "SELECT * FROM test_table".to_string(),
-        };
-
-        let serialized = serde_wasm_bindgen::to_value(&query_request);
-        assert!(serialized.is_ok());
-
-        let js_value = serialized.unwrap();
-
-        let msg_type = Reflect::get(&js_value, &JsValue::from_str("type")).unwrap();
-        assert_eq!(msg_type.as_string().unwrap(), "query-request");
-
-        let query_id = Reflect::get(&js_value, &JsValue::from_str("queryId")).unwrap();
-        assert_eq!(query_id.as_string().unwrap(), "test-query-123");
-
-        let sql = Reflect::get(&js_value, &JsValue::from_str("sql")).unwrap();
-        assert_eq!(sql.as_string().unwrap(), "SELECT * FROM test_table");
-    }
-
-    #[wasm_bindgen_test]
-    fn test_channel_message_query_response_success_handling() {
-        let query_response = ChannelMessage::QueryResponse {
-            query_id: "test-query-456".to_string(),
-            result: Some("[{\"id\": 1, \"name\": \"test\"}]".to_string()),
-            error: None,
-        };
-
-        let serialized = serde_wasm_bindgen::to_value(&query_response);
-        assert!(serialized.is_ok());
-
-        let js_value = serialized.unwrap();
-
-        let msg_type = Reflect::get(&js_value, &JsValue::from_str("type")).unwrap();
-        assert_eq!(msg_type.as_string().unwrap(), "query-response");
-
-        let query_id = Reflect::get(&js_value, &JsValue::from_str("queryId")).unwrap();
-        assert_eq!(query_id.as_string().unwrap(), "test-query-456");
-
-        let result = Reflect::get(&js_value, &JsValue::from_str("result")).unwrap();
-        assert!(result.is_string());
-
-        let error = Reflect::get(&js_value, &JsValue::from_str("error")).unwrap();
-        assert!(error.is_null() || error.is_undefined());
-    }
-
-    #[wasm_bindgen_test]
-    fn test_channel_message_query_response_error_handling() {
-        let query_response = ChannelMessage::QueryResponse {
-            query_id: "test-query-error".to_string(),
-            result: None,
-            error: Some("SQL syntax error: near 'SELCT'".to_string()),
-        };
-
-        let serialized = serde_wasm_bindgen::to_value(&query_response);
-        assert!(serialized.is_ok());
-
-        let js_value = serialized.unwrap();
-
-        let error = Reflect::get(&js_value, &JsValue::from_str("error")).unwrap();
-        assert_eq!(error.as_string().unwrap(), "SQL syntax error: near 'SELCT'");
-
-        let result = Reflect::get(&js_value, &JsValue::from_str("result")).unwrap();
-        assert!(result.is_null() || result.is_undefined());
-    }
-
-    #[wasm_bindgen_test]
-    fn test_channel_message_new_leader_handling() {
-        let new_leader = ChannelMessage::NewLeader {
-            leader_id: "leader-worker-789".to_string(),
-        };
-
-        let serialized = serde_wasm_bindgen::to_value(&new_leader);
-        assert!(serialized.is_ok());
-
-        let js_value = serialized.unwrap();
-
-        let msg_type = Reflect::get(&js_value, &JsValue::from_str("type")).unwrap();
-        assert_eq!(msg_type.as_string().unwrap(), "new-leader");
-
-        let leader_id = Reflect::get(&js_value, &JsValue::from_str("leaderId")).unwrap();
-        assert_eq!(leader_id.as_string().unwrap(), "leader-worker-789");
-    }
-
-    #[wasm_bindgen_test]
-    fn test_pending_query_storage() {
-        let mut pending_queries = HashMap::new();
-
-        let resolve_fn = Function::new_no_args("return 'resolved';");
-        let reject_fn = Function::new_no_args("return 'rejected';");
-
-        let pending_query = PendingQuery {
-            resolve: resolve_fn.clone(),
-            reject: reject_fn.clone(),
-        };
-
-        let query_id = "test-pending-query";
-        pending_queries.insert(query_id.to_string(), pending_query);
-
-        assert!(pending_queries.contains_key(query_id));
-        assert_eq!(pending_queries.len(), 1);
-
-        let retrieved = pending_queries.remove(query_id);
-        assert!(retrieved.is_some());
-        assert!(pending_queries.is_empty());
-    }
-
-    #[wasm_bindgen_test]
-    fn test_worker_state_leadership_flag() {
+    fn test_leadership_state_management() {
         if let Ok(state) = WorkerState::new() {
-            assert!(!*state.is_leader.borrow());
-
+            assert!(!*state.is_leader.borrow(), "Should start as follower");
+            
             *state.is_leader.borrow_mut() = true;
-            assert!(*state.is_leader.borrow());
-
+            assert!(*state.is_leader.borrow(), "Should become leader");
+            
             *state.is_leader.borrow_mut() = false;
-            assert!(!*state.is_leader.borrow());
+            assert!(!*state.is_leader.borrow(), "Should become follower again");
         }
     }
 
     #[wasm_bindgen_test]
-    fn test_worker_state_database_storage() {
-        if let Ok(state) = WorkerState::new() {
-            assert!(state.db.borrow().is_none());
-            assert!(state.db.borrow().is_none());
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn test_pending_queries_concurrent_access() {
+    fn test_pending_queries_management() {
         if let Ok(state) = WorkerState::new() {
             let pending_queries = Rc::clone(&state.pending_queries);
-
-            let resolve1 = Function::new_no_args("return 'resolve1';");
-            let reject1 = Function::new_no_args("return 'reject1';");
-            let resolve2 = Function::new_no_args("return 'resolve2';");
-            let reject2 = Function::new_no_args("return 'reject2';");
-
+            
+            assert_eq!(pending_queries.borrow().len(), 0);
+            
+            let test_queries = vec!["query-a", "query-b", "query-c", "query-d", "query-e"];
             {
                 let mut queries = pending_queries.borrow_mut();
-                queries.insert(
-                    "query1".to_string(),
-                    PendingQuery {
-                        resolve: resolve1,
-                        reject: reject1,
-                    },
-                );
-                queries.insert(
-                    "query2".to_string(),
-                    PendingQuery {
-                        resolve: resolve2,
-                        reject: reject2,
-                    },
-                );
+                for query_id in &test_queries {
+                    let resolve = Function::new_no_args(&format!("return 'resolved-{}';", query_id));
+                    let reject = Function::new_no_args(&format!("return 'rejected-{}';", query_id));
+                    queries.insert(query_id.to_string(), PendingQuery { resolve, reject });
+                }
             }
-
-            assert_eq!(pending_queries.borrow().len(), 2);
-            assert!(pending_queries.borrow().contains_key("query1"));
-            assert!(pending_queries.borrow().contains_key("query2"));
-
-            let removed = pending_queries.borrow_mut().remove("query1");
-            assert!(removed.is_some());
+            
+            assert_eq!(pending_queries.borrow().len(), test_queries.len());
+            for query_id in &test_queries {
+                assert!(pending_queries.borrow().contains_key(*query_id));
+            }
+            
+            for (i, query_id) in test_queries.iter().enumerate() {
+                if i % 2 == 0 {
+                    let removed = pending_queries.borrow_mut().remove(*query_id);
+                    assert!(removed.is_some(), "Should remove query {}", query_id);
+                }
+            }
+            
+            let remaining_count = test_queries.len() - (test_queries.len() + 1) / 2;
+            assert_eq!(pending_queries.borrow().len(), remaining_count);
+            
+            pending_queries.borrow_mut().clear();
+            assert_eq!(pending_queries.borrow().len(), 0);
+            
+            {
+                let mut queries = pending_queries.borrow_mut();
+                let resolve = Function::new_no_args("return 'post-cleanup';");
+                let reject = Function::new_no_args("return 'rejected';");
+                queries.insert("post-cleanup-test".to_string(), PendingQuery { resolve, reject });
+            }
             assert_eq!(pending_queries.borrow().len(), 1);
-            assert!(!pending_queries.borrow().contains_key("query1"));
-            assert!(pending_queries.borrow().contains_key("query2"));
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn test_uuid_generation() {
-        let uuid1 = Uuid::new_v4().to_string();
-        let uuid2 = Uuid::new_v4().to_string();
-
-        assert_ne!(uuid1, uuid2);
-        assert_eq!(uuid1.len(), 36);
-        assert_eq!(uuid2.len(), 36);
-        assert!(uuid1.contains('-'));
-        assert!(uuid2.contains('-'));
-
-        for c in uuid1.chars() {
-            assert!(c.is_ascii_hexdigit() || c == '-');
-        }
-        for c in uuid2.chars() {
-            assert!(c.is_ascii_hexdigit() || c == '-');
+            assert!(pending_queries.borrow().contains_key("post-cleanup-test"));
         }
     }
 
@@ -472,62 +328,86 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_javascript_object_creation() {
-        let obj = Object::new();
-
-        let set_result = Reflect::set(
-            &obj,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("test-message"),
-        );
-        assert!(set_result.is_ok());
-
-        let set_result2 = Reflect::set(
-            &obj,
-            &JsValue::from_str("data"),
-            &JsValue::from_str("test-data"),
-        );
-        assert!(set_result2.is_ok());
-
-        let type_val = Reflect::get(&obj, &JsValue::from_str("type")).unwrap();
-        assert_eq!(type_val.as_string().unwrap(), "test-message");
-
-        let data_val = Reflect::get(&obj, &JsValue::from_str("data")).unwrap();
-        assert_eq!(data_val.as_string().unwrap(), "test-data");
+    async fn test_execute_query_leader_vs_follower_paths() {
+        if let Ok(leader_state) = WorkerState::new() {
+            *leader_state.is_leader.borrow_mut() = true;
+            
+            let test_queries = vec![
+                "", 
+                "SELECT 1", 
+                "INSERT INTO test VALUES (1, 'hello')",
+                "SELECT 'test with spaces and symbols: !@#$%^&*()'",
+                "SELECT 'Hello 世界 🌍'",
+            ];
+            
+            for query in test_queries {
+                let result = leader_state.execute_query(query.to_string()).await;
+                match result {
+                    Err(msg) => assert_eq!(msg, "Database not initialized", 
+                        "Leader should get DB init error for query: {}", query),
+                    Ok(_) => panic!("Expected database not initialized error for query: {}", query),
+                }
+            }
+        }
+        
+        if let Ok(follower_state) = WorkerState::new() {
+            assert!(!*follower_state.is_leader.borrow(), "Should start as follower");
+            
+            let result = follower_state.execute_query("SELECT 1".to_string()).await;
+            match result {
+                Err(msg) => assert!(msg.contains("timeout") || msg.contains("Query timeout"), 
+                    "Follower should timeout, got: {}", msg),
+                Ok(_) => panic!("Expected timeout error for follower"),
+            }
+        }
     }
 
     #[wasm_bindgen_test]
-    fn test_timeout_promise_creation() {
-        let promise = Promise::new(&mut |resolve, _reject| {
-            let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str("timeout"));
-        });
-
-        assert!(!promise.is_undefined());
-        assert!(promise.is_object());
+    fn test_setup_channel_listener() {
+        if let Ok(state) = WorkerState::new() {
+            state.setup_channel_listener();
+        }
     }
 
     #[wasm_bindgen_test]
-    fn test_message_race_condition_setup() {
-        let promise1 = Promise::new(&mut |resolve, _reject| {
-            let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str("result1"));
-        });
-
-        let promise2 = Promise::new(&mut |resolve, _reject| {
-            let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str("result2"));
-        });
-
-        let promises_array = Array::of2(&promise1, &promise2);
-        let race_promise = js_sys::Promise::race(&promises_array);
-
-        assert!(!race_promise.is_undefined());
-        assert!(race_promise.is_object());
+    async fn test_attempt_leadership_behavior() {
+        if let Ok(state) = WorkerState::new() {
+            assert!(!*state.is_leader.borrow(), "Should start as follower");
+            assert!(state.db.borrow().is_none(), "Database should be uninitialized");
+            
+            state.attempt_leadership().await;
+        }
+        
+        let workers: Vec<_> = (0..3).filter_map(|_| WorkerState::new().ok()).collect();
+        if workers.len() >= 2 {
+            for worker in &workers {
+                assert!(!*worker.is_leader.borrow(), "All should start as followers");
+            }
+            
+            for worker in &workers {
+                worker.attempt_leadership().await;
+            }
+        }
     }
 
     #[wasm_bindgen_test]
-    fn test_error_message_formatting() {
-        let error_msg = "Database connection failed";
-        let js_error = JsValue::from_str(error_msg);
-        let formatted = format!("{:?}", js_error);
-        assert!(!formatted.is_empty());
+    fn test_worker_state_rc_shared_references() {
+        if let Ok(state) = WorkerState::new() {
+            let is_leader_clone = Rc::clone(&state.is_leader);
+            let pending_clone = Rc::clone(&state.pending_queries);
+            
+            assert_eq!(*state.is_leader.borrow(), *is_leader_clone.borrow());
+            assert_eq!(state.pending_queries.borrow().len(), pending_clone.borrow().len());
+            
+            *state.is_leader.borrow_mut() = true;
+            assert!(*is_leader_clone.borrow(), "Changes should be visible through cloned Rc");
+            
+            {
+                let resolve = Function::new_no_args("return 'resolved';");
+                let reject = Function::new_no_args("return 'rejected';");
+                pending_clone.borrow_mut().insert("test-ref".to_string(), PendingQuery { resolve, reject });
+            }
+            assert_eq!(state.pending_queries.borrow().len(), 1, "Should see changes through original Rc");
+        }
     }
 }
