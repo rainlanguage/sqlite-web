@@ -7,6 +7,7 @@ use web_sys::{Blob, BlobPropertyBag, MessageEvent, Url, Worker};
 
 mod coordination;
 mod database;
+mod database_functions;
 mod messages;
 mod worker;
 mod worker_template;

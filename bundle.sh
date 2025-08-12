@@ -3,6 +3,14 @@ set -e
 
 echo "🔨 Building SQLite Worker with embedded WASM..."
 
+# Clean up pkg directory first for a clean slate
+echo "🧹 Cleaning up pkg directory..."
+rm -rf pkg/*.tgz 2>/dev/null || true
+
+# Clear embedded_worker.js file contents first
+echo "🧹 Clearing embedded_worker.js..."
+echo "" > src/embedded_worker.js
+
 # Build with web target for better bundler compatibility
 echo "📦 Building WASM with web target..."
 wasm-pack build --target web --out-dir pkg
@@ -101,3 +109,20 @@ echo "📊 JS glue code lines: $(wc -l < pkg/sqlite_worker.js)"
 echo ""
 echo "🚀 Your SQLite worker is now fully self-contained!"
 echo "   No external dependencies required - everything is embedded in the worker blob."
+
+# Run wasm-pack again to use the populated embedded_worker.js file
+echo "📦 Running wasm-pack build again with populated embedded_worker.js..."
+wasm-pack build --target web --out-dir pkg
+
+# Package the result
+echo "📦 Packaging with npm pack..."
+cd pkg
+npm pack
+cd ..
+
+# Update Svelte integration with fresh package
+echo "🔄 Updating Svelte integration..."
+cd svelte-test
+bun remove sqlite-worker
+rm -rf node_modules
+bun add ../pkg/sqlite-worker-*.tgz

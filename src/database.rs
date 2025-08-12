@@ -1,6 +1,7 @@
 use sqlite_wasm_rs::export::{*, install_opfs_sahpool};
 use std::ffi::{CStr, CString};
 use wasm_bindgen::prelude::*;
+use crate::database_functions::register_custom_functions;
 
 // Real SQLite database using sqlite-wasm-rs FFI
 pub struct SQLiteDatabase {
@@ -50,6 +51,11 @@ impl SQLiteDatabase {
         web_sys::console::log_1(
             &"[Worker] SQLite database initialized successfully with OPFS".into(),
         );
+
+        // Register custom functions
+        register_custom_functions(db).map_err(|e| JsValue::from_str(&e))?;
+
+        web_sys::console::log_1(&"[Worker] Custom functions registered".into());
 
         Ok(SQLiteDatabase { db })
     }
