@@ -6,7 +6,6 @@ use std::ops::Add;
 use std::os::raw::c_char;
 use std::str::FromStr;
 
-
 // Custom function using rain-math-float library - sums two Float values
 unsafe extern "C" fn rain_math_process(
     context: *mut sqlite3_context,
@@ -104,7 +103,6 @@ unsafe extern "C" fn rain_math_process(
     );
 }
 
-
 /// Register all custom functions with the SQLite database
 pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
     // Register rain_math_process function
@@ -137,13 +135,12 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-
     #[wasm_bindgen_test]
     fn test_u256_hex_conversion() {
         // Test the hex conversion logic used in rain_math_process
         let test_value = U256::from(12345u64);
         let hex_str = format!("{:#066x}", test_value);
-        
+
         // Should be 66 characters (0x + 64 hex digits)
         assert_eq!(hex_str.len(), 66);
         assert!(hex_str.starts_with("0x"));
@@ -175,9 +172,12 @@ mod tests {
         // Test that we can create Float from valid U256 hex strings
         let u256_val = U256::from(42u64);
         let hex_str = format!("{:#066x}", u256_val);
-        
+
         let float_result = Float::from_hex(&hex_str);
-        assert!(float_result.is_ok(), "Should be able to create Float from valid hex");
+        assert!(
+            float_result.is_ok(),
+            "Should be able to create Float from valid hex"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -193,16 +193,16 @@ mod tests {
         // Test that Float addition works as expected
         let val1 = U256::from(10u64);
         let val2 = U256::from(20u64);
-        
+
         let hex1 = format!("{:#066x}", val1);
         let hex2 = format!("{:#066x}", val2);
-        
+
         let float1 = Float::from_hex(&hex1).expect("Should create float1");
         let float2 = Float::from_hex(&hex2).expect("Should create float2");
-        
+
         let result = float1.add(float2);
         assert!(result.is_ok(), "Float addition should succeed");
-        
+
         // Format the result and check it represents 30
         let formatted = result.unwrap().format();
         assert!(formatted.is_ok(), "Should be able to format result");
@@ -214,7 +214,7 @@ mod tests {
         // Test that error messages are meaningful for edge cases
         let max_u256 = U256::MAX;
         let hex_str = format!("{:#066x}", max_u256);
-        
+
         // This should work fine - MAX U256 should be valid
         let float_result = Float::from_hex(&hex_str);
         assert!(float_result.is_ok(), "MAX U256 should be valid for Float");
@@ -225,8 +225,11 @@ mod tests {
         // Test that our string conversions work correctly for SQLite
         let test_string = "test string with spaces and symbols!@#$%";
         let c_string_result = CString::new(test_string);
-        assert!(c_string_result.is_ok(), "Should be able to convert to CString");
-        
+        assert!(
+            c_string_result.is_ok(),
+            "Should be able to convert to CString"
+        );
+
         let c_string = c_string_result.unwrap();
         assert_eq!(c_string.to_string_lossy(), test_string);
     }
@@ -236,6 +239,9 @@ mod tests {
         // Test edge case - strings with null bytes should fail
         let string_with_null = "test\0string";
         let c_string_result = CString::new(string_with_null);
-        assert!(c_string_result.is_err(), "Strings with null bytes should fail CString conversion");
+        assert!(
+            c_string_result.is_err(),
+            "Strings with null bytes should fail CString conversion"
+        );
     }
 }

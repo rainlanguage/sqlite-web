@@ -116,7 +116,11 @@ mod tests {
 
         let deserialized: ChannelMessage = serde_json::from_str(&json).expect("Should deserialize");
         match deserialized {
-            ChannelMessage::QueryResponse { query_id, result, error } => {
+            ChannelMessage::QueryResponse {
+                query_id,
+                result,
+                error,
+            } => {
                 assert_eq!(query_id, "query-789");
                 assert!(result.is_some());
                 assert!(error.is_none());
@@ -140,7 +144,11 @@ mod tests {
 
         let deserialized: ChannelMessage = serde_json::from_str(&json).expect("Should deserialize");
         match deserialized {
-            ChannelMessage::QueryResponse { query_id, result, error } => {
+            ChannelMessage::QueryResponse {
+                query_id,
+                result,
+                error,
+            } => {
                 assert_eq!(query_id, "query-error");
                 assert!(result.is_none());
                 assert_eq!(error.unwrap(), "SQL syntax error");
@@ -178,7 +186,8 @@ mod tests {
         assert!(json.contains("\"type\":\"query-result\""));
         assert!(json.contains("\"result\":\"Success\""));
 
-        let deserialized: MainThreadMessage = serde_json::from_str(&json).expect("Should deserialize");
+        let deserialized: MainThreadMessage =
+            serde_json::from_str(&json).expect("Should deserialize");
         match deserialized {
             MainThreadMessage::QueryResult { result, error } => {
                 assert_eq!(result.unwrap(), "Success");
@@ -195,7 +204,8 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("Should serialize");
         assert!(json.contains("\"type\":\"worker-ready\""));
 
-        let deserialized: MainThreadMessage = serde_json::from_str(&json).expect("Should deserialize");
+        let deserialized: MainThreadMessage =
+            serde_json::from_str(&json).expect("Should deserialize");
         match deserialized {
             MainThreadMessage::WorkerReady => {
                 // Success
@@ -207,7 +217,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_invalid_message_deserialization() {
         let invalid_json = r#"{"type": "unknown-type", "data": "test"}"#;
-        
+
         // Should fail gracefully for unknown message types
         let result = serde_json::from_str::<ChannelMessage>(invalid_json);
         assert!(result.is_err());
