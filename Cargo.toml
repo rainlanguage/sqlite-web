@@ -33,6 +33,7 @@ console_error_panic_hook = "0.1"
 base64 = "0.21"  # For embedding WASM as base64
 sqlite-wasm-rs = { version = "=0.3.0", default-features = false, features = ["precompiled"] }
 rain-math-float = { path = "lib/rain.math.float/crates/float"}
+alloy = { version = "1.0.9", features = ["sol-types", "json", "json-abi"] }
 
 [features]
 default = []

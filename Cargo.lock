@@ -4053,6 +4053,7 @@ dependencies = [
 name = "sqlite-worker"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "base64 0.21.7",
  "console_error_panic_hook",
  "js-sys",

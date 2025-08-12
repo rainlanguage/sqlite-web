@@ -1,8 +1,10 @@
+use alloy::primitives::U256;
 use sqlite_wasm_rs::export::*;
 use std::ffi::{c_int, CStr, CString};
 use std::os::raw::c_char;
 use rain_math_float::Float;
 use std::ops::Add;
+use std::str::FromStr;
 
 // Custom function - alternates case (1st lowercase, 2nd uppercase, 3rd lowercase, etc.)
 unsafe extern "C" fn alternating_case_function(
@@ -83,8 +85,21 @@ unsafe extern "C" fn rain_math_process(
     }
     let input2_str = CStr::from_ptr(input2 as *const c_char).to_string_lossy();
 
+    let input1_u256 = match U256::from_str(&input1_str) {
+        Ok(u) => u,
+        Err(e) => {
+            let error_msg = format!("Failed to parse first argument as U256: {}\0", e);
+            sqlite3_result_error(
+                context,
+                error_msg.as_ptr() as *const c_char,
+                -1,
+            );
+            return;
+        }
+    };
+
     // Convert strings to Float using rain-math-float
-    let float1 = match Float::parse(input1_str.to_string()) {
+    let float1 = match Float::from_hex(&format!("{:#066x}", input1_u256)) {
         Ok(f) => f,
         Err(e) => {
             let error_msg = format!("Failed to parse first argument as Float: {}\0", e);
@@ -97,7 +112,20 @@ unsafe extern "C" fn rain_math_process(
         }
     };
 
-    let float2 = match Float::parse(input2_str.to_string()) {
+    let input2_u256 = match U256::from_str(&input2_str) {
+        Ok(u) => u,
+        Err(e) => {
+            let error_msg = format!("Failed to parse second argument as U256: {}\0", e);
+            sqlite3_result_error(
+                context,
+                error_msg.as_ptr() as *const c_char,
+                -1,
+            );
+            return;
+        }
+    };
+
+    let float2 = match Float::from_hex(&format!("{:#066x}", input2_u256)) {
         Ok(f) => f,
         Err(e) => {
             let error_msg = format!("Failed to parse second argument as Float: {}\0", e);
