@@ -73,7 +73,6 @@ impl DatabaseConnection {
     /// Create a new database connection with fully embedded worker
     #[wasm_export(js_name = "new", preserve_js_class)]
     pub fn new() -> Result<DatabaseConnection, DatabaseConnectionError> {
-        web_sys::console::log_1(&"Creating self-contained worker...".into());
 
         // Create the worker with embedded WASM and glue code
         let worker_code = generate_self_contained_worker();
@@ -108,14 +107,10 @@ impl DatabaseConnection {
             if let Ok(obj) = js_sys::Reflect::get(&data, &JsValue::from_str("type")) {
                 if let Some(msg_type) = obj.as_string() {
                     if msg_type == "worker-ready" {
-                        web_sys::console::log_1(&"✅ Worker is ready!".into());
                         return;
                     } else if msg_type == "worker-error" {
                         if let Ok(error) = js_sys::Reflect::get(&data, &JsValue::from_str("error"))
                         {
-                            web_sys::console::error_1(
-                                &format!("❌ Worker error: {:?}", error).into(),
-                            );
                         }
                         return;
                     }

@@ -16,7 +16,6 @@ thread_local! {
 pub fn main() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
 
-    web_sys::console::log_1(&"[Worker] Starting worker_main...".into());
 
     let state = Rc::new(WorkerState::new()?);
 

@@ -24,7 +24,6 @@ impl WorkerState {
         let worker_id = Uuid::new_v4().to_string();
         let channel = BroadcastChannel::new("sqlite-queries")?;
 
-        web_sys::console::log_1(&format!("[Worker {}] Initialized", worker_id).into());
 
         Ok(WorkerState {
             worker_id,
@@ -94,9 +93,6 @@ impl WorkerState {
                         }
                     }
                     ChannelMessage::NewLeader { leader_id } => {
-                        web_sys::console::log_1(
-                            &format!("[Worker] New leader: {}", leader_id).into(),
-                        );
                     }
                 }
             }
@@ -113,7 +109,6 @@ impl WorkerState {
         let db = Rc::clone(&self.db);
         let channel = self.channel.clone();
 
-        web_sys::console::log_1(&format!("[Worker {}] Attempting leadership...", worker_id).into());
 
         // Get navigator.locks from WorkerGlobalScope
         let global = js_sys::global();
@@ -129,7 +124,6 @@ impl WorkerState {
         .unwrap();
 
         let handler = Closure::once(move |_lock: JsValue| -> Promise {
-            web_sys::console::log_1(&format!("[Worker {}] Became leader!", worker_id).into());
 
             *is_leader.borrow_mut() = true;
 
@@ -149,9 +143,6 @@ impl WorkerState {
                         let _ = channel.post_message(&msg_js);
                     }
                     Err(e) => {
-                        web_sys::console::error_1(
-                            &format!("Failed to initialize DB: {:?}", e).into(),
-                        );
                     }
                 }
             });

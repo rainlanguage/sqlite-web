@@ -13,7 +13,6 @@ unsafe impl Sync for SQLiteDatabase {}
 
 impl SQLiteDatabase {
     pub async fn initialize_opfs() -> Result<Self, JsValue> {
-        web_sys::console::log_1(&"[Worker] Initializing SQLite with OPFS...".into());
 
         // Install OPFS VFS and set as default
         install_opfs_sahpool(None, true)
@@ -48,20 +47,15 @@ impl SQLiteDatabase {
             )));
         }
 
-        web_sys::console::log_1(
-            &"[Worker] SQLite database initialized successfully with OPFS".into(),
-        );
 
         // Register custom functions
         register_custom_functions(db).map_err(|e| JsValue::from_str(&e))?;
 
-        web_sys::console::log_1(&"[Worker] Custom functions registered".into());
 
         Ok(SQLiteDatabase { db })
     }
 
     pub async fn exec(&self, sql: &str) -> Result<String, String> {
-        web_sys::console::log_1(&format!("[Worker] Executing SQL: {}", sql).into());
 
         let sql_cstr = CString::new(sql).map_err(|e| format!("Invalid SQL string: {}", e))?;
         let mut stmt = std::ptr::null_mut();
