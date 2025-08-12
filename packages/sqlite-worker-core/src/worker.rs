@@ -16,7 +16,6 @@ thread_local! {
 pub fn main() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
 
-
     let state = Rc::new(WorkerState::new()?);
 
     state.setup_channel_listener();

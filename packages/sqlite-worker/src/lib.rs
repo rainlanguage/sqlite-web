@@ -34,7 +34,7 @@ impl<'de> Deserialize<'de> for SQLiteWasmDatabase {
     {
         let _ = deserializer.deserialize_any(IgnoredAny)?;
         Self::new().map_err(|e| {
-            serde::de::Error::custom(format!("Failed to create SQLiteWasmDatabase: {:?}", e))
+            serde::de::Error::custom(format!("Failed to create SQLiteWasmDatabase: {e:?}"))
         })
     }
 }
@@ -127,7 +127,7 @@ impl SQLiteWasmDatabase {
                             {
                                 if !error.is_null() && !error.is_undefined() {
                                     let error_str =
-                                        error.as_string().unwrap_or_else(|| format!("{:?}", error));
+                                        error.as_string().unwrap_or_else(|| format!("{error:?}"));
                                     let _ = reject
                                         .call1(&JsValue::NULL, &JsValue::from_str(&error_str));
                                     return;
@@ -139,9 +139,8 @@ impl SQLiteWasmDatabase {
                                 js_sys::Reflect::get(&data, &JsValue::from_str("result"))
                             {
                                 if !result.is_null() && !result.is_undefined() {
-                                    let result_str = result
-                                        .as_string()
-                                        .unwrap_or_else(|| format!("{:?}", result));
+                                    let result_str =
+                                        result.as_string().unwrap_or_else(|| format!("{result:?}"));
                                     let _ = resolve
                                         .call1(&JsValue::NULL, &JsValue::from_str(&result_str));
                                 }
@@ -191,8 +190,6 @@ impl SQLiteWasmDatabase {
         });
 
         let result = JsFuture::from(promise).await?;
-        Ok(result
-            .as_string()
-            .unwrap_or_else(|| format!("{:?}", result)))
+        Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
     }
 }
