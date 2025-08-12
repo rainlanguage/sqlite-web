@@ -20,5 +20,8 @@ sqlite-wasm-rs = { workspace = true }
 rain-math-float = { path = "../../lib/rain.math.float/crates/float"}
 alloy = { workspace = true }
 
+[dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+
 [features]
 default = []

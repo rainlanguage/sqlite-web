@@ -2,6 +2,7 @@
     "editor.rulers": [
         80
     ],
+    "rust-analyzer.cargo.target": "wasm32-unknown-unknown",
     "rust-analyzer.linkedProjects": [
         "./Cargo.toml",
         "./packages/sqlite-worker-core/Cargo.toml",

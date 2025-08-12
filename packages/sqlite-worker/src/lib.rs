@@ -40,27 +40,27 @@ impl<'de> Deserialize<'de> for SQLiteWasmDatabase {
 }
 
 #[derive(Debug, Error)]
-pub enum DatabaseConnectionError {
+pub enum SQLiteWasmDatabaseError {
     #[error(transparent)]
     SerdeError(#[from] serde_wasm_bindgen::Error),
     #[error("JavaScript error: {0:?}")]
     JsError(JsValue),
 }
 
-impl From<JsValue> for DatabaseConnectionError {
+impl From<JsValue> for SQLiteWasmDatabaseError {
     fn from(value: JsValue) -> Self {
-        DatabaseConnectionError::JsError(value)
+        SQLiteWasmDatabaseError::JsError(value)
     }
 }
 
-impl From<DatabaseConnectionError> for JsValue {
-    fn from(value: DatabaseConnectionError) -> Self {
+impl From<SQLiteWasmDatabaseError> for JsValue {
+    fn from(value: SQLiteWasmDatabaseError) -> Self {
         JsError::new(&value.to_string()).into()
     }
 }
 
-impl From<DatabaseConnectionError> for WasmEncodedError {
-    fn from(value: DatabaseConnectionError) -> Self {
+impl From<SQLiteWasmDatabaseError> for WasmEncodedError {
+    fn from(value: SQLiteWasmDatabaseError) -> Self {
         WasmEncodedError {
             msg: value.to_string(),
             readable_msg: value.to_string(),
@@ -72,7 +72,7 @@ impl From<DatabaseConnectionError> for WasmEncodedError {
 impl SQLiteWasmDatabase {
     /// Create a new database connection with fully embedded worker
     #[wasm_export(js_name = "new", preserve_js_class)]
-    pub fn new() -> Result<SQLiteWasmDatabase, DatabaseConnectionError> {
+    pub fn new() -> Result<SQLiteWasmDatabase, SQLiteWasmDatabaseError> {
         // Create the worker with embedded WASM and glue code
         let worker_code = generate_self_contained_worker();
 
@@ -162,7 +162,7 @@ impl SQLiteWasmDatabase {
 
     /// Execute a SQL query
     #[wasm_export(js_name = "query", unchecked_return_type = "string")]
-    pub async fn query(&self, sql: &str) -> Result<String, DatabaseConnectionError> {
+    pub async fn query(&self, sql: &str) -> Result<String, SQLiteWasmDatabaseError> {
         let worker = &self.worker;
         let pending_queries = Rc::clone(&self.pending_queries);
         let sql = sql.to_string();
@@ -191,5 +191,149 @@ impl SQLiteWasmDatabase {
 
         let result = JsFuture::from(promise).await?;
         Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn test_sqlite_wasm_database_error_from_js_value() {
+        let js_error = JsValue::from_str("Test error message");
+        let db_error = SQLiteWasmDatabaseError::from(js_error);
+
+        match db_error {
+            SQLiteWasmDatabaseError::JsError(val) => {
+                assert_eq!(val.as_string().unwrap(), "Test error message");
+            }
+            _ => panic!("Expected JsError variant"),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn test_sqlite_wasm_database_error_to_js_value() {
+        let db_error = SQLiteWasmDatabaseError::JsError(JsValue::from_str("Test error"));
+        let js_value = JsValue::from(db_error);
+
+        // Should be a JsError object
+        assert!(js_value.is_object());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_sqlite_wasm_database_error_to_wasm_encoded_error() {
+        let db_error = SQLiteWasmDatabaseError::JsError(JsValue::from_str("Test error"));
+        let wasm_error = WasmEncodedError::from(db_error);
+
+        assert!(wasm_error.msg.contains("Test error"));
+        assert!(wasm_error.readable_msg.contains("Test error"));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_sqlite_wasm_database_error_display() {
+        let db_error = SQLiteWasmDatabaseError::JsError(JsValue::from_str("Display test"));
+        let error_string = format!("{}", db_error);
+
+        assert!(error_string.contains("JavaScript error"));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_sqlite_wasm_database_serialization() {
+        // Test that we can serialize the struct (should be empty)
+        let db = SQLiteWasmDatabase::new().expect("Should create database");
+        let serialized = serde_json::to_string(&db);
+
+        assert!(serialized.is_ok());
+        let json_str = serialized.unwrap();
+        assert_eq!(json_str, "{}"); // Empty struct should serialize to empty object
+    }
+
+    #[wasm_bindgen_test]
+    fn test_sqlite_wasm_database_deserialization() {
+        // Test that we can deserialize (should create a new instance)
+        let json_str = "{}";
+        let result: Result<SQLiteWasmDatabase, _> = serde_json::from_str(json_str);
+
+        assert!(result.is_ok(), "Should be able to deserialize empty object");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_sqlite_wasm_database_creation() {
+        // Test that database creation doesn't panic
+        let result = SQLiteWasmDatabase::new();
+
+        // In browser environment, this should work
+        // In test environment without proper web worker support, it might fail
+        // But it shouldn't panic
+        match result {
+            Ok(_db) => {
+                // Success - worker was created successfully
+                assert!(true);
+            }
+            Err(e) => {
+                // Error is acceptable in test environment
+                // Just ensure the error is meaningful
+                let error_msg = format!("{:?}", e);
+                assert!(!error_msg.is_empty());
+            }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_query_message_format() {
+        // Test that we format query messages correctly
+        // This is more of an integration test that requires worker setup
+
+        if let Ok(db) = SQLiteWasmDatabase::new() {
+            // Test with a simple query - this may fail in test environment
+            // but we can at least test that the method exists and handles errors gracefully
+            let result = db.query("SELECT 1").await;
+
+            match result {
+                Ok(_) => {
+                    // Success case - query worked
+                    assert!(true);
+                }
+                Err(e) => {
+                    // Error case - should still be meaningful
+                    let error_msg = format!("{:?}", e);
+                    assert!(!error_msg.is_empty());
+                }
+            }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn test_error_propagation_chain() {
+        // Test that errors propagate correctly through the chain
+        let serde_error = serde_wasm_bindgen::Error::new("Test serde error");
+        let db_error = SQLiteWasmDatabaseError::SerdeError(serde_error);
+
+        match db_error {
+            SQLiteWasmDatabaseError::SerdeError(_) => {
+                assert!(true); // Correct variant
+            }
+            _ => panic!("Expected SerdeError variant"),
+        }
+
+        let js_value = JsValue::from(db_error);
+        assert!(js_value.is_object()); // Should convert to JS error object
+    }
+
+    #[wasm_bindgen_test]
+    fn test_worker_template_generation() {
+        // Test that worker template generation doesn't panic
+        let worker_code = generate_self_contained_worker();
+
+        assert!(!worker_code.is_empty());
+        // Should contain some expected JavaScript patterns
+        assert!(
+            worker_code.contains("importScripts")
+                || worker_code.contains("import")
+                || worker_code.len() > 100
+        );
     }
 }

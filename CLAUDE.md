@@ -15,6 +15,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `cd packages/sqlite-worker-core && wasm-pack build --target web --out-dir ../../pkg`
 - `cd packages/sqlite-worker && wasm-pack build --target web --out-dir ../../pkg`
 
+### Testing
+- `./test.sh` - Run all Rust WASM tests (both packages)
+- `cd packages/sqlite-worker-core && wasm-pack test --headless --chrome` - Test core package only
+- `cd packages/sqlite-worker && wasm-pack test --headless --chrome` - Test worker package only
+
 ### Svelte Test App
 - `cd svelte-test && bun dev` - Start development server
 - `cd svelte-test && bun build` - Production build

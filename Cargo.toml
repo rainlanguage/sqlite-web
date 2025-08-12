@@ -41,6 +41,7 @@ thiserror = "2.0.12"
 proptest = "1.7.0"
 revm = { version = "25.0.0", default-features = false }
 wasm-bindgen-utils = { git = "https://github.com/rainlanguage/rain.wasm", rev = "06990d85a0b7c55378a1c8cca4dd9e2bc34a596a" }
+wasm-bindgen-test = "0.3"
 
 [profile.release]
 opt-level = "z"

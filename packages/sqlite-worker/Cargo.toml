@@ -18,3 +18,7 @@ thiserror = { workspace = true }
 
 [features]
 default = []
+
+[dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+serde_json = { workspace = true }
