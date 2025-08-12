@@ -12,29 +12,29 @@ mod worker_template;
 use worker_template::generate_self_contained_worker;
 
 #[wasm_bindgen]
-pub struct DatabaseConnection {
+pub struct SQLiteWasmDatabase {
     worker: Worker,
     pending_queries: Rc<RefCell<Vec<(js_sys::Function, js_sys::Function)>>>,
 }
 
-impl Serialize for DatabaseConnection {
+impl Serialize for SQLiteWasmDatabase {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let state = serializer.serialize_struct("DatabaseConnection", 0)?;
+        let state = serializer.serialize_struct("SQLiteWasmDatabase", 0)?;
         state.end()
     }
 }
-impl<'de> Deserialize<'de> for DatabaseConnection {
+impl<'de> Deserialize<'de> for SQLiteWasmDatabase {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let _ = deserializer.deserialize_any(IgnoredAny)?;
         Self::new().map_err(|e| {
-            serde::de::Error::custom(format!("Failed to create DatabaseConnection: {:?}", e))
+            serde::de::Error::custom(format!("Failed to create SQLiteWasmDatabase: {:?}", e))
         })
     }
 }
@@ -69,10 +69,10 @@ impl From<DatabaseConnectionError> for WasmEncodedError {
 }
 
 #[wasm_export]
-impl DatabaseConnection {
+impl SQLiteWasmDatabase {
     /// Create a new database connection with fully embedded worker
     #[wasm_export(js_name = "new", preserve_js_class)]
-    pub fn new() -> Result<DatabaseConnection, DatabaseConnectionError> {
+    pub fn new() -> Result<SQLiteWasmDatabase, DatabaseConnectionError> {
 
         // Create the worker with embedded WASM and glue code
         let worker_code = generate_self_contained_worker();
@@ -109,7 +109,7 @@ impl DatabaseConnection {
                     if msg_type == "worker-ready" {
                         return;
                     } else if msg_type == "worker-error" {
-                        if let Ok(error) = js_sys::Reflect::get(&data, &JsValue::from_str("error"))
+                        if let Ok(_error) = js_sys::Reflect::get(&data, &JsValue::from_str("error"))
                         {
                         }
                         return;
@@ -156,7 +156,7 @@ impl DatabaseConnection {
         worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
 
-        Ok(DatabaseConnection {
+        Ok(SQLiteWasmDatabase {
             worker,
             pending_queries,
         })

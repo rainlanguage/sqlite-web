@@ -1,9 +1,9 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { browser } from '$app/environment';
-    import init, { DatabaseConnection } from 'sqlite-worker';
+    import init, { SQLiteWasmDatabase } from 'sqlite-worker';
     
-    let db: DatabaseConnection | null = null;
+    let db: SQLiteWasmDatabase | undefined;
     let sqlQuery = $state('SELECT * FROM users;');
     let queryResult = $state<any[] | null>(null);
     let status = $state('Initializing...');
@@ -19,7 +19,12 @@
             await init();
             
             status = 'Creating database connection...';
-            db = new DatabaseConnection();
+            let res = SQLiteWasmDatabase.new();
+            if (res.error) {
+                status = `Failed to create database connection: ${res.error.msg}`;
+                return;
+            }
+            db = res.value;
             
             status = 'Waiting for worker to be ready...';
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -51,7 +56,7 @@
             const result = await db.query(sqlQuery.trim());
             
             try {
-                queryResult = JSON.parse(result);
+                queryResult = JSON.parse(result.value);
             } catch {
                 queryResult = [{ result }];
             }

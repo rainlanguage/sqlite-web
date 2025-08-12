@@ -40,7 +40,7 @@ This is a **Rust WebAssembly SQLite Worker** project with a workspace architectu
 #### 2. `packages/sqlite-worker/`
 - **Purpose**: Public API that creates self-contained workers with embedded core
 - **Key files**:
-  - `lib.rs` - `DatabaseConnection` struct with async query interface
+  - `lib.rs` - `SQLiteWasmDatabase` struct with async query interface
   - `worker_template.rs` - Generates self-contained worker JavaScript
   - `embedded_worker.js` - Generated template with embedded WASM
 - **Pattern**: Creates blob URLs from JavaScript code that includes base64-encoded WASM

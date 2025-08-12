@@ -92,7 +92,7 @@ impl WorkerState {
                             }
                         }
                     }
-                    ChannelMessage::NewLeader { leader_id } => {
+                    ChannelMessage::NewLeader { leader_id: _ } => {
                     }
                 }
             }
@@ -142,7 +142,7 @@ impl WorkerState {
                         let msg_js = serde_wasm_bindgen::to_value(&msg).unwrap();
                         let _ = channel.post_message(&msg_js);
                     }
-                    Err(e) => {
+                    Err(_e) => {
                     }
                 }
             });

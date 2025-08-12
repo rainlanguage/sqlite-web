@@ -1,9 +1,9 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { browser } from '$app/environment';
-    import init, { DatabaseConnection } from 'sqlite-worker';
+    import init, { SQLiteWasmDatabase } from 'sqlite-worker';
     
-    let db: DatabaseConnection | undefined;
+    let db: SQLiteWasmDatabase | undefined;
     let users: any[] = $state([]);
     let newUserName = $state('');
     let newUserEmail = $state('');
@@ -20,7 +20,7 @@
             await init();
             
             status = 'Creating database connection...';
-            let res = DatabaseConnection.new();
+            let res = SQLiteWasmDatabase.new();
             if (res.error) {
                 throw new Error('Failed to create database connection');
             }
