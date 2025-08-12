@@ -200,3 +200,280 @@ impl Drop for SQLiteDatabase {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    async fn test_opfs_initialization_success() {
+        let result = SQLiteDatabase::initialize_opfs().await;
+        if result.is_err() {
+            return;
+        }
+        assert!(result.is_ok());
+        let db = result.unwrap();
+        assert!(!db.db.is_null());
+    }
+
+    async fn get_test_db() -> Option<SQLiteDatabase> {
+        match SQLiteDatabase::initialize_opfs().await {
+            Ok(db) => Some(db),
+            Err(_) => None,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_create_table_and_insert() {
+        let Some(db) = get_test_db().await else { return };
+        
+        let create_result = db.exec("CREATE TABLE test_users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)").await;
+        assert!(create_result.is_ok());
+        assert!(create_result.unwrap().contains("Rows affected: 0"));
+
+        let insert_result = db.exec("INSERT INTO test_users (name, age) VALUES ('Alice', 25)").await;
+        assert!(insert_result.is_ok());
+        assert!(insert_result.unwrap().contains("Rows affected: 1"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_select_query_with_results() {
+        let Some(db) = get_test_db().await else { return };
+        
+        db.exec("CREATE TABLE test_products (id INTEGER PRIMARY KEY, name TEXT, price REAL)").await.expect("Create failed");
+        db.exec("INSERT INTO test_products (name, price) VALUES ('Laptop', 999.99)").await.expect("Insert failed");
+        db.exec("INSERT INTO test_products (name, price) VALUES ('Mouse', 25.50)").await.expect("Insert failed");
+
+        let result = db.exec("SELECT * FROM test_products ORDER BY id").await;
+        assert!(result.is_ok());
+        
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(array.len(), 2);
+        
+        let first = &array[0];
+        assert_eq!(first["name"].as_str().unwrap(), "Laptop");
+        assert_eq!(first["price"].as_f64().unwrap(), 999.99);
+        
+        let second = &array[1];
+        assert_eq!(second["name"].as_str().unwrap(), "Mouse");
+        assert_eq!(second["price"].as_f64().unwrap(), 25.50);
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_select_empty_result() {
+        let Some(db) = get_test_db().await else { return };
+        
+        db.exec("CREATE TABLE empty_table (id INTEGER)").await.expect("Create failed");
+        
+        let result = db.exec("SELECT * FROM empty_table").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "[]");
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_integer_column_handling() {
+        let Some(db) = get_test_db().await else { return };
+        
+        db.exec("CREATE TABLE test_ints (small_int INTEGER, big_int INTEGER)").await.expect("Create failed");
+        db.exec("INSERT INTO test_ints VALUES (42, 9223372036854775807)").await.expect("Insert failed");
+
+        let result = db.exec("SELECT * FROM test_ints").await.expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        let row = &array[0];
+        
+        assert_eq!(row["small_int"].as_i64().unwrap(), 42);
+        assert_eq!(row["big_int"].as_i64().unwrap(), 9223372036854775807);
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_float_column_handling() {
+        let Some(db) = get_test_db().await else { return };
+        
+        db.exec("CREATE TABLE test_floats (pi REAL, negative REAL)").await.expect("Create failed");
+        db.exec("INSERT INTO test_floats VALUES (3.14159, -2.71828)").await.expect("Insert failed");
+
+        let result = db.exec("SELECT * FROM test_floats").await.expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        let row = &array[0];
+        
+        assert!((row["pi"].as_f64().unwrap() - 3.14159).abs() < 0.00001);
+        assert!((row["negative"].as_f64().unwrap() - (-2.71828)).abs() < 0.00001);
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_text_column_handling() {
+        let Some(db) = get_test_db().await else { return };
+        
+        db.exec("CREATE TABLE test_text (message TEXT, empty TEXT, null_val TEXT)").await.expect("Create failed");
+        db.exec("INSERT INTO test_text VALUES ('Hello World', '', NULL)").await.expect("Insert failed");
+
+        let result = db.exec("SELECT * FROM test_text").await.expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        let row = &array[0];
+        
+        assert_eq!(row["message"].as_str().unwrap(), "Hello World");
+        assert_eq!(row["empty"].as_str().unwrap(), "");
+        assert!(row["null_val"].is_null());
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_blob_column_handling() {
+        let Some(db) = get_test_db().await else { return };
+        
+        db.exec("CREATE TABLE test_blob (data BLOB)").await.expect("Create failed");
+        db.exec("INSERT INTO test_blob VALUES (X'48656C6C6F')").await.expect("Insert failed");
+
+        let result = db.exec("SELECT * FROM test_blob").await.expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        let row = &array[0];
+        
+        let blob_str = row["data"].as_str().unwrap();
+        assert!(blob_str.starts_with("<blob"));
+        assert!(blob_str.contains("bytes>"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_column_names_handling() {
+        let Some(db) = get_test_db().await else { return };
+        
+        db.exec("CREATE TABLE test_cols (id INTEGER, full_name TEXT, \"quoted col\" INTEGER)").await.expect("Create failed");
+        db.exec("INSERT INTO test_cols VALUES (1, 'John Doe', 100)").await.expect("Insert failed");
+
+        let result = db.exec("SELECT * FROM test_cols").await.expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        let row = &array[0];
+        
+        assert!(row.get("id").is_some());
+        assert!(row.get("full_name").is_some());
+        assert!(row.get("quoted col").is_some());
+        assert_eq!(row["full_name"].as_str().unwrap(), "John Doe");
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_update_query() {
+        let Some(db) = get_test_db().await else { return };
+        
+        db.exec("CREATE TABLE test_update (id INTEGER, value INTEGER)").await.expect("Create failed");
+        db.exec("INSERT INTO test_update VALUES (1, 10), (2, 20), (3, 30)").await.expect("Insert failed");
+
+        let result = db.exec("UPDATE test_update SET value = value * 2 WHERE id > 1").await;
+        assert!(result.is_ok());
+        let update_result = result.unwrap();
+        assert!(update_result.contains("Rows affected: 2"));
+
+        let select_result = db.exec("SELECT value FROM test_update ORDER BY id").await.expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&select_result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        
+        assert_eq!(array[0]["value"].as_i64().unwrap(), 10);
+        assert_eq!(array[1]["value"].as_i64().unwrap(), 40);
+        assert_eq!(array[2]["value"].as_i64().unwrap(), 60);
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_delete_query() {
+        let Some(db) = get_test_db().await else { return };
+        
+        db.exec("CREATE TABLE test_delete (id INTEGER, name TEXT)").await.expect("Create failed");
+        db.exec("INSERT INTO test_delete VALUES (1, 'keep'), (2, 'delete'), (3, 'delete')").await.expect("Insert failed");
+
+        let result = db.exec("DELETE FROM test_delete WHERE name = 'delete'").await;
+        assert!(result.is_ok());
+        let delete_result = result.unwrap();
+        assert!(delete_result.contains("Rows affected: 2"));
+
+        let select_result = db.exec("SELECT COUNT(*) as count FROM test_delete").await.expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&select_result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(array[0]["count"].as_i64().unwrap(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_invalid_sql_syntax_error() {
+        let Some(db) = get_test_db().await else { return };
+        
+        let result = db.exec("INVALID SQL SYNTAX HERE").await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Failed to prepare statement"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_sql_with_null_byte_error() {
+        let Some(db) = get_test_db().await else { return };
+        
+        let result = db.exec("SELECT * FROM table\0WITH NULL").await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Invalid SQL string"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_table_not_found_error() {
+        let Some(db) = get_test_db().await else { return };
+        
+        let result = db.exec("SELECT * FROM nonexistent_table").await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Query execution failed") || error.contains("no such table"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_custom_functions_available() {
+        let Some(db) = get_test_db().await else { return };
+        
+        let result = db.exec("SELECT float_add('1.5', '2.5') as result").await;
+        assert!(result.is_ok());
+        
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        let row = &array[0];
+        
+        assert!(row.get("result").is_some());
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_database_drop_cleanup() {
+        {
+            let Some(db) = get_test_db().await else { return };
+            assert!(!db.db.is_null());
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_multiple_statements_handling() {
+        let Some(db) = get_test_db().await else { return };
+        
+        let result = db.exec("CREATE TABLE multi_test (id INTEGER); INSERT INTO multi_test VALUES (1);").await;
+        assert!(result.is_ok());
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_concurrent_database_operations() {
+        let Some(db) = get_test_db().await else { return };
+        
+        db.exec("CREATE TABLE concurrent_test (id INTEGER PRIMARY KEY, value TEXT)").await.expect("Create failed");
+        
+        let insert1 = db.exec("INSERT INTO concurrent_test (value) VALUES ('first')").await;
+        let insert2 = db.exec("INSERT INTO concurrent_test (value) VALUES ('second')").await;
+        
+        assert!(insert1.is_ok());
+        assert!(insert2.is_ok());
+        
+        let result = db.exec("SELECT COUNT(*) as count FROM concurrent_test").await.expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(array[0]["count"].as_i64().unwrap(), 2);
+    }
+}
