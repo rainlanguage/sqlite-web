@@ -107,3 +107,112 @@ pub fn main() -> Result<(), JsValue> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+    use std::rc::Rc;
+    use js_sys::{Object, Reflect};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn test_worker_state_creation() {
+        let state = WorkerState::new();
+        assert!(state.is_ok());
+        let worker_state = state.unwrap();
+        assert!(!worker_state.worker_id.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_execute_query_message_structure() {
+        let msg = Object::new();
+        Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("execute-query")).unwrap();
+        Reflect::set(&msg, &JsValue::from_str("sql"), &JsValue::from_str("SELECT 1")).unwrap();
+
+        let msg_type = Reflect::get(&msg, &JsValue::from_str("type")).unwrap();
+        let sql = Reflect::get(&msg, &JsValue::from_str("sql")).unwrap();
+
+        assert_eq!(msg_type.as_string().unwrap(), "execute-query");
+        assert_eq!(sql.as_string().unwrap(), "SELECT 1");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_query_response_structure_success() {
+        let response = Object::new();
+        Reflect::set(&response, &JsValue::from_str("type"), &JsValue::from_str("query-result")).unwrap();
+        Reflect::set(&response, &JsValue::from_str("result"), &JsValue::from_str("test_result")).unwrap();
+        Reflect::set(&response, &JsValue::from_str("error"), &JsValue::NULL).unwrap();
+
+        let response_type = Reflect::get(&response, &JsValue::from_str("type")).unwrap();
+        let result = Reflect::get(&response, &JsValue::from_str("result")).unwrap();
+        let error = Reflect::get(&response, &JsValue::from_str("error")).unwrap();
+
+        assert_eq!(response_type.as_string().unwrap(), "query-result");
+        assert_eq!(result.as_string().unwrap(), "test_result");
+        assert!(error.is_null());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_query_response_structure_error() {
+        let response = Object::new();
+        Reflect::set(&response, &JsValue::from_str("type"), &JsValue::from_str("query-result")).unwrap();
+        Reflect::set(&response, &JsValue::from_str("result"), &JsValue::NULL).unwrap();
+        Reflect::set(&response, &JsValue::from_str("error"), &JsValue::from_str("test_error")).unwrap();
+
+        let response_type = Reflect::get(&response, &JsValue::from_str("type")).unwrap();
+        let result = Reflect::get(&response, &JsValue::from_str("result")).unwrap();
+        let error = Reflect::get(&response, &JsValue::from_str("error")).unwrap();
+
+        assert_eq!(response_type.as_string().unwrap(), "query-result");
+        assert!(result.is_null());
+        assert_eq!(error.as_string().unwrap(), "test_error");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_message_parsing_invalid_type() {
+        let msg = Object::new();
+        Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("invalid-type")).unwrap();
+
+        let msg_type = Reflect::get(&msg, &JsValue::from_str("type")).unwrap();
+        assert_eq!(msg_type.as_string().unwrap(), "invalid-type");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_message_parsing_missing_sql() {
+        let msg = Object::new();
+        Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("execute-query")).unwrap();
+
+        let sql_result = Reflect::get(&msg, &JsValue::from_str("sql"));
+        assert!(sql_result.is_ok());
+        assert!(sql_result.unwrap().is_undefined());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_message_parsing_empty_sql() {
+        let msg = Object::new();
+        Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("execute-query")).unwrap();
+        Reflect::set(&msg, &JsValue::from_str("sql"), &JsValue::from_str("")).unwrap();
+
+        let sql = Reflect::get(&msg, &JsValue::from_str("sql")).unwrap();
+        assert_eq!(sql.as_string().unwrap(), "");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_worker_state_reference_counting() {
+        let state = WorkerState::new().unwrap();
+        let state_rc = Rc::new(state);
+        let cloned_state = Rc::clone(&state_rc);
+        assert_eq!(Rc::strong_count(&state_rc), 2);
+        drop(cloned_state);
+        assert_eq!(Rc::strong_count(&state_rc), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_global_worker_scope_access() {
+        let global = js_sys::global();
+        assert!(!global.is_undefined());
+        assert!(!global.is_null());
+    }
+}
