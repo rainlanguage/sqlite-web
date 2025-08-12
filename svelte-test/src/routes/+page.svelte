@@ -3,7 +3,7 @@
     import { browser } from '$app/environment';
     import init, { DatabaseConnection } from 'sqlite-worker';
     
-    let db: DatabaseConnection | null = null;
+    let db: DatabaseConnection | undefined;
     let users: any[] = $state([]);
     let newUserName = $state('');
     let newUserEmail = $state('');
@@ -20,8 +20,12 @@
             await init();
             
             status = 'Creating database connection...';
-            db = new DatabaseConnection();
-            
+            let res = DatabaseConnection.new();
+            if (res.error) {
+                throw new Error('Failed to create database connection');
+            }
+            db = res.value;
+
             status = 'Waiting for worker to be ready...';
             // Wait for worker to be ready
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -46,12 +50,12 @@
         }
     });
 
-    async function loadUsers() {
+    async function  loadUsers() {
         if (!db) return;
         try {
             isLoading = true;
             const result = await db.query('SELECT * FROM users ORDER BY created_at DESC');
-            users = JSON.parse(result);
+            users = JSON.parse(result.value);
         } catch (error) {
             console.error('Failed to load users:', error);
             status = `Load error: ${error instanceof Error ? error.message : 'Unknown error'}`;

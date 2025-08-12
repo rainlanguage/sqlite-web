@@ -1,31 +1,78 @@
-// lib.rs - Fully self-contained worker with embedded WASM
 use js_sys::Array;
+use serde::{de::IgnoredAny, Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
+use thiserror::Error;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_utils::prelude::*;
 use web_sys::{Blob, BlobPropertyBag, MessageEvent, Url, Worker};
 
-mod coordination;
-mod database;
-mod database_functions;
-mod messages;
-mod worker;
 mod worker_template;
-
 use worker_template::generate_self_contained_worker;
 
-/// Main database connection - creates worker with embedded WASM
 #[wasm_bindgen]
 pub struct DatabaseConnection {
     worker: Worker,
     pending_queries: Rc<RefCell<Vec<(js_sys::Function, js_sys::Function)>>>,
 }
 
-#[wasm_bindgen]
+impl Serialize for DatabaseConnection {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let state = serializer.serialize_struct("DatabaseConnection", 0)?;
+        state.end()
+    }
+}
+impl<'de> Deserialize<'de> for DatabaseConnection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let _ = deserializer.deserialize_any(IgnoredAny)?;
+        Self::new().map_err(|e| {
+            serde::de::Error::custom(format!("Failed to create DatabaseConnection: {:?}", e))
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum DatabaseConnectionError {
+    #[error(transparent)]
+    SerdeError(#[from] serde_wasm_bindgen::Error),
+    #[error("JavaScript error: {0:?}")]
+    JsError(JsValue),
+}
+
+impl From<JsValue> for DatabaseConnectionError {
+    fn from(value: JsValue) -> Self {
+        DatabaseConnectionError::JsError(value)
+    }
+}
+
+impl From<DatabaseConnectionError> for JsValue {
+    fn from(value: DatabaseConnectionError) -> Self {
+        JsError::new(&value.to_string()).into()
+    }
+}
+
+impl From<DatabaseConnectionError> for WasmEncodedError {
+    fn from(value: DatabaseConnectionError) -> Self {
+        WasmEncodedError {
+            msg: value.to_string(),
+            readable_msg: value.to_string(),
+        }
+    }
+}
+
+#[wasm_export]
 impl DatabaseConnection {
     /// Create a new database connection with fully embedded worker
-    #[wasm_bindgen(constructor)]
-    pub fn new() -> Result<DatabaseConnection, JsValue> {
+    #[wasm_export(js_name = "new", preserve_js_class)]
+    pub fn new() -> Result<DatabaseConnection, DatabaseConnectionError> {
         web_sys::console::log_1(&"Creating self-contained worker...".into());
 
         // Create the worker with embedded WASM and glue code
@@ -121,13 +168,13 @@ impl DatabaseConnection {
     }
 
     /// Execute a SQL query
-    #[wasm_bindgen]
-    pub fn query(&self, sql: &str) -> js_sys::Promise {
+    #[wasm_export(js_name = "query", unchecked_return_type = "string")]
+    pub async fn query(&self, sql: &str) -> Result<String, DatabaseConnectionError> {
         let worker = &self.worker;
         let pending_queries = Rc::clone(&self.pending_queries);
         let sql = sql.to_string();
 
-        js_sys::Promise::new(&mut |resolve, reject| {
+        let promise = js_sys::Promise::new(&mut |resolve, reject| {
             // Store the promise callbacks
             pending_queries.borrow_mut().push((resolve, reject));
 
@@ -147,6 +194,11 @@ impl DatabaseConnection {
             .unwrap();
 
             let _ = worker.post_message(&message);
-        })
+        });
+
+        let result = JsFuture::from(promise).await?;
+        Ok(result
+            .as_string()
+            .unwrap_or_else(|| format!("{:?}", result)))
     }
 }

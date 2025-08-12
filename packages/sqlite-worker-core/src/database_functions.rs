@@ -1,9 +1,9 @@
 use alloy::primitives::U256;
+use rain_math_float::Float;
 use sqlite_wasm_rs::export::*;
 use std::ffi::{c_int, CStr, CString};
-use std::os::raw::c_char;
-use rain_math_float::Float;
 use std::ops::Add;
+use std::os::raw::c_char;
 use std::str::FromStr;
 
 // Custom function - alternates case (1st lowercase, 2nd uppercase, 3rd lowercase, etc.)
@@ -28,7 +28,7 @@ unsafe extern "C" fn alternating_case_function(
     }
 
     let input_str = CStr::from_ptr(input as *const c_char).to_string_lossy();
-    
+
     // Apply alternating case: 1st char lowercase, 2nd uppercase, 3rd lowercase, etc.
     let alternating_str: String = input_str
         .chars()
@@ -43,7 +43,7 @@ unsafe extern "C" fn alternating_case_function(
             }
         })
         .collect();
-    
+
     let result_cstring = CString::new(alternating_str).unwrap();
 
     sqlite3_result_text(
@@ -89,11 +89,7 @@ unsafe extern "C" fn rain_math_process(
         Ok(u) => u,
         Err(e) => {
             let error_msg = format!("Failed to parse first argument as U256: {}\0", e);
-            sqlite3_result_error(
-                context,
-                error_msg.as_ptr() as *const c_char,
-                -1,
-            );
+            sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
     };
@@ -103,11 +99,7 @@ unsafe extern "C" fn rain_math_process(
         Ok(f) => f,
         Err(e) => {
             let error_msg = format!("Failed to parse first argument as Float: {}\0", e);
-            sqlite3_result_error(
-                context,
-                error_msg.as_ptr() as *const c_char,
-                -1,
-            );
+            sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
     };
@@ -116,11 +108,7 @@ unsafe extern "C" fn rain_math_process(
         Ok(u) => u,
         Err(e) => {
             let error_msg = format!("Failed to parse second argument as U256: {}\0", e);
-            sqlite3_result_error(
-                context,
-                error_msg.as_ptr() as *const c_char,
-                -1,
-            );
+            sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
     };
@@ -129,11 +117,7 @@ unsafe extern "C" fn rain_math_process(
         Ok(f) => f,
         Err(e) => {
             let error_msg = format!("Failed to parse second argument as Float: {}\0", e);
-            sqlite3_result_error(
-                context,
-                error_msg.as_ptr() as *const c_char,
-                -1,
-            );
+            sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
     };
@@ -143,11 +127,7 @@ unsafe extern "C" fn rain_math_process(
         Ok(r) => r,
         Err(e) => {
             let error_msg = format!("Failed to add Float values: {}\0", e);
-            sqlite3_result_error(
-                context,
-                error_msg.as_ptr() as *const c_char,
-                -1,
-            );
+            sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
     };
@@ -157,11 +137,7 @@ unsafe extern "C" fn rain_math_process(
         Ok(s) => s,
         Err(e) => {
             let error_msg = format!("Failed to format result as string: {}\0", e);
-            sqlite3_result_error(
-                context,
-                error_msg.as_ptr() as *const c_char,
-                -1,
-            );
+            sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
             return;
         }
     };

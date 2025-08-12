@@ -17,17 +17,18 @@ This is a **SQLite Worker** project - a browser-native WebAssembly SQLite implem
 
 ### Rust WASM Development
 ```bash
-# Build and check Rust code
+# Build and check Rust code (workspace)
 cargo build
-
-# Generate WASM package for browser
-wasm-pack build --target web
 
 # Generate WASM with embedded worker (production)
 ./bundle.sh
 
+# Build individual packages for development
+wasm-pack build --target web packages/sqlite-worker-core
+wasm-pack build --target web packages/sqlite-worker
+
 # Generate optimized release WASM
-wasm-pack build --target web --release
+wasm-pack build --target web --release packages/sqlite-worker
 ```
 
 ### Svelte Frontend Development
@@ -62,13 +63,20 @@ open http://localhost:5173
 
 ## Code Architecture
 
-### Core Rust Modules (src/)
-- **`lib.rs`** (152 lines): Main API - DatabaseConnection struct, worker creation, promise handling
+### Core Rust Modules (Workspace Architecture)
+
+#### sqlite-worker-core package (packages/sqlite-worker-core/src/)
+- **`lib.rs`**: Core package entry point, exports worker_main function
 - **`worker.rs`**: Worker entry point, initializes WorkerState and handles main thread messages
 - **`database.rs`**: SQLite FFI implementation with OPFS integration, query execution
 - **`coordination.rs`**: Worker coordination, leader election via Web Locks API, BroadcastChannel routing
 - **`messages.rs`**: Message type definitions for all communication channels
+- **`database_functions.rs`**: Custom SQLite functions (alternating case, math processing)
+
+#### sqlite-worker package (packages/sqlite-worker/src/)
+- **`lib.rs`**: Main API - DatabaseConnection struct, worker creation, promise handling
 - **`worker_template.rs`**: JavaScript code generation for self-contained workers
+- **`embedded_worker.js`**: Generated JavaScript with embedded core WASM
 
 ### Key Design Patterns
 1. **Worker Coordination**: Only one worker (leader) accesses SQLite directly, others proxy through BroadcastChannel
@@ -90,10 +98,11 @@ open http://localhost:5173
 3. `./bundle.sh` - Create self-contained worker with embedded WASM (base64)
 
 ### Bundle Script (`bundle.sh`)
-- Builds WASM with `wasm-pack`
-- Converts WASM to base64 
-- Generates `embedded_worker.js` with WASM data + JS glue code embedded
+- **Step 1**: Builds `sqlite-worker-core` package with `wasm-pack`
+- Converts core WASM to base64 and embeds in `packages/sqlite-worker/src/embedded_worker.js`
+- **Step 2**: Builds `sqlite-worker` package (with embedded core) 
 - Creates fully self-contained worker blob (no external file dependencies)
+- **No Circular Dependencies**: Clean separation between core logic and public API
 
 ### Development vs Production
 - **Development**: Use `wasm-pack build --target web` + `bun server.js`

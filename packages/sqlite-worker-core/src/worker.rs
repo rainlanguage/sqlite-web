@@ -1,5 +1,4 @@
 // worker.rs - This module runs in the worker context
-use js_sys::Reflect;
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
@@ -7,7 +6,6 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
 use crate::coordination::WorkerState;
-use crate::messages::{ChannelMessage, MainThreadMessage, PendingQuery, WorkerMessage};
 
 // Global state
 thread_local! {
@@ -15,8 +13,7 @@ thread_local! {
 }
 
 /// Entry point for the worker - called from the blob
-#[wasm_bindgen]
-pub fn worker_main() -> Result<(), JsValue> {
+pub fn main() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
 
     web_sys::console::log_1(&"[Worker] Starting worker_main...".into());

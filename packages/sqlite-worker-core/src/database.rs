@@ -1,7 +1,7 @@
-use sqlite_wasm_rs::export::{*, install_opfs_sahpool};
+use crate::database_functions::register_custom_functions;
+use sqlite_wasm_rs::export::{install_opfs_sahpool, *};
 use std::ffi::{CStr, CString};
 use wasm_bindgen::prelude::*;
-use crate::database_functions::register_custom_functions;
 
 // Real SQLite database using sqlite-wasm-rs FFI
 pub struct SQLiteDatabase {
