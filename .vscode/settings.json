@@ -1,0 +1,16 @@
+{
+    "editor.rulers": [
+        80
+    ],
+    "rust-analyzer.linkedProjects": [
+        "./Cargo.toml",
+        "./packages/sqlite-worker-core/Cargo.toml",
+        "./packages/sqlite-worker/Cargo.toml",
+        "./lib/rain.math.float/Cargo.toml"
+    ],
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer",
+        "editor.formatOnSave": true,
+        "editor.formatOnSaveMode": "file"
+    }
+}

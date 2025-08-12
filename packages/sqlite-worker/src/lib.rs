@@ -73,7 +73,6 @@ impl SQLiteWasmDatabase {
     /// Create a new database connection with fully embedded worker
     #[wasm_export(js_name = "new", preserve_js_class)]
     pub fn new() -> Result<SQLiteWasmDatabase, DatabaseConnectionError> {
-
         // Create the worker with embedded WASM and glue code
         let worker_code = generate_self_contained_worker();
 
