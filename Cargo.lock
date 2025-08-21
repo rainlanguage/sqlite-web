@@ -4154,7 +4154,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlite-worker"
+name = "sqlite-web"
 version = "0.1.0"
 dependencies = [
  "base64 0.21.7",
@@ -4170,7 +4170,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlite-worker-core"
+name = "sqlite-web-core"
 version = "0.1.0"
 dependencies = [
  "alloy",

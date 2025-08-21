@@ -15,10 +15,10 @@
             name = "test-wasm";
             body = ''
               set -euxo pipefail
-              cd packages/sqlite-worker-core
+              cd packages/sqlite-web-core
               wasm-pack test --headless --chrome
               cd ../..
-              cd packages/sqlite-worker
+              cd packages/sqlite-web
               wasm-pack test --headless --chrome
               cd ../..
             '';
@@ -28,10 +28,10 @@
             name = "build-wasm";
             body = ''
               set -euxo pipefail
-              cd packages/sqlite-worker-core
+              cd packages/sqlite-web-core
               wasm-pack build --target web --out-dir ../../pkg
               cd ../..
-              cd packages/sqlite-worker
+              cd packages/sqlite-web
               wasm-pack build --target web --out-dir ../../pkg
               cd ../..
             '';
