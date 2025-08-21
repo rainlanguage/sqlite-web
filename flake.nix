@@ -51,6 +51,7 @@
               set -euxo pipefail
               ./scripts/local-bundle.sh
               cd svelte-test
+              npx playwright install chromium
               npm run test
               cd ..
             '';
