@@ -40,6 +40,11 @@ jobs:
 
       - run: nix develop -c local-bundle
 
+      - name: Install Playwright browsers with dependencies
+        run: |
+          cd svelte-test
+          npx playwright install --with-deps
+
       - run: nix develop -c test-ui
 
       - name: Frontend linting and formatting
