@@ -124,8 +124,9 @@ echo "🔄 Updating Svelte integration..."
 cd svelte-test
 npm remove sqlite-web
 npm remove sqlite-web
-rm -rf node_modules
+rm -rf node_modules package-lock.json
 npm install ../pkg/sqlite-web-*.tgz
+npm install
 cd ..
 
 echo ""
