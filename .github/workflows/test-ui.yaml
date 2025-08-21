@@ -38,6 +38,8 @@ jobs:
 
       - run: nix develop -c build-submodules
 
+      - run: nix develop -c local-bundle
+
       - run: nix develop -c test-ui
 
       - name: Frontend linting and formatting

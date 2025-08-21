@@ -38,7 +38,7 @@ jobs:
 
       - run: nix develop -c build-submodules
 
-      - run: echo "// Generated file placeholder" > packages/sqlite-web/src/embedded_worker.js
+      - run: nix develop -c local-bundle
 
       - run: nix develop -c rainix-rs-static
 

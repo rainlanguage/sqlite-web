@@ -32,6 +32,8 @@ jobs:
           cache: "npm"
 
       - run: nix develop -c build-submodules
+      
+      - run: nix develop -c local-bundle
 
       - name: Test full integration
         run: nix develop -c test-full-integration
