@@ -20,28 +20,20 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - uses: nixbuild/nix-quick-install-action@v30
+      - uses: DeterminateSystems/nix-installer-action@main
         with:
-          nix_conf: |
-            keep-env-derivations = true
-            keep-outputs = true
-      - name: Restore and save Nix store
-        uses: nix-community/cache-nix-action@v6
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 1G
-
-      - run: nix develop -c forge install
+          determinate: true
+      - uses: DeterminateSystems/flakehub-cache-action@main
 
       - name: Install NodeJS v22
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: "npm"
-          cache-dependency-path: "svelte-test/package-lock.json"
 
-      - name: Test WASM and UI
+      - run: nix develop -c rainix-sol-prelude
+
+      - name: Test full integration
         run: nix develop -c test-full-integration
 
       - name: Git Config
@@ -71,7 +63,6 @@ jobs:
       - name: Set Version
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
-          cd pkg
           NEW_VERSION=$(npm version prerelease --preid alpha --no-git-tag-version)
           echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
 
@@ -85,7 +76,7 @@ jobs:
 
       # Push the commit to remote
       - name: Push Changes To Remote
-        if: ${{ env.OLD_HASH != env.NEW_VERSION }}
+        if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
           git push origin
           git push -u origin npm-v${{ env.NEW_VERSION }}
