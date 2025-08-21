@@ -36,6 +36,8 @@ jobs:
           # 1G = 1073741824
           gc-max-store-size-linux: 1G
 
+      - run: nix develop -c forge install
+
       - run: nix develop -c test-ui
 
       - name: Frontend linting and formatting

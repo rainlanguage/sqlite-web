@@ -32,6 +32,8 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 1G
 
+      - run: nix develop -c forge install
+
       - name: Install NodeJS v22
         uses: actions/setup-node@v4
         with:

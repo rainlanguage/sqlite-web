@@ -3,6 +3,9 @@ members = [
     "packages/sqlite-web-core",
     "packages/sqlite-web"
 ]
+exclude = [
+    "lib/rain.math.float"
+]
 resolver = "2"
 
 [workspace.package]
