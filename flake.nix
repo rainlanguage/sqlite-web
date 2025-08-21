@@ -68,7 +68,7 @@
 
         devShells.default = pkgs.mkShell {
           shellHook = rainix.devShells.${system}.default.shellHook;
-          packages = [ packages.test-wasm packages.build-wasm packages.local-bundle packages.test-ui packages.test-full-integration ];
+          packages = [ packages.test-wasm packages.build-wasm packages.local-bundle packages.test-ui packages.test-full-integration pkgs.wasm-pack ];
           inputsFrom = [ rainix.devShells.${system}.default ];
         };
       });
