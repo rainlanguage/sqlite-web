@@ -38,6 +38,8 @@ jobs:
 
       - run: nix develop -c rainix-sol-prelude
 
+      - run: echo "// Generated file placeholder" > packages/sqlite-web/src/embedded_worker.js
+
       - run: nix develop -c rainix-rs-static
 
       - run: nix develop -c test-wasm
