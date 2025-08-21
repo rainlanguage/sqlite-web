@@ -41,7 +41,6 @@
 
             status = 'Ready ✅';
         } catch (error) {
-            console.error('Database initialization failed:', error);
             status = `Failed: ${error instanceof Error ? error.message : 'Unknown error'}`;
         }
     });
@@ -61,7 +60,6 @@
                 queryResult = [{ result }];
             }
         } catch (error) {
-            console.error('Query execution failed:', error);
             errorMessage = error instanceof Error ? error.message : 'Unknown error';
             queryResult = null;
         } finally {
