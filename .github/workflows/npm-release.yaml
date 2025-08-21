@@ -31,7 +31,7 @@ jobs:
           node-version: 22
           cache: "npm"
 
-      - run: nix develop -c rainix-sol-prelude
+      - run: nix develop -c build-submodules
 
       - name: Test full integration
         run: nix develop -c test-full-integration

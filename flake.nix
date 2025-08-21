@@ -56,6 +56,17 @@
             '';
           };
 
+          build-submodules = rainix.mkTask.${system} {
+            name = "build-submodules";
+            body = ''
+              set -euxo pipefail
+              rainix-sol-prelude
+              cd lib/rain.math.float
+              forge build
+              cd ../..
+            '';
+          };
+
           test-full-integration = rainix.mkTask.${system} {
             name = "test-full-integration";
             body = ''
@@ -68,7 +79,7 @@
 
         devShells.default = pkgs.mkShell {
           shellHook = rainix.devShells.${system}.default.shellHook;
-          packages = [ packages.test-wasm packages.build-wasm packages.local-bundle packages.test-ui packages.test-full-integration pkgs.wasm-pack ];
+          packages = [ packages.test-wasm packages.build-wasm packages.local-bundle packages.test-ui packages.build-submodules packages.test-full-integration pkgs.wasm-pack ];
           inputsFrom = [ rainix.devShells.${system}.default ];
         };
       });
