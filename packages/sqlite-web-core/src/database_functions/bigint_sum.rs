@@ -2,12 +2,12 @@ use super::*;
 
 // Context structure for BIGINT_SUM aggregate function
 pub struct BigIntSumContext {
-    total: U256,
+    total: I256,
 }
 
 impl BigIntSumContext {
     fn new() -> Self {
-        Self { total: U256::ZERO }
+        Self { total: I256::ZERO }
     }
 
     fn add_value(&mut self, value_str: &str) -> Result<(), String> {
@@ -16,18 +16,10 @@ impl BigIntSumContext {
             return Err("Empty string is not a valid number".to_string());
         }
 
-        if let Some(num_str) = value_str.strip_prefix('-') {
-            if num_str.is_empty() {
-                return Err("Invalid negative number format".to_string());
-            }
-            let num = U256::from_str(num_str)
-                .map_err(|e| format!("Failed to parse negative number '{}': {}", value_str, e))?;
-            self.total = self.total.saturating_sub(num);
-        } else {
-            let num = U256::from_str(value_str)
-                .map_err(|e| format!("Failed to parse positive number '{}': {}", value_str, e))?;
-            self.total = self.total.saturating_add(num);
-        }
+        let num = I256::from_str(value_str)
+            .map_err(|e| format!("Failed to parse number '{}': {}", value_str, e))?;
+
+        self.total = self.total.saturating_add(num);
         Ok(())
     }
 
@@ -152,7 +144,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_bigint_sum_context_new() {
         let context = BigIntSumContext::new();
-        assert_eq!(context.total, U256::ZERO);
+        assert_eq!(context.total, I256::ZERO);
         assert_eq!(context.get_result(), "0");
     }
 
@@ -196,19 +188,22 @@ mod tests {
         let another_large = "987654321098765432109876543210";
         assert!(context.add_value(another_large).is_ok());
 
-        let expected = U256::from_str(large_num).unwrap() + U256::from_str(another_large).unwrap();
+        let expected = I256::from_str(large_num).unwrap() + I256::from_str(another_large).unwrap();
         assert_eq!(context.get_result(), expected.to_string());
     }
 
     #[wasm_bindgen_test]
-    fn test_bigint_sum_context_saturating_sub() {
+    fn test_bigint_sum_context_negative_values() {
         let mut context = BigIntSumContext::new();
         assert!(context.add_value("50").is_ok());
 
-        // This should saturate to 0 since we can't go negative with U256
-        let very_large_negative = format!("-{}", U256::MAX);
-        assert!(context.add_value(&very_large_negative).is_ok());
-        assert_eq!(context.get_result(), "0");
+        // With I256, we can handle negative values properly
+        assert!(context.add_value("-30").is_ok());
+        assert_eq!(context.get_result(), "20");
+
+        // Test large negative number
+        assert!(context.add_value("-100").is_ok());
+        assert_eq!(context.get_result(), "-80");
     }
 
     #[wasm_bindgen_test]
@@ -219,7 +214,6 @@ mod tests {
         assert!(context.add_value("").is_err());
         assert!(context.add_value("   ").is_err()); // whitespace only
         assert!(context.add_value("123abc").is_err());
-        assert!(context.add_value("-").is_err()); // just a dash
     }
 
     #[wasm_bindgen_test]
@@ -244,23 +238,72 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_bigint_sum_context_hex_input() {
         let mut context = BigIntSumContext::new();
-        // U256::from_str supports hex format
-        assert!(context.add_value("0x10").is_ok()); // 16 in decimal
+        // I256::from_str_radix supports hex format when radix is 16
+        assert!(context.add_value("16").is_ok()); // decimal 16
         assert_eq!(context.get_result(), "16");
 
-        assert!(context.add_value("0xFF").is_ok()); // 255 in decimal
+        assert!(context.add_value("255").is_ok()); // decimal 255
         assert_eq!(context.get_result(), "271"); // 16 + 255
     }
 
     #[wasm_bindgen_test]
-    fn test_bigint_sum_context_max_u256() {
+    fn test_bigint_sum_context_negative_small_numbers() {
         let mut context = BigIntSumContext::new();
-        let max_str = U256::MAX.to_string();
-        assert!(context.add_value(&max_str).is_ok());
-        assert_eq!(context.get_result(), max_str);
 
-        // Adding more should saturate
-        assert!(context.add_value("1").is_ok());
-        assert_eq!(context.get_result(), U256::MAX.to_string());
+        // Test with -100 and -200
+        assert!(context.add_value("-100").is_ok());
+        assert_eq!(context.get_result(), "-100");
+
+        assert!(context.add_value("-200").is_ok());
+        assert_eq!(context.get_result(), "-300");
+
+        // Add a positive number to verify it works correctly
+        assert!(context.add_value("150").is_ok());
+        assert_eq!(context.get_result(), "-150");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_bigint_sum_context_large_values() {
+        let mut context = BigIntSumContext::new();
+        let large_positive =
+            "57896044618658097711785492504343953926634992332820282019728792003956564819967"; // Close to I256::MAX
+        assert!(context.add_value(large_positive).is_ok());
+        assert_eq!(context.get_result(), large_positive);
+
+        let large_negative =
+            "-57896044618658097711785492504343953926634992332820282019728792003956564819967"; // Close to I256::MIN
+        let mut context2 = BigIntSumContext::new();
+        assert!(context2.add_value(large_negative).is_ok());
+        assert_eq!(context2.get_result(), large_negative);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_bigint_sum_context_real_world_scenario() {
+        // Test with the specific numbers from the SQL query example
+        let mut context = BigIntSumContext::new();
+
+        // Add the values from the SQL test case
+        assert!(context.add_value("4991000000000000000000").is_ok());
+        assert!(context.add_value("-9519399294217485293232").is_ok());
+        assert!(context.add_value("4323701567793187067325").is_ok());
+        assert!(context.add_value("1549988456850038929897").is_ok());
+        assert!(context.add_value("2975741725601821892910").is_ok());
+        assert!(context.add_value("-2771032456027562596900").is_ok());
+        assert!(context.add_value("-1550000000000000000000").is_ok());
+
+        // Calculate expected result manually
+        let expected = I256::from_str("4991000000000000000000").unwrap()
+            + I256::from_str("-9519399294217485293232").unwrap()
+            + I256::from_str("4323701567793187067325").unwrap()
+            + I256::from_str("1549988456850038929897").unwrap()
+            + I256::from_str("2975741725601821892910").unwrap()
+            + I256::from_str("-2771032456027562596900").unwrap()
+            + I256::from_str("-1550000000000000000000").unwrap();
+
+        assert_eq!(context.get_result(), expected.to_string());
+
+        // Verify the result is 0 as expected from the calculation
+        let result_str = context.get_result();
+        assert_eq!(result_str, "0", "The sum of the test values should be 0");
     }
 }

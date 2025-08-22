@@ -1,4 +1,4 @@
-use alloy::primitives::U256;
+use alloy::primitives::{I256, U256};
 use rain_math_float::Float;
 use sqlite_wasm_rs::export::*;
 use std::ffi::{c_int, CStr, CString};
