@@ -7,12 +7,12 @@ use std::os::raw::c_char;
 use std::str::FromStr;
 
 // Import the individual function modules
-mod rain_math;
 mod bigint_sum;
+mod rain_math;
 
 // Re-export the functions
-pub use rain_math::*;
 pub use bigint_sum::*;
+pub use rain_math::*;
 
 /// Register all custom functions with the SQLite database
 pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
@@ -45,10 +45,10 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
             1, // 1 argument
             SQLITE_UTF8,
             std::ptr::null_mut(),
-            None, // No xFunc for aggregate function
-            Some(bigint_sum_step), // xStep callback
+            None,                   // No xFunc for aggregate function
+            Some(bigint_sum_step),  // xStep callback
             Some(bigint_sum_final), // xFinal callback
-            None, // No destructor
+            None,                   // No destructor
         )
     };
 
@@ -65,7 +65,7 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
-    
+
     #[wasm_bindgen_test]
     fn test_cstring_conversion() {
         let test_string = "test string with spaces and symbols!@#$%";
