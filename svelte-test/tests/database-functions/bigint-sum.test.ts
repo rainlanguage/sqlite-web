@@ -150,7 +150,7 @@ describe('BIGINT_SUM Database Function', () => {
 			expect(data[0].total).toBe('0');
 		});
 
-		it('should handle saturating subtraction (underflow protection)', async () => {
+		it('should handle numbers exceeding I256 range with parse error', async () => {
 			await db.query('DELETE FROM bigint_test');
 			await db.query(`
 				INSERT INTO bigint_test (amount) VALUES 
@@ -160,7 +160,6 @@ describe('BIGINT_SUM Database Function', () => {
 			
 			const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM bigint_test');
 			
-			// The very large negative number should cause a parsing error
 			expect(result.error).toBeDefined();
 			expect(result.error?.msg).toContain('Failed to parse');
 		});
@@ -195,8 +194,8 @@ describe('BIGINT_SUM Database Function', () => {
 			const income = data.find((row: CategoryRow) => row.category === 'income');
 			
 			expect(bonus?.total).toBe('300000000000000000000000000000');
-			expect(expense?.total).toBe('0'); // Negative values saturate to 0
-			expect(income?.total).toBe('300000000000000000000000000000'); // 100000000000000000000000000000 + 200000000000000000000000000000
+			expect(expense?.total).toBe('-125000000000000000000000000000');
+			expect(income?.total).toBe('300000000000000000000000000000');
 		});
 
 		it('should work with HAVING clauses', async () => {
@@ -210,8 +209,8 @@ describe('BIGINT_SUM Database Function', () => {
 			const data = JSON.parse(result.value || '[]');
 			
 			expect(data).toHaveLength(2); // Only income and bonus should remain
-			expect(data[0].category).toBe('income'); // Highest total first
-			expect(data[1].category).toBe('bonus');
+			const categories = data.map((row: CategoryRow) => row.category).sort();
+			expect(categories).toEqual(['bonus', 'income']);
 		});
 	});
 
@@ -261,9 +260,8 @@ describe('BIGINT_SUM Database Function', () => {
 	});
 
 	describe('Edge Cases and Limits', () => {
-		it('should handle very large numbers near U256 limit', async () => {
-			// U256::MAX is approximately 1.15 * 10^77
-			const nearMax = '115792089237316195423570985008687907853269984665640564039457584007913129639935';
+		it('should handle very large numbers near I256 limit', async () => {
+			const nearMax = '57896044618658097711785492504343953926634992332820282019728792003956564819967';
 			
 			await db.query(`
 				INSERT INTO bigint_test (amount) VALUES ('${nearMax}')
@@ -273,6 +271,20 @@ describe('BIGINT_SUM Database Function', () => {
 			const data = JSON.parse(result.value || '[]');
 			
 			expect(data[0].total).toBe(nearMax);
+		});
+
+		it('should handle overflow with checked arithmetic', async () => {
+			const iMax = '57896044618658097711785492504343953926634992332820282019728792003956564819967';
+			
+			await db.query(`
+				INSERT INTO bigint_test (amount) VALUES 
+				('${iMax}'),
+				('1')
+			`);
+			
+			const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM bigint_test');
+			expect(result.error).toBeDefined();
+			expect(result.error?.msg).toContain('Integer overflow');
 		});
 
 		it('should handle hexadecimal input', async () => {
@@ -301,10 +313,7 @@ describe('BIGINT_SUM Database Function', () => {
 			const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM bigint_test');
 			const data = JSON.parse(result.value || '[]');
 			
-			// 123 - 456 + 789 = 456, but since we can't go negative in U256, 
-			// it should be 123 + 789 - 456 = 456 if order allows, or saturate
-			// The actual result depends on processing order, but should be valid
-			expect(data[0].total).toMatch(/^\d+$/);
+			expect(data[0].total).toBe('456');
 		});
 	});
 

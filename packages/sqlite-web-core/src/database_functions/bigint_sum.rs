@@ -11,15 +11,21 @@ impl BigIntSumContext {
     }
 
     fn add_value(&mut self, value_str: &str) -> Result<(), String> {
-        // Handle empty string as an error
-        if value_str.trim().is_empty() {
+        let trimmed = value_str.trim();
+        
+        if trimmed.is_empty() {
             return Err("Empty string is not a valid number".to_string());
         }
 
-        let num = I256::from_str(value_str)
-            .map_err(|e| format!("Failed to parse number '{}': {}", value_str, e))?;
+        if trimmed == "-" {
+            return Err("Invalid negative number format".to_string());
+        }
 
-        self.total = self.total.saturating_add(num);
+        let num = I256::from_str(trimmed)
+            .map_err(|e| format!("Failed to parse number '{}': {}", trimmed, e))?;
+
+        self.total = self.total.checked_add(num)
+            .ok_or_else(|| format!("Integer overflow when adding {} to running total {}", num, self.total))?;
         Ok(())
     }
 
