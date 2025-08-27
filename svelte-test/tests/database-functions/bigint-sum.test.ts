@@ -379,7 +379,24 @@ describe('BIGINT_SUM Database Function', () => {
 			
 			const data = JSON.parse(result.value || '[]');
 			expect(Array.isArray(data)).toBe(true);
-			expect(data.length).toBeGreaterThan(0);
+			expect(data.length).toBe(2);
+			
+			// Create a map by category for deterministic row access
+			const rowsByCategory = data.reduce((map: Record<string, any>, row: any) => {
+				map[row.category] = row;
+				return map;
+			}, {} as Record<string, any>);
+			
+			// Assert income row
+			expect(rowsByCategory['income']).toBeDefined();
+			expect(rowsByCategory['income'].total_amount).toBe('100000000000000000000000000000');
+			expect(rowsByCategory['income'].multiplier).toBe('2');
+			
+			// Assert expense row
+			expect(rowsByCategory['expense']).toBeDefined();
+			expect(rowsByCategory['expense'].total_amount).toBe('-50000000000000000000000000000');
+			expect(rowsByCategory['expense'].multiplier).toBe('1');
+			
 			expect(perf.getDuration('complex-bigint-query')).toBeLessThan(2000);
 		});
 	});
