@@ -247,7 +247,6 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_bigint_sum_context_hex_input() {
         let mut context = BigIntSumContext::new();
-        // I256::from_str_radix supports hex format when radix is 16
         assert!(context.add_value("16").is_ok()); // decimal 16
         assert_eq!(context.get_result(), "16");
 
