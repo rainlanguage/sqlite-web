@@ -1,13 +1,7 @@
-use alloy::primitives::U256;
-use rain_math_float::Float;
-use sqlite_wasm_rs::export::*;
-use std::ffi::{c_int, CStr, CString};
-use std::ops::Add;
-use std::os::raw::c_char;
-use std::str::FromStr;
+use super::*;
 
 // Custom function using rain-math-float library - sums two Float values
-unsafe extern "C" fn rain_math_process(
+pub unsafe extern "C" fn rain_math_process(
     context: *mut sqlite3_context,
     argc: c_int,
     argv: *mut *mut sqlite3_value,
@@ -106,37 +100,10 @@ unsafe extern "C" fn rain_math_process(
     );
 }
 
-/// Register all custom functions with the SQLite database
-pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
-    // Register rain_math_process function
-    let func_name = CString::new("RAIN_MATH_PROCESS").unwrap();
-    let ret = unsafe {
-        sqlite3_create_function_v2(
-            db,
-            func_name.as_ptr(),
-            2, // 2 arguments
-            SQLITE_UTF8,
-            std::ptr::null_mut(),
-            Some(rain_math_process),
-            None, // No xStep for scalar function
-            None, // No xFinal for scalar function
-            None, // No destructor
-        )
-    };
-
-    if ret != SQLITE_OK {
-        return Err("Failed to register RAIN_MATH_PROCESS function".to_string());
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use wasm_bindgen_test::*;
-
-    wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
     fn test_u256_hex_conversion() {
@@ -213,28 +180,5 @@ mod tests {
 
         let float_result = Float::from_hex(&hex_str);
         assert!(float_result.is_ok(), "MAX U256 should be valid for Float");
-    }
-
-    #[wasm_bindgen_test]
-    fn test_cstring_conversion() {
-        let test_string = "test string with spaces and symbols!@#$%";
-        let c_string_result = CString::new(test_string);
-        assert!(
-            c_string_result.is_ok(),
-            "Should be able to convert to CString"
-        );
-
-        let c_string = c_string_result.unwrap();
-        assert_eq!(c_string.to_string_lossy(), test_string);
-    }
-
-    #[wasm_bindgen_test]
-    fn test_cstring_with_null_bytes() {
-        let string_with_null = "test\0string";
-        let c_string_result = CString::new(string_with_null);
-        assert!(
-            c_string_result.is_err(),
-            "Strings with null bytes should fail CString conversion"
-        );
     }
 }
