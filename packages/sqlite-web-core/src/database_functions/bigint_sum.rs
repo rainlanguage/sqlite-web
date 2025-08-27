@@ -12,7 +12,7 @@ impl BigIntSumContext {
 
     fn add_value(&mut self, value_str: &str) -> Result<(), String> {
         let trimmed = value_str.trim();
-        
+
         if trimmed.is_empty() {
             return Err("Empty string is not a valid number".to_string());
         }
@@ -24,8 +24,12 @@ impl BigIntSumContext {
         let num = I256::from_str(trimmed)
             .map_err(|e| format!("Failed to parse number '{}': {}", trimmed, e))?;
 
-        self.total = self.total.checked_add(num)
-            .ok_or_else(|| format!("Integer overflow when adding {} to running total {}", num, self.total))?;
+        self.total = self.total.checked_add(num).ok_or_else(|| {
+            format!(
+                "Integer overflow when adding {} to running total {}",
+                num, self.total
+            )
+        })?;
         Ok(())
     }
 
