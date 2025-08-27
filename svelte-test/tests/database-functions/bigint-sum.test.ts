@@ -45,27 +45,32 @@ describe('BIGINT_SUM Database Function', () => {
 			// First check what functions are available
 			try {
 				const pragmaResult = await db.query('PRAGMA function_list');
-				console.log('Available functions:', pragmaResult);
+				expect(pragmaResult).toBeDefined();
+				const functions = JSON.parse(pragmaResult.value || '[]');
+				const bigintSumEntry = functions.find((f: any) => f.name === 'BIGINT_SUM');
+				expect(bigintSumEntry).toBeDefined();
 			} catch (error) {
-				console.log('Cannot list functions, SQLite version may not support it');
+				// SQLite version may not support function_list, skip this check
 			}
 
 			// Test RAIN_MATH_PROCESS (known working function) 
 			try {
 				const rainResult = await db.query('SELECT RAIN_MATH_PROCESS("100", "200") as test');
-				console.log('RAIN_MATH_PROCESS test result:', rainResult);
+				expect(rainResult).toBeDefined();
+				expect(rainResult.value).toBeDefined();
 			} catch (error) {
-				console.error('RAIN_MATH_PROCESS not available:', error);
+				throw new Error('RAIN_MATH_PROCESS not available');
 			}
 
 			// Test if function exists by trying to use it
 			try {
 				const result = await db.query('SELECT BIGINT_SUM("123") as test');
-				console.log('BIGINT_SUM function test result:', result);
 				expect(result).toBeDefined();
+				expect(result.value).toBeDefined();
+				const data = JSON.parse(result.value || '[]');
+				expect(data[0].test).toBe('123');
 			} catch (error) {
-				console.error('BIGINT_SUM function not available:', error);
-				throw error;
+				throw new Error('BIGINT_SUM function not available');
 			}
 		});
 	});
