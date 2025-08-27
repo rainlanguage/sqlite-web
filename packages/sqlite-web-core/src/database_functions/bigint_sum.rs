@@ -56,7 +56,6 @@ pub unsafe extern "C" fn bigint_sum_step(
     // Get the text value
     let value_ptr = sqlite3_value_text(*argv);
     if value_ptr.is_null() {
-        sqlite3_result_error(context, c"BIGINT_SUM() received NULL value".as_ptr(), -1);
         return;
     }
 
