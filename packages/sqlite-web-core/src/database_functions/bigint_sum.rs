@@ -21,8 +21,17 @@ impl BigIntSumContext {
             return Err("Invalid negative number format".to_string());
         }
 
-        let num = I256::from_str(trimmed)
-            .map_err(|e| format!("Failed to parse number '{}': {}", trimmed, e))?;
+        let num = if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+            let hex_part = &trimmed[2..];
+            if hex_part.is_empty() {
+                return Err("Incomplete hex number: missing digits after 0x".to_string());
+            }
+            I256::from_hex_str(hex_part)
+                .map_err(|e| format!("Failed to parse hex number '{}': {}", trimmed, e))?
+        } else {
+            I256::from_str(trimmed)
+                .map_err(|e| format!("Failed to parse number '{}': {}", trimmed, e))?
+        };
 
         self.total = self.total.checked_add(num).ok_or_else(|| {
             format!(
@@ -245,13 +254,77 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_bigint_sum_context_hex_input() {
+    fn test_bigint_sum_context_hex_basic() {
         let mut context = BigIntSumContext::new();
-        assert!(context.add_value("16").is_ok()); // decimal 16
+
+        assert!(context.add_value("0x10").is_ok());
         assert_eq!(context.get_result(), "16");
 
-        assert!(context.add_value("255").is_ok()); // decimal 255
-        assert_eq!(context.get_result(), "271"); // 16 + 255
+        assert!(context.add_value("0X10").is_ok());
+        assert_eq!(context.get_result(), "32");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_bigint_sum_context_hex_large_numbers() {
+        let mut context = BigIntSumContext::new();
+
+        assert!(context.add_value("0xFF").is_ok());
+        assert_eq!(context.get_result(), "255");
+
+        assert!(context.add_value("0x1000000000000000").is_ok());
+        let expected =
+            I256::from_str("255").unwrap() + I256::from_str("1152921504606846976").unwrap();
+        assert_eq!(context.get_result(), expected.to_string());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_bigint_sum_context_hex_mixed_with_decimal() {
+        let mut context = BigIntSumContext::new();
+
+        assert!(context.add_value("100").is_ok());
+        assert_eq!(context.get_result(), "100");
+
+        assert!(context.add_value("0x64").is_ok());
+        assert_eq!(context.get_result(), "200");
+
+        assert!(context.add_value("-50").is_ok());
+        assert_eq!(context.get_result(), "150");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_bigint_sum_context_hex_edge_cases() {
+        let mut context = BigIntSumContext::new();
+
+        assert!(context.add_value("0x0").is_ok());
+        assert_eq!(context.get_result(), "0");
+
+        assert!(context.add_value("0xA").is_ok());
+        assert_eq!(context.get_result(), "10");
+
+        assert!(context.add_value("0xDeAdBeEf").is_ok());
+        let expected = I256::from_str("10").unwrap() + I256::from_str("3735928559").unwrap();
+        assert_eq!(context.get_result(), expected.to_string());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_bigint_sum_context_hex_invalid_input() {
+        let mut context = BigIntSumContext::new();
+
+        assert!(context.add_value("0xGHI").is_err());
+
+        assert!(context.add_value("0x").is_err());
+
+        assert!(context.add_value("0x123Z").is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_bigint_sum_context_hex_input() {
+        let mut context = BigIntSumContext::new();
+        assert!(context.add_value("16").is_ok());
+        assert_eq!(context.get_result(), "16");
+
+        assert!(context.add_value("255").is_ok());
+        assert_eq!(context.get_result(), "271");
     }
 
     #[wasm_bindgen_test]

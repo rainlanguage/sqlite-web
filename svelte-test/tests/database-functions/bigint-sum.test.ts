@@ -295,16 +295,98 @@ describe('BIGINT_SUM Database Function', () => {
 		it('should handle hexadecimal input', async () => {
 			await db.query(`
 				INSERT INTO bigint_test (amount) VALUES 
-				('0x10'),   -- 16 in decimal
-				('0xFF'),   -- 255 in decimal
-				('0x100')   -- 256 in decimal
+				('0x10'),
+				('0xFF'),
+				('0x100')
 			`);
 			
 			const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM bigint_test');
 			const data = JSON.parse(result.value || '[]');
 			
-			// 16 + 255 + 256 = 527
 			expect(data[0].total).toBe('527');
+		});
+
+		it('should handle uppercase hex prefix', async () => {
+			await db.query(`
+				INSERT INTO bigint_test (amount) VALUES 
+				('0X10'),
+				('0XFF')
+			`);
+			
+			const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM bigint_test');
+			const data = JSON.parse(result.value || '[]');
+			
+			expect(data[0].total).toBe('271');
+		});
+
+		it('should handle mixed hex and decimal values', async () => {
+			await db.query(`
+				INSERT INTO bigint_test (amount) VALUES 
+				('100'),
+				('0x64'),
+				('-50')
+			`);
+			
+			const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM bigint_test');
+			const data = JSON.parse(result.value || '[]');
+			
+			expect(data[0].total).toBe('150');
+		});
+
+		it('should handle large hex numbers', async () => {
+			await db.query(`
+				INSERT INTO bigint_test (amount) VALUES 
+				('0x1000000000000000')
+			`);
+			
+			const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM bigint_test');
+			const data = JSON.parse(result.value || '[]');
+			
+			expect(data[0].total).toBe('1152921504606846976');
+		});
+
+		it('should handle hex edge cases', async () => {
+			await db.query(`
+				INSERT INTO bigint_test (amount) VALUES 
+				('0x0'),
+				('0xA'),
+				('0xDeAdBeEf')
+			`);
+			
+			const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM bigint_test');
+			const data = JSON.parse(result.value || '[]');
+			
+			expect(data[0].total).toBe('3735928569');
+		});
+
+		it('should reject invalid hex inputs', async () => {
+			await db.query(`
+				INSERT INTO bigint_test (amount) VALUES ('0xGHI')
+			`);
+			
+			const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM bigint_test');
+			expect(result.error).toBeDefined();
+			expect(result.error?.msg).toContain('Failed to parse hex number');
+		});
+
+		it('should reject incomplete hex inputs', async () => {
+			await db.query(`
+				INSERT INTO bigint_test (amount) VALUES ('0x')
+			`);
+			
+			const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM bigint_test');
+			expect(result.error).toBeDefined();
+			expect(result.error?.msg).toContain('Incomplete hex number');
+		});
+
+		it('should reject hex with invalid characters', async () => {
+			await db.query(`
+				INSERT INTO bigint_test (amount) VALUES ('0x123Z')
+			`);
+			
+			const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM bigint_test');
+			expect(result.error).toBeDefined();
+			expect(result.error?.msg).toContain('Failed to parse hex number');
 		});
 
 		it('should handle leading zeros correctly', async () => {
