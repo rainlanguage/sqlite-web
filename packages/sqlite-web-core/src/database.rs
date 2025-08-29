@@ -3,9 +3,19 @@ use sqlite_wasm_rs::export::{install_opfs_sahpool, *};
 use std::ffi::{CStr, CString};
 use wasm_bindgen::prelude::*;
 
+/// Helper function to split SQL statements by semicolons
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    sql.split(';')
+        .map(|stmt| stmt.trim())
+        .filter(|stmt| !stmt.is_empty())
+        .map(|stmt| stmt.to_string())
+        .collect()
+}
+
 // Real SQLite database using sqlite-wasm-rs FFI
 pub struct SQLiteDatabase {
     db: *mut sqlite3,
+    in_transaction: bool,
 }
 
 unsafe impl Send for SQLiteDatabase {}
@@ -48,10 +58,29 @@ impl SQLiteDatabase {
         // Register custom functions
         register_custom_functions(db).map_err(|e| JsValue::from_str(&e))?;
 
-        Ok(SQLiteDatabase { db })
+        Ok(SQLiteDatabase {
+            db,
+            in_transaction: false,
+        })
     }
 
-    pub async fn exec(&self, sql: &str) -> Result<String, String> {
+    /// Helper to detect transaction control statements
+    fn is_transaction_control(sql: &str) -> Option<bool> {
+        let sql_lower = sql.trim().to_lowercase();
+        if sql_lower.starts_with("begin") || sql_lower.starts_with("start transaction") {
+            Some(true)
+        } else if sql_lower.starts_with("commit") || sql_lower.starts_with("rollback") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Execute a single SQL statement and return the result
+    async fn exec_single_statement(
+        &self,
+        sql: &str,
+    ) -> Result<(Option<Vec<serde_json::Value>>, i32), String> {
         let sql_cstr = CString::new(sql).map_err(|e| format!("Invalid SQL string: {e}"))?;
         let mut stmt = std::ptr::null_mut();
 
@@ -168,22 +197,78 @@ impl SQLiteDatabase {
             }
         }
 
+        // Get changes count before cleanup
+        let changes = unsafe { sqlite3_changes(self.db) };
+
         // Cleanup
         unsafe {
             sqlite3_finalize(stmt);
         }
 
-        // Return results
-        if sql.trim().to_lowercase().starts_with("select") && !results.is_empty() {
+        let is_select = sql.trim().to_lowercase().starts_with("select");
+        if !results.is_empty() || is_select {
+            Ok((Some(results), changes))
+        } else {
+            Ok((None, changes))
+        }
+    }
+
+    /// Execute potentially multiple SQL statements
+    pub async fn exec(&mut self, sql: &str) -> Result<String, String> {
+        if !sql.trim().ends_with(';') {
+            let (results, affected) = self.exec_single_statement(sql).await?;
+            return if let Some(results) = results {
+                serde_json::to_string_pretty(&results)
+                    .map_err(|e| format!("JSON serialization error: {e}"))
+            } else {
+                Ok(format!(
+                    "Query executed successfully. Rows affected: {affected}"
+                ))
+            };
+        }
+
+        let statements = split_sql_statements(sql);
+
+        if statements.is_empty() {
+            return Ok("No statements to execute.".to_string());
+        }
+
+        let mut select_results: Option<Vec<serde_json::Value>> = None;
+        let mut total_affected_rows = 0;
+
+        for (index, statement) in statements.iter().enumerate() {
+            // Update transaction state
+            if let Some(entering_transaction) = Self::is_transaction_control(statement) {
+                self.in_transaction = entering_transaction;
+            }
+
+            // Execute the statement
+            match self.exec_single_statement(statement).await {
+                Ok((results, affected)) => {
+                    // If we get SELECT results and haven't captured any yet, capture them
+                    if results.is_some() && select_results.is_none() {
+                        select_results = results;
+                    }
+                    total_affected_rows += affected;
+                }
+                Err(err) => {
+                    // If we're in a transaction and encounter an error, rollback
+                    if self.in_transaction {
+                        let _ = self.exec_single_statement("ROLLBACK").await;
+                        self.in_transaction = false;
+                    }
+                    return Err(format!("Statement {} failed: {}", index + 1, err));
+                }
+            }
+        }
+
+        // Return appropriate result based on what we executed
+        if let Some(results) = select_results {
             serde_json::to_string_pretty(&results)
                 .map_err(|e| format!("JSON serialization error: {e}"))
-        } else if sql.trim().to_lowercase().starts_with("select") {
-            Ok("[]".to_string())
         } else {
-            // For non-SELECT queries, return changes count
-            let changes = unsafe { sqlite3_changes(self.db) };
             Ok(format!(
-                "Query executed successfully. Rows affected: {changes}"
+                "Query executed successfully. Rows affected: {total_affected_rows}"
             ))
         }
     }
@@ -229,7 +314,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_create_table_and_insert() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -260,7 +345,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_select_query_with_results() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -309,7 +394,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_select_empty_result() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -331,7 +416,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_integer_column_handling() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -364,7 +449,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_float_column_handling() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -395,7 +480,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_text_column_handling() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -432,7 +517,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_blob_column_handling() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -464,7 +549,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_column_names_handling() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -501,7 +586,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_update_query() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -548,7 +633,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_delete_query() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -584,7 +669,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_invalid_sql_syntax_error() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -599,7 +684,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_sql_with_null_byte_error() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -614,7 +699,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_table_not_found_error() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -629,7 +714,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_custom_functions_available() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -662,7 +747,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_multiple_statements_handling() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -677,7 +762,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_sequential_database_operations() {
-        let Some(db) = get_test_db().await else {
+        let Some(mut db) = get_test_db().await else {
             return;
         };
 
@@ -705,6 +790,274 @@ mod tests {
             array[0]["count"].as_i64().unwrap(),
             2,
             "Should have exactly 2 rows after sequential inserts"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_multi_statement_create_and_insert() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        let result = db
+            .exec("CREATE TABLE multi_users (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO multi_users (name) VALUES ('Alice'); INSERT INTO multi_users (name) VALUES ('Bob')")
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Multi-statement should execute successfully"
+        );
+        assert!(
+            result.unwrap().contains("Rows affected: 2"),
+            "Should affect 2 rows total"
+        );
+
+        let select_result = db
+            .exec("SELECT COUNT(*) as count FROM multi_users")
+            .await
+            .expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&select_result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(
+            array[0]["count"].as_i64().unwrap(),
+            2,
+            "Should have 2 rows after multi-statement insert"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_transaction_with_multi_statement() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("CREATE TABLE transaction_test (id INTEGER PRIMARY KEY, value INTEGER)")
+            .await
+            .expect("Create failed");
+
+        let result = db
+            .exec("BEGIN TRANSACTION; INSERT INTO transaction_test (value) VALUES (100); INSERT INTO transaction_test (value) VALUES (200); COMMIT")
+            .await;
+
+        assert!(result.is_ok(), "Transaction should execute successfully");
+        assert!(
+            result.unwrap().contains("Rows affected: 2"),
+            "Should affect 2 rows in transaction"
+        );
+
+        let select_result = db
+            .exec("SELECT COUNT(*) as count FROM transaction_test")
+            .await
+            .expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&select_result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(
+            array[0]["count"].as_i64().unwrap(),
+            2,
+            "Should have 2 rows after successful transaction"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_transaction_with_error_auto_rollback() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("CREATE TABLE rollback_test (id INTEGER PRIMARY KEY, value INTEGER)")
+            .await
+            .expect("Create failed");
+
+        let result = db
+            .exec("BEGIN TRANSACTION; INSERT INTO rollback_test (value) VALUES (300); INSERT INTO nonexistent_table (value) VALUES (400); COMMIT")
+            .await;
+
+        assert!(result.is_err(), "Transaction with error should fail");
+        assert!(
+            result.unwrap_err().contains("Statement 2 failed"),
+            "Should indicate which statement failed"
+        );
+
+        let select_result = db
+            .exec("SELECT COUNT(*) as count FROM rollback_test")
+            .await
+            .expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&select_result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(
+            array[0]["count"].as_i64().unwrap(),
+            0,
+            "Should have 0 rows after failed transaction (auto-rollback)"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_mixed_select_and_modification_statements() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("CREATE TABLE mixed_test (id INTEGER PRIMARY KEY, name TEXT)")
+            .await
+            .expect("Create failed");
+
+        let result = db
+            .exec("INSERT INTO mixed_test (name) VALUES ('First'); SELECT * FROM mixed_test; INSERT INTO mixed_test (name) VALUES ('Second')")
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Mixed statements should execute successfully"
+        );
+        let result_str = result.unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result_str).expect("Should be valid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(
+            array.len(),
+            1,
+            "Should return results from SELECT statement"
+        );
+        assert_eq!(
+            array[0]["name"].as_str().unwrap(),
+            "First",
+            "Should have first inserted value"
+        );
+
+        let count_result = db
+            .exec("SELECT COUNT(*) as count FROM mixed_test")
+            .await
+            .expect("Select failed");
+        let count_parsed: serde_json::Value =
+            serde_json::from_str(&count_result).expect("Invalid JSON");
+        let count_array = count_parsed.as_array().expect("Should be array");
+        assert_eq!(
+            count_array[0]["count"].as_i64().unwrap(),
+            2,
+            "Both INSERT statements should have been executed"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_empty_statements_handling() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        let result = db.exec(";;; ; ").await;
+
+        assert!(result.is_ok(), "Empty statements should not error");
+        assert_eq!(
+            result.unwrap(),
+            "No statements to execute.",
+            "Should handle empty input gracefully"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_transaction_state_tracking() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("CREATE TABLE state_test (id INTEGER)")
+            .await
+            .expect("Create failed");
+
+        assert!(!db.in_transaction, "Should not be in transaction initially");
+
+        db.exec("BEGIN TRANSACTION").await.expect("Begin failed");
+
+        assert!(db.in_transaction, "Should be in transaction after BEGIN");
+
+        db.exec("COMMIT").await.expect("Commit failed");
+
+        assert!(
+            !db.in_transaction,
+            "Should not be in transaction after COMMIT"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_sql_splitting_utility() {
+        let statements = split_sql_statements("SELECT 1; INSERT INTO test VALUES (1); ; SELECT 2;");
+        assert_eq!(
+            statements.len(),
+            3,
+            "Should split into 3 non-empty statements"
+        );
+        assert_eq!(
+            statements[0], "SELECT 1",
+            "First statement should be SELECT 1"
+        );
+        assert_eq!(
+            statements[1], "INSERT INTO test VALUES (1)",
+            "Second statement should be INSERT"
+        );
+        assert_eq!(
+            statements[2], "SELECT 2",
+            "Third statement should be SELECT 2"
+        );
+
+        let empty_statements = split_sql_statements("  ;  ; ");
+        assert_eq!(
+            empty_statements.len(),
+            0,
+            "Should return empty vec for only empty statements"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_sql_injection_prevention() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("CREATE TABLE injection_test (id INTEGER PRIMARY KEY, username TEXT)")
+            .await
+            .expect("Create failed");
+
+        db.exec("INSERT INTO injection_test (username) VALUES ('alice')")
+            .await
+            .expect("Insert failed");
+
+        let injection_attempt = "SELECT * FROM injection_test WHERE username = ''; DELETE FROM injection_test WHERE 1=1";
+        let result = db.exec(injection_attempt).await;
+
+        assert!(result.is_ok(), "Query should execute without error");
+
+        let count_result = db
+            .exec("SELECT COUNT(*) as count FROM injection_test")
+            .await
+            .expect("Count query failed");
+        let parsed: serde_json::Value = serde_json::from_str(&count_result).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(
+            array[0]["count"].as_i64().unwrap(),
+            1,
+            "Data should not be deleted by injection attempt (no trailing semicolon)"
+        );
+
+        let multi_statement_with_semicolon = "INSERT INTO injection_test (username) VALUES ('bob'); DELETE FROM injection_test WHERE username = 'bob';";
+        let result2 = db.exec(multi_statement_with_semicolon).await;
+
+        assert!(
+            result2.is_ok(),
+            "Multi-statement with trailing semicolon should work"
+        );
+
+        let final_count = db
+            .exec("SELECT COUNT(*) as count FROM injection_test")
+            .await
+            .expect("Final count failed");
+        let final_parsed: serde_json::Value =
+            serde_json::from_str(&final_count).expect("Invalid JSON");
+        let final_array = final_parsed.as_array().expect("Should be array");
+        assert_eq!(
+            final_array[0]["count"].as_i64().unwrap(),
+            1,
+            "Multi-statement with trailing semicolon should execute both insert and delete"
         );
     }
 }

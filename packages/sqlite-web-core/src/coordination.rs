@@ -14,7 +14,7 @@ use crate::messages::{ChannelMessage, PendingQuery};
 pub struct WorkerState {
     pub worker_id: String,
     pub is_leader: Rc<RefCell<bool>>,
-    pub db: Rc<RefCell<Option<Rc<SQLiteDatabase>>>>,
+    pub db: Rc<RefCell<Option<SQLiteDatabase>>>,
     pub channel: BroadcastChannel,
     pub pending_queries: Rc<RefCell<HashMap<String, PendingQuery>>>,
 }
@@ -50,11 +50,18 @@ impl WorkerState {
                             let channel = channel.clone();
 
                             spawn_local(async move {
-                                let database = db.borrow().clone();
-                                let result = if let Some(database) = database {
-                                    database.exec(&sql).await
-                                } else {
-                                    Err("Database not initialized".to_string())
+                                let result = {
+                                    // Extract database temporarily to avoid holding RefCell across await
+                                    let db_opt = db.borrow_mut().take();
+                                    match db_opt {
+                                        Some(mut database) => {
+                                            let result = database.exec(&sql).await;
+                                            // Put the database back
+                                            *db.borrow_mut() = Some(database);
+                                            result
+                                        }
+                                        None => Err("Database not initialized".to_string()),
+                                    }
                                 };
 
                                 let response = match result {
@@ -131,7 +138,7 @@ impl WorkerState {
             spawn_local(async move {
                 match SQLiteDatabase::initialize_opfs().await {
                     Ok(database) => {
-                        *db.borrow_mut() = Some(Rc::new(database));
+                        *db.borrow_mut() = Some(database);
 
                         let msg = ChannelMessage::NewLeader {
                             leader_id: worker_id.clone(),
@@ -162,11 +169,16 @@ impl WorkerState {
 
     pub async fn execute_query(&self, sql: String) -> Result<String, String> {
         if *self.is_leader.borrow() {
-            let database = self.db.borrow().clone();
-            if let Some(database) = database {
-                database.exec(&sql).await
-            } else {
-                Err("Database not initialized".to_string())
+            // Extract database temporarily to avoid holding RefCell across await
+            let db_opt = self.db.borrow_mut().take();
+            match db_opt {
+                Some(mut database) => {
+                    let result = database.exec(&sql).await;
+                    // Put the database back
+                    *self.db.borrow_mut() = Some(database);
+                    result
+                }
+                None => Err("Database not initialized".to_string()),
             }
         } else {
             let query_id = Uuid::new_v4().to_string();
