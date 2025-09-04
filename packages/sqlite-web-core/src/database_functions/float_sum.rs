@@ -107,10 +107,9 @@ pub unsafe extern "C" fn float_sum_final(context: *mut sqlite3_context) {
 
     if aggregate_context.is_null() {
         // No values were processed, return 0 in hex format
-        let zero_result = CString::new(
-            "0x0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
+        let zero_result =
+            CString::new("0x0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
         sqlite3_result_text(
             context,
             zero_result.as_ptr(),
