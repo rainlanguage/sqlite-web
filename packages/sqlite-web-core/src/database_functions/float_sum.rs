@@ -32,9 +32,8 @@ impl FloatSumContext {
     }
 
     fn get_result(&self) -> Result<String, String> {
-        self.total
-            .format()
-            .map_err(|e| format!("Failed to format float result: {}", e))
+        // Return the hex representation of the accumulated Float
+        Ok(self.total.as_hex())
     }
 }
 
@@ -107,8 +106,10 @@ pub unsafe extern "C" fn float_sum_final(context: *mut sqlite3_context) {
         sqlite3_aggregate_context(context, std::mem::size_of::<FloatSumContext>() as c_int);
 
     if aggregate_context.is_null() {
-        // No values were processed, return 0
-        let zero_result = CString::new("0").unwrap();
+        // No values were processed, return 0 in hex format
+        let zero_result =
+            CString::new("0x0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
         sqlite3_result_text(
             context,
             zero_result.as_ptr(),
@@ -161,7 +162,9 @@ mod tests {
         let context = FloatSumContext::new();
         let zero = Float::parse("0".to_string()).unwrap();
         assert_eq!(context.total.format().unwrap(), zero.format().unwrap());
-        assert_eq!(context.get_result().unwrap(), "0");
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "0");
     }
 
     #[wasm_bindgen_test]
@@ -171,12 +174,16 @@ mod tests {
         assert!(context
             .add_value("0xffffffff00000000000000000000000000000000000000000000000000000001")
             .is_ok()); // 0.1
-        assert_eq!(context.get_result().unwrap(), "0.1");
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "0.1");
 
         assert!(context
             .add_value("0xffffffff00000000000000000000000000000000000000000000000000000005")
             .is_ok()); // 0.5
-        assert_eq!(context.get_result().unwrap(), "0.6"); // 0.1 + 0.5 = 0.6
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "0.6"); // 0.1 + 0.5 = 0.6
     }
 
     #[wasm_bindgen_test]
@@ -186,12 +193,16 @@ mod tests {
         assert!(context
             .add_value("ffffffff0000000000000000000000000000000000000000000000000000000f")
             .is_ok()); // 1.5
-        assert_eq!(context.get_result().unwrap(), "1.5");
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "1.5");
 
         assert!(context
             .add_value("fffffffe000000000000000000000000000000000000000000000000000000e1")
             .is_ok()); // 2.25
-        assert_eq!(context.get_result().unwrap(), "3.75"); // 1.5 + 2.25 = 3.75
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "3.75"); // 1.5 + 2.25 = 3.75
     }
 
     #[wasm_bindgen_test]
@@ -224,10 +235,14 @@ mod tests {
         let large_hex2 = "0xfffffffd0000000000000000000000000000000000000000000000000001e240"; // 123.456
 
         assert!(context.add_value(large_hex1).is_ok());
-        assert_eq!(context.get_result().unwrap(), "100.25");
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "100.25");
 
         assert!(context.add_value(large_hex2).is_ok());
-        assert_eq!(context.get_result().unwrap(), "223.706"); // 100.25 + 123.456 = 223.706
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "223.706"); // 100.25 + 123.456 = 223.706
     }
 
     #[wasm_bindgen_test]
@@ -237,12 +252,16 @@ mod tests {
         assert!(context
             .add_value("0x0000000000000000000000000000000000000000000000000000000000000000")
             .is_ok()); // 0
-        assert_eq!(context.get_result().unwrap(), "0");
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "0");
 
         assert!(context
             .add_value("0xffffffff00000000000000000000000000000000000000000000000000000001")
             .is_ok()); // 0.1
-        assert_eq!(context.get_result().unwrap(), "0.1"); // 0 + 0.1 = 0.1
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "0.1"); // 0 + 0.1 = 0.1
     }
 
     #[wasm_bindgen_test]
@@ -252,12 +271,16 @@ mod tests {
         assert!(context
             .add_value("0xFfFfFfFf0000000000000000000000000000000000000000000000000000000F")
             .is_ok()); // 1.5
-        assert_eq!(context.get_result().unwrap(), "1.5");
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "1.5");
 
         assert!(context
             .add_value("0xFfFfFfFe000000000000000000000000000000000000000000000000000000E1")
             .is_ok()); // 2.25
-        assert_eq!(context.get_result().unwrap(), "3.75"); // 1.5 + 2.25 = 3.75
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "3.75"); // 1.5 + 2.25 = 3.75
     }
 
     #[wasm_bindgen_test]
@@ -275,12 +298,16 @@ mod tests {
         assert!(context
             .add_value("  0x000000000000000000000000000000000000000000000000000000000000000a  ")
             .is_ok()); // 10
-        assert_eq!(context.get_result().unwrap(), "10");
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "10");
 
         assert!(context
             .add_value("\t0x0000000000000000000000000000000000000000000000000000000000000014\n")
             .is_ok()); // 20
-        assert_eq!(context.get_result().unwrap(), "30"); // 10 + 20 = 30
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "30"); // 10 + 20 = 30
     }
 
     #[wasm_bindgen_test]
@@ -299,8 +326,9 @@ mod tests {
             assert!(context.add_value(hex_val).is_ok());
         }
 
-        let result = context.get_result().unwrap();
-        assert_eq!(result, "1503.444444443444444441"); // Sum of all 5 high-precision values
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "1503.444444443444444441"); // Sum of all 5 high-precision values
     }
 
     #[wasm_bindgen_test]
@@ -310,16 +338,22 @@ mod tests {
         assert!(context
             .add_value("0xffffffee00000000000000000000000000000000000000000f9751ff4d94f34e")
             .is_ok()); // 1.123456789012345678
-        assert_eq!(context.get_result().unwrap(), "1.123456789012345678");
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "1.123456789012345678");
 
         assert!(context
             .add_value("0xffffffee0000000000000000000000000000000000000000297647c698c0b478")
             .is_ok()); // 2.987654321098765432
-        assert_eq!(context.get_result().unwrap(), "4.11111111011111111"); // 1.123456789012345678 + 2.987654321098765432
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "4.11111111011111111"); // 1.123456789012345678 + 2.987654321098765432
 
         assert!(context
             .add_value("0x0000000000000000000000000000000000000000000000000000000000000064")
             .is_ok()); // 100
-        assert_eq!(context.get_result().unwrap(), "104.11111111011111111"); // 4.11111111011111111 + 100
+        let result_hex = context.get_result().unwrap();
+        let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
+        assert_eq!(result_decimal, "104.11111111011111111"); // 4.11111111011111111 + 100
     }
 }
