@@ -3,15 +3,6 @@ use sqlite_wasm_rs::export::{install_opfs_sahpool, *};
 use std::ffi::{CStr, CString};
 use wasm_bindgen::prelude::*;
 
-/// Helper function to split SQL statements by semicolons
-fn split_sql_statements(sql: &str) -> Vec<String> {
-    sql.split(';')
-        .map(|stmt| stmt.trim())
-        .filter(|stmt| !stmt.is_empty())
-        .map(|stmt| stmt.to_string())
-        .collect()
-}
-
 // Real SQLite database using sqlite-wasm-rs FFI
 pub struct SQLiteDatabase {
     db: *mut sqlite3,
@@ -64,50 +55,16 @@ impl SQLiteDatabase {
         })
     }
 
-    /// Helper to detect transaction control statements
-    fn is_transaction_control(sql: &str) -> Option<bool> {
-        let sql_lower = sql.trim().to_lowercase();
-        if sql_lower.starts_with("begin") || sql_lower.starts_with("start transaction") {
-            Some(true)
-        } else if sql_lower.starts_with("commit") || sql_lower.starts_with("rollback") {
-            Some(false)
-        } else {
-            None
-        }
-    }
-
-    /// Execute a single SQL statement and return the result
-    async fn exec_single_statement(
+    /// Execute a prepared statement, collecting any result rows and the affected row count.
+    /// Returns Some(rows) for queries (column count > 0), even if zero rows; None otherwise.
+    fn exec_prepared_statement(
         &self,
-        sql: &str,
+        stmt: *mut sqlite3_stmt,
     ) -> Result<(Option<Vec<serde_json::Value>>, i32), String> {
-        let sql_cstr = CString::new(sql).map_err(|e| format!("Invalid SQL string: {e}"))?;
-        let mut stmt = std::ptr::null_mut();
+        // Determine if this statement produces rows (e.g., SELECT/PRAGMA)
+        let col_count = unsafe { sqlite3_column_count(stmt) };
+        let is_query = col_count > 0;
 
-        // Prepare statement
-        let ret = unsafe {
-            sqlite3_prepare_v2(
-                self.db,
-                sql_cstr.as_ptr(),
-                -1,
-                &mut stmt,
-                std::ptr::null_mut(),
-            )
-        };
-
-        if ret != SQLITE_OK {
-            let error_msg = unsafe {
-                let ptr = sqlite3_errmsg(self.db);
-                if !ptr.is_null() {
-                    CStr::from_ptr(ptr).to_string_lossy().into_owned()
-                } else {
-                    format!("SQLite error code: {ret}")
-                }
-            };
-            return Err(format!("Failed to prepare statement: {error_msg}"));
-        }
-
-        // Execute and collect results
         let mut results = Vec::new();
         let mut column_names = Vec::new();
         let mut first_row = true;
@@ -118,8 +75,6 @@ impl SQLiteDatabase {
             match step_result {
                 SQLITE_ROW => {
                     if first_row {
-                        // Get column names
-                        let col_count = unsafe { sqlite3_column_count(stmt) };
                         for i in 0..col_count {
                             let col_name = unsafe {
                                 let ptr = sqlite3_column_name(stmt, i);
@@ -134,10 +89,7 @@ impl SQLiteDatabase {
                         first_row = false;
                     }
 
-                    // Get row data
                     let mut row_obj = std::collections::HashMap::new();
-                    let col_count = unsafe { sqlite3_column_count(stmt) };
-
                     for i in 0..col_count {
                         let col_type = unsafe { sqlite3_column_type(stmt, i) };
                         let value = match col_type {
@@ -189,34 +141,75 @@ impl SQLiteDatabase {
                             format!("SQLite error code: {step_result}")
                         }
                     };
-                    unsafe {
-                        sqlite3_finalize(stmt);
-                    }
+                    unsafe { sqlite3_finalize(stmt) };
                     return Err(format!("Query execution failed: {error_msg}"));
                 }
             }
         }
 
-        // Get changes count before cleanup
         let changes = unsafe { sqlite3_changes(self.db) };
 
-        // Cleanup
-        unsafe {
-            sqlite3_finalize(stmt);
-        }
+        unsafe { sqlite3_finalize(stmt) };
 
-        let is_select = sql.trim().to_lowercase().starts_with("select");
-        if !results.is_empty() || is_select {
+        if is_query {
             Ok((Some(results), changes))
         } else {
             Ok((None, changes))
         }
     }
 
+    /// Execute a single SQL statement and return the result
+    async fn exec_single_statement(
+        &self,
+        sql: &str,
+    ) -> Result<(Option<Vec<serde_json::Value>>, i32), String> {
+        let sql_cstr = CString::new(sql).map_err(|e| format!("Invalid SQL string: {e}"))?;
+        let mut ptr = sql_cstr.as_ptr();
+
+        loop {
+            let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
+            let mut tail: *const i8 = std::ptr::null();
+
+            let ret = unsafe { sqlite3_prepare_v2(self.db, ptr, -1, &mut stmt, &mut tail) };
+            if ret != SQLITE_OK {
+                let error_msg = unsafe {
+                    let p = sqlite3_errmsg(self.db);
+                    if !p.is_null() {
+                        CStr::from_ptr(p).to_string_lossy().into_owned()
+                    } else {
+                        format!("SQLite error code: {ret}")
+                    }
+                };
+                return Err(format!("Failed to prepare statement: {error_msg}"));
+            }
+
+            // No statement found at this position (whitespace/comments). Advance or finish.
+            if stmt.is_null() {
+                if tail.is_null() || tail == ptr {
+                    // No more content
+                    return Ok((None, 0));
+                } else {
+                    ptr = tail;
+                    continue;
+                }
+            }
+
+            // Execute only the first prepared statement; ignore any tail
+            return self.exec_prepared_statement(stmt);
+        }
+    }
+
     /// Execute potentially multiple SQL statements
     pub async fn exec(&mut self, sql: &str) -> Result<String, String> {
-        if !sql.trim().ends_with(';') {
-            let (results, affected) = self.exec_single_statement(sql).await?;
+        let trimmed = sql.trim();
+
+        // Single-statement mode: execute only the first statement, ignore tail
+        if !trimmed.ends_with(';') {
+            let (results, affected) = self.exec_single_statement(trimmed).await?;
+
+            // Update transaction state based on actual DB autocommit mode
+            self.in_transaction = unsafe { sqlite3_get_autocommit(self.db) } == 0;
+
             return if let Some(results) = results {
                 serde_json::to_string_pretty(&results)
                     .map_err(|e| format!("JSON serialization error: {e}"))
@@ -227,42 +220,84 @@ impl SQLiteDatabase {
             };
         }
 
-        let statements = split_sql_statements(sql);
-
-        if statements.is_empty() {
-            return Ok("No statements to execute.".to_string());
-        }
+        // Multi-statement mode: use SQLite parser with tail pointer
+        let sql_cstr = CString::new(sql).map_err(|e| format!("Invalid SQL string: {e}"))?;
+        let mut ptr = sql_cstr.as_ptr();
 
         let mut select_results: Option<Vec<serde_json::Value>> = None;
         let mut total_affected_rows = 0;
+        let mut stmt_index: usize = 0;
+        let mut executed_any = false;
 
-        for (index, statement) in statements.iter().enumerate() {
-            // Update transaction state
-            if let Some(entering_transaction) = Self::is_transaction_control(statement) {
-                self.in_transaction = entering_transaction;
+        loop {
+            let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
+            let mut tail: *const i8 = std::ptr::null();
+
+            let ret = unsafe { sqlite3_prepare_v2(self.db, ptr, -1, &mut stmt, &mut tail) };
+            if ret != SQLITE_OK {
+                // Rollback if we're inside a transaction
+                if unsafe { sqlite3_get_autocommit(self.db) } == 0 {
+                    let _ = self.exec_single_statement("ROLLBACK").await; // best-effort
+                }
+                let error_msg = unsafe {
+                    let p = sqlite3_errmsg(self.db);
+                    if !p.is_null() {
+                        CStr::from_ptr(p).to_string_lossy().into_owned()
+                    } else {
+                        format!("SQLite error code: {ret}")
+                    }
+                };
+                return Err(format!(
+                    "Statement {} failed: {}",
+                    stmt_index + 1,
+                    error_msg
+                ));
             }
 
-            // Execute the statement
-            match self.exec_single_statement(statement).await {
-                Ok((results, affected)) => {
-                    // If we get SELECT results and haven't captured any yet, capture them
-                    if results.is_some() && select_results.is_none() {
-                        select_results = results;
+            if stmt.is_null() {
+                // No statement at this position; advance or finish
+                if tail.is_null() || tail == ptr {
+                    break;
+                } else {
+                    ptr = tail;
+                    continue;
+                }
+            }
+
+            // We have a valid statement; execute it
+            stmt_index += 1;
+            executed_any = true;
+            match self.exec_prepared_statement(stmt) {
+                Ok((rows_opt, affected)) => {
+                    if rows_opt.is_some() && select_results.is_none() {
+                        select_results = rows_opt;
                     }
                     total_affected_rows += affected;
                 }
                 Err(err) => {
-                    // If we're in a transaction and encounter an error, rollback
-                    if self.in_transaction {
-                        let _ = self.exec_single_statement("ROLLBACK").await;
-                        self.in_transaction = false;
+                    // Rollback if we're inside a transaction
+                    if unsafe { sqlite3_get_autocommit(self.db) } == 0 {
+                        let _ = self.exec_single_statement("ROLLBACK").await; // best-effort
                     }
-                    return Err(format!("Statement {} failed: {}", index + 1, err));
+                    return Err(format!("Statement {} failed: {}", stmt_index, err));
                 }
+            }
+
+            // Advance to the tail of this statement
+            if tail.is_null() || tail == ptr {
+                break;
+            } else {
+                ptr = tail;
             }
         }
 
-        // Return appropriate result based on what we executed
+        // Update transaction state
+        self.in_transaction = unsafe { sqlite3_get_autocommit(self.db) } == 0;
+
+        if !executed_any {
+            return Ok("No statements to execute.".to_string());
+        }
+
         if let Some(results) = select_results {
             serde_json::to_string_pretty(&results)
                 .map_err(|e| format!("JSON serialization error: {e}"))
@@ -981,31 +1016,19 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_sql_splitting_utility() {
-        let statements = split_sql_statements("SELECT 1; INSERT INTO test VALUES (1); ; SELECT 2;");
-        assert_eq!(
-            statements.len(),
-            3,
-            "Should split into 3 non-empty statements"
-        );
-        assert_eq!(
-            statements[0], "SELECT 1",
-            "First statement should be SELECT 1"
-        );
-        assert_eq!(
-            statements[1], "INSERT INTO test VALUES (1)",
-            "Second statement should be INSERT"
-        );
-        assert_eq!(
-            statements[2], "SELECT 2",
-            "Third statement should be SELECT 2"
-        );
+        // Ensure production logic handles multiple semicolons and empty statements gracefully
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
 
-        let empty_statements = split_sql_statements("  ;  ; ");
-        assert_eq!(
-            empty_statements.len(),
-            0,
-            "Should return empty vec for only empty statements"
-        );
+        // Multiple statements with empty fragments should execute the non-empty ones
+        let res = db
+            .exec("; SELECT 1; ; SELECT 2; ;")
+            .await
+            .expect("Execution failed");
+        let parsed: serde_json::Value = serde_json::from_str(&res).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(array.len(), 1, "Only first result set should be returned");
     }
 
     #[wasm_bindgen_test]
@@ -1059,5 +1082,94 @@ mod tests {
             1,
             "Multi-statement with trailing semicolon should execute both insert and delete"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_semicolon_in_string_literal_multi_statement() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("CREATE TABLE semi_string_test (name TEXT)")
+            .await
+            .expect("Create failed");
+
+        // Semicolon inside the string literal should NOT split the statement.
+        let sql = "INSERT INTO semi_string_test (name) VALUES ('a; b'); INSERT INTO semi_string_test (name) VALUES ('c');";
+        let result = db.exec(sql).await;
+        assert!(
+            result.is_ok(),
+            "Statements with ';' in strings should execute"
+        );
+
+        let rows = db
+            .exec("SELECT name FROM semi_string_test ORDER BY rowid")
+            .await
+            .expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&rows).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(array.len(), 2, "Should have inserted two rows");
+        assert_eq!(array[0]["name"].as_str().unwrap(), "a; b");
+        assert_eq!(array[1]["name"].as_str().unwrap(), "c");
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_semicolons_in_comments_do_not_split() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("CREATE TABLE comment_split_test (id INTEGER)")
+            .await
+            .expect("Create failed");
+
+        // Both block and line comments contain semicolons; they should not split statements.
+        let sql = "/* leading; comment; with; semicolons */ INSERT INTO comment_split_test (id) VALUES (1); -- trailing; comment;\nINSERT INTO comment_split_test (id) VALUES (2);";
+        let result = db.exec(sql).await;
+        assert!(
+            result.is_ok(),
+            "Statements with ';' in comments should execute"
+        );
+
+        let rows = db
+            .exec("SELECT COUNT(*) as count FROM comment_split_test")
+            .await
+            .expect("Count failed");
+        let parsed: serde_json::Value = serde_json::from_str(&rows).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(array[0]["count"].as_i64().unwrap(), 2);
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_create_trigger_with_semicolons_in_body() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        // Create source and log tables (multi-statement create)
+        db.exec("CREATE TABLE trg_src (id INTEGER); CREATE TABLE trg_log (msg TEXT);")
+            .await
+            .expect("Create tables failed");
+
+        // Create a trigger whose body contains statements separated by semicolons
+        // and also a string literal that itself includes a semicolon.
+        let trigger_sql = "CREATE TRIGGER trg_after_insert AFTER INSERT ON trg_src BEGIN INSERT INTO trg_log (msg) VALUES ('insert; happened'); INSERT INTO trg_log (msg) VALUES ('second; line'); END;";
+        db.exec(trigger_sql).await.expect("Create trigger failed");
+
+        // Fire the trigger
+        db.exec("INSERT INTO trg_src (id) VALUES (123)")
+            .await
+            .expect("Insert into src failed");
+
+        // Verify trigger body executed both statements and preserved semicolons in literals
+        let rows = db
+            .exec("SELECT msg FROM trg_log ORDER BY rowid")
+            .await
+            .expect("Select from log failed");
+        let parsed: serde_json::Value = serde_json::from_str(&rows).expect("Invalid JSON");
+        let array = parsed.as_array().expect("Should be array");
+        assert_eq!(array.len(), 2, "Trigger should have inserted two rows");
+        assert_eq!(array[0]["msg"].as_str().unwrap(), "insert; happened");
+        assert_eq!(array[1]["msg"].as_str().unwrap(), "second; line");
     }
 }
