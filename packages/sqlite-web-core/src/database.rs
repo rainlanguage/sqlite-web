@@ -1,4 +1,5 @@
 use crate::database_functions::register_custom_functions;
+use crate::util::sanitize_db_filename;
 use sqlite_wasm_rs::export::{install_opfs_sahpool, *};
 use std::ffi::{CStr, CString};
 use wasm_bindgen::prelude::*;
@@ -19,28 +20,14 @@ impl SQLiteDatabase {
             .map_err(|e| JsValue::from_str(&format!("Failed to install OPFS VFS: {e:?}")))?;
 
         // Open database with OPFS
-        let mut db = std::ptr::null_mut();
-        fn sanitize_filename(name: &str) -> String {
-            let mut s: String = name
-                .trim()
-                .chars()
-                .map(|c| match c {
-                    'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => c,
-                    _ => '_',
-                })
-                .collect();
-            if s.is_empty() {
-                s.push_str("db");
-            }
-            if !s.ends_with(".db") {
-                s.push_str(".db");
-            }
-            s
-        }
-
-        let sanitized = sanitize_filename(db_name);
+        let mut db: *mut sqlite3 = std::ptr::null_mut();
+        let sanitized = sanitize_db_filename(db_name);
         let open_uri = format!("opfs-sahpool:{}", sanitized);
-        let db_name = CString::new(open_uri).unwrap();
+        let db_name = CString::new(open_uri.clone()).map_err(|e| {
+            JsValue::from_str(&format!(
+                "Invalid database URI (NUL found): {open_uri} ({e})"
+            ))
+        })?;
 
         let ret = unsafe {
             sqlite3_open_v2(
@@ -53,20 +40,30 @@ impl SQLiteDatabase {
 
         if ret != SQLITE_OK {
             let error_msg = unsafe {
-                let ptr = sqlite3_errmsg(db);
-                if !ptr.is_null() {
-                    CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                if db.is_null() {
+                    format!("SQLite open error code: {ret}")
                 } else {
-                    format!("SQLite error code: {ret}")
+                    let ptr = sqlite3_errmsg(db);
+                    if !ptr.is_null() {
+                        CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                    } else {
+                        format!("SQLite open error code: {ret}")
+                    }
                 }
             };
+            if !db.is_null() {
+                unsafe { sqlite3_close(db) };
+            }
             return Err(JsValue::from_str(&format!(
                 "Failed to open SQLite database: {error_msg}"
             )));
         }
 
         // Register custom functions
-        register_custom_functions(db).map_err(|e| JsValue::from_str(&e))?;
+        if let Err(e) = register_custom_functions(db) {
+            unsafe { sqlite3_close(db) };
+            return Err(JsValue::from_str(&e));
+        }
 
         Ok(SQLiteDatabase { db })
     }

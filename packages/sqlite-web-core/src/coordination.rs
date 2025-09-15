@@ -9,6 +9,7 @@ use web_sys::BroadcastChannel;
 
 use crate::database::SQLiteDatabase;
 use crate::messages::{ChannelMessage, PendingQuery};
+use crate::util::sanitize_identifier;
 
 // Worker state
 pub struct WorkerState {
@@ -42,24 +43,9 @@ impl WorkerState {
             }
         }
 
-        fn sanitize_for_id(name: &str) -> String {
-            let mut s: String = name
-                .trim()
-                .chars()
-                .map(|c| match c {
-                    'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '.' => c,
-                    _ => '_',
-                })
-                .collect();
-            if s.is_empty() {
-                s.push_str("db");
-            }
-            s
-        }
-
         let worker_id = Uuid::new_v4().to_string();
         let db_name_raw = get_db_name_from_global()?;
-        let channel_name = format!("sqlite-queries-{}", sanitize_for_id(&db_name_raw));
+        let channel_name = format!("sqlite-queries-{}", sanitize_identifier(&db_name_raw));
         let channel = BroadcastChannel::new(&channel_name)?;
 
         Ok(WorkerState {
@@ -191,20 +177,7 @@ impl WorkerState {
         let request_fn = Reflect::get(&locks, &JsValue::from_str("request")).unwrap();
         let request_fn = request_fn.dyn_ref::<Function>().unwrap();
 
-        let lock_id: String = {
-            let mut s: String = self
-                .db_name
-                .chars()
-                .map(|c| match c {
-                    'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '.' => c,
-                    _ => '_',
-                })
-                .collect();
-            if s.is_empty() {
-                s.push_str("db");
-            }
-            format!("sqlite-database-{}", s)
-        };
+        let lock_id: String = format!("sqlite-database-{}", sanitize_identifier(&self.db_name));
         let _ = request_fn.call3(
             &locks,
             &JsValue::from_str(&lock_id),
