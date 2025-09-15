@@ -184,7 +184,9 @@ export async function cleanupDatabase(db: SQLiteWasmDatabase): Promise<void> {
 			'long_query_test', 'many_params_test', 'nested_test', 'timeout_test',
 			'recovery_test', 'custom_function_test', 'special_chars_test', 'concurrent_error_test',
 			// Worker communication test tables  
-			'workers_test', 'shared_data', 'worker_coordination', 'message_test'
+			'workers_test', 'shared_data', 'worker_coordination', 'message_test',
+			// Multi-SQL commands (UI) test tables
+			'multi_ui', 'semi_ui', 'gate_ui', 'trg_src_ui', 'trg_log_ui'
 		];
 		for (const table of tables) {
 			try {

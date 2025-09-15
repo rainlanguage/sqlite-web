@@ -55,6 +55,20 @@ describe("Multi-SQL Commands (UI Integration)", () => {
     expect(data[0].note).toBe("hello; world");
     expect(data[1].name).toBe("B");
     expect(data[1].note).toBe("-- not a comment ; inside string");
+
+    // Line comment with semicolons should not split statements
+    const lineCommentAndInsert = `
+      -- pre;line;comment
+      INSERT INTO semi_ui (name, note) VALUES ('C', 'third row');
+    `;
+    const res2 = await db.query(lineCommentAndInsert);
+    expect(res2.error).toBeUndefined();
+
+    const countRes = await db.query(`SELECT COUNT(*) c FROM semi_ui`);
+    const countData = JSON.parse(countRes.value || "[]");
+    expect(Array.isArray(countData)).toBe(true);
+    expect(countData).toHaveLength(1);
+    expect(countData[0].c).toBe(3);
   });
 
   it("gates multi-statement execution by trailing semicolon", async () => {

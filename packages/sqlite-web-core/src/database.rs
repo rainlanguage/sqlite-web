@@ -46,8 +46,11 @@ impl SQLiteDatabase {
             )));
         }
 
-        // Register custom functions
-        register_custom_functions(db).map_err(|e| JsValue::from_str(&e))?;
+        // Register custom functions; close DB on failure to avoid leaks
+        if let Err(e) = register_custom_functions(db) {
+            unsafe { sqlite3_close(db) };
+            return Err(JsValue::from_str(&e));
+        }
 
         Ok(SQLiteDatabase {
             db,
