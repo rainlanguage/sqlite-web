@@ -3,12 +3,12 @@ import init, { SQLiteWasmDatabase } from 'sqlite-web';
 /**
  * Initialize a new SQLite database instance for testing
  */
-export async function createTestDatabase(): Promise<SQLiteWasmDatabase> {
+export async function createTestDatabase(name: string = 'ui-test-db'): Promise<SQLiteWasmDatabase> {
 	// Initialize WASM module
 	await init();
 	
 	// Create database instance
-	const result = SQLiteWasmDatabase.new();
+	const result = SQLiteWasmDatabase.new(name);
 	if (result.error) {
 		throw new Error(`Failed to create database: ${result.error.msg}`);
 	}
