@@ -12,7 +12,7 @@ unsafe impl Send for SQLiteDatabase {}
 unsafe impl Sync for SQLiteDatabase {}
 
 impl SQLiteDatabase {
-    pub async fn initialize_opfs() -> Result<Self, JsValue> {
+    pub async fn initialize_opfs(db_name: &str) -> Result<Self, JsValue> {
         // Install OPFS VFS and set as default
         install_opfs_sahpool(None, true)
             .await
@@ -20,7 +20,27 @@ impl SQLiteDatabase {
 
         // Open database with OPFS
         let mut db = std::ptr::null_mut();
-        let db_name = CString::new("opfs-sahpool:worker.db").unwrap();
+        fn sanitize_filename(name: &str) -> String {
+            let mut s: String = name
+                .trim()
+                .chars()
+                .map(|c| match c {
+                    'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => c,
+                    _ => '_',
+                })
+                .collect();
+            if s.is_empty() {
+                s.push_str("db");
+            }
+            if !s.ends_with(".db") {
+                s.push_str(".db");
+            }
+            s
+        }
+
+        let sanitized = sanitize_filename(db_name);
+        let open_uri = format!("opfs-sahpool:{}", sanitized);
+        let db_name = CString::new(open_uri).unwrap();
 
         let ret = unsafe {
             sqlite3_open_v2(
@@ -208,7 +228,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_opfs_initialization_success() {
-        let result = SQLiteDatabase::initialize_opfs().await;
+        let result = SQLiteDatabase::initialize_opfs("testdb").await;
         if result.is_err() {
             return;
         }
@@ -224,7 +244,7 @@ mod tests {
     }
 
     async fn get_test_db() -> Option<SQLiteDatabase> {
-        (SQLiteDatabase::initialize_opfs().await).ok()
+        (SQLiteDatabase::initialize_opfs("testdb").await).ok()
     }
 
     #[wasm_bindgen_test]

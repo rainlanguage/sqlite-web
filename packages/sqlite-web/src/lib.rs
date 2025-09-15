@@ -1,5 +1,5 @@
 use js_sys::Array;
-use serde::{de::IgnoredAny, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
 use thiserror::Error;
@@ -32,8 +32,20 @@ impl<'de> Deserialize<'de> for SQLiteWasmDatabase {
     where
         D: serde::Deserializer<'de>,
     {
-        let _ = deserializer.deserialize_any(IgnoredAny)?;
-        Self::new().map_err(|e| {
+        #[derive(Deserialize)]
+        struct InitOpts {
+            #[serde(rename = "dbName")]
+            db_name: String,
+        }
+
+        let opts = InitOpts::deserialize(deserializer)?;
+        let trimmed = opts.db_name.trim();
+        if trimmed.is_empty() {
+            return Err(serde::de::Error::custom(
+                "dbName must be a non-empty string",
+            ));
+        }
+        Self::new(trimmed).map_err(|e| {
             serde::de::Error::custom(format!("Failed to create SQLiteWasmDatabase: {e:?}"))
         })
     }
@@ -72,9 +84,15 @@ impl From<SQLiteWasmDatabaseError> for WasmEncodedError {
 impl SQLiteWasmDatabase {
     /// Create a new database connection with fully embedded worker
     #[wasm_export(js_name = "new", preserve_js_class)]
-    pub fn new() -> Result<SQLiteWasmDatabase, SQLiteWasmDatabaseError> {
+    pub fn new(db_name: &str) -> Result<SQLiteWasmDatabase, SQLiteWasmDatabaseError> {
+        let db_name = db_name.trim();
+        if db_name.is_empty() {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Database name is required",
+            )));
+        }
         // Create the worker with embedded WASM and glue code
-        let worker_code = generate_self_contained_worker();
+        let worker_code = generate_self_contained_worker(db_name);
 
         // Create a Blob with the worker code
         let blob_parts = Array::new();
@@ -241,7 +259,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_sqlite_wasm_database_serialization() {
-        let db = SQLiteWasmDatabase::new().expect("Should create database");
+        let db = SQLiteWasmDatabase::new("testdb").expect("Should create database");
         let serialized = serde_json::to_string(&db);
 
         assert!(serialized.is_ok());
@@ -251,7 +269,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_sqlite_wasm_database_deserialization() {
-        let json_str = "{}";
+        let json_str = r#"{"dbName":"testdb"}"#;
         let result: Result<SQLiteWasmDatabase, _> = serde_json::from_str(json_str);
 
         assert!(result.is_ok(), "Should be able to deserialize empty object");
@@ -259,7 +277,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_sqlite_wasm_database_creation() {
-        let result = SQLiteWasmDatabase::new();
+        let result = SQLiteWasmDatabase::new("testdb");
 
         match result {
             Ok(_db) => {}
@@ -272,7 +290,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_query_message_format() {
-        if let Ok(db) = SQLiteWasmDatabase::new() {
+        if let Ok(db) = SQLiteWasmDatabase::new("testdb") {
             let result = db.query("SELECT 1").await;
 
             match result {
@@ -301,7 +319,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn test_worker_template_generation() {
-        let worker_code = generate_self_contained_worker();
+        let worker_code = generate_self_contained_worker("testdb");
 
         assert!(!worker_code.is_empty());
         assert!(
