@@ -186,7 +186,8 @@ export async function cleanupDatabase(db: SQLiteWasmDatabase): Promise<void> {
 			// Worker communication test tables  
 			'workers_test', 'shared_data', 'worker_coordination', 'message_test',
 			// Database function test tables
-			'bigint_test', 'categories', 'float_test', 'float_categories'
+			'bigint_test', 'categories', 'float_test', 'float_categories',
+			'float_is_zero_test'
 		];
 		for (const table of tables) {
 			try {
