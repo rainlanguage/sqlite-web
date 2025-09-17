@@ -10,8 +10,8 @@ use std::str::FromStr;
 mod bigint_sum;
 mod rain_math;
 
-// Re-export the functions
-pub use bigint_sum::*;
+use bigint_sum::*;
+
 pub use rain_math::*;
 
 /// Register all custom functions with the SQLite database
