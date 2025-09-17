@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   createTestDatabase,
   cleanupDatabase,
-  PerformanceTracker,
 } from "../fixtures/test-helpers.js";
 import type { SQLiteWasmDatabase } from "sqlite-web";
 import {
@@ -23,11 +22,9 @@ const floatHex = createFloatHexMap({
 
 describe("FLOAT_NEGATE Database Function", () => {
   let db: SQLiteWasmDatabase;
-  let perf: PerformanceTracker;
 
   beforeEach(async () => {
     db = await createTestDatabase();
-    perf = new PerformanceTracker();
   });
 
   afterEach(async () => {

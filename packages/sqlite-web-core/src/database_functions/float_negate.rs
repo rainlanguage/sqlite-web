@@ -42,28 +42,40 @@ pub unsafe extern "C" fn float_negate(
         return;
     }
 
-    let value_str = CStr::from_ptr(value_ptr as *const c_char).to_string_lossy();
+    let value_cstr = CStr::from_ptr(value_ptr as *const c_char);
+    let value_str = match value_cstr.to_str() {
+        Ok(value_str) => value_str,
+        Err(_) => {
+            sqlite3_result_error(context, c"invalid UTF-8".as_ptr(), -1);
+            return;
+        }
+    };
 
-    match float_negate_hex_to_hex(&value_str) {
+    match float_negate_hex_to_hex(value_str) {
         Ok(result_hex) => {
             if let Ok(result_cstr) = CString::new(result_hex) {
                 sqlite3_result_text(
                     context,
                     result_cstr.as_ptr(),
                     result_cstr.as_bytes().len() as c_int,
-                    Some(std::mem::transmute::<
-                        isize,
-                        unsafe extern "C" fn(*mut std::ffi::c_void),
-                    >(-1isize)), // SQLITE_TRANSIENT
+                    SQLITE_TRANSIENT(),
                 );
             } else {
                 sqlite3_result_error(context, c"Failed to create result string".as_ptr(), -1);
             }
         }
-        Err(e) => {
-            let error_msg = format!("{e}\0");
-            sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
-        }
+        Err(e) => match CString::new(e) {
+            Ok(error_msg) => {
+                sqlite3_result_error(context, error_msg.as_ptr(), -1);
+            }
+            Err(_) => {
+                sqlite3_result_error(
+                    context,
+                    c"Error message contained interior NUL".as_ptr(),
+                    -1,
+                );
+            }
+        },
     }
 }
 
