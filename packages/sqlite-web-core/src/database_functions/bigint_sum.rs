@@ -112,11 +112,9 @@ pub unsafe extern "C" fn bigint_sum_step(
 
 // Aggregate function final - called to return the final result
 pub unsafe extern "C" fn bigint_sum_final(context: *mut sqlite3_context) {
-    let aggregate_context =
-        sqlite3_aggregate_context(context, std::mem::size_of::<BigIntSumContext>() as c_int);
+    let aggregate_context = sqlite3_aggregate_context(context, 0);
 
     if aggregate_context.is_null() {
-        // No values were processed, return 0
         let zero_result = CString::new("0").unwrap();
         sqlite3_result_text(
             context,
@@ -125,7 +123,7 @@ pub unsafe extern "C" fn bigint_sum_final(context: *mut sqlite3_context) {
             Some(std::mem::transmute::<
                 isize,
                 unsafe extern "C" fn(*mut std::ffi::c_void),
-            >(-1isize)), // SQLITE_TRANSIENT
+            >(-1isize)),
         );
         return;
     }
@@ -138,6 +136,7 @@ pub unsafe extern "C" fn bigint_sum_final(context: *mut sqlite3_context) {
         Err(e) => {
             let error_msg = format!("Failed to create result string: {}\0", e);
             sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
+            std::ptr::drop_in_place(sum_context);
             return;
         }
     };
@@ -151,6 +150,8 @@ pub unsafe extern "C" fn bigint_sum_final(context: *mut sqlite3_context) {
             unsafe extern "C" fn(*mut std::ffi::c_void),
         >(-1isize)), // SQLITE_TRANSIENT
     );
+
+    std::ptr::drop_in_place(sum_context);
 }
 
 #[cfg(test)]

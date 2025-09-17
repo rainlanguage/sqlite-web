@@ -8,9 +8,11 @@ use std::str::FromStr;
 
 // Import the individual function modules
 mod bigint_sum;
+mod float_sum;
 mod rain_math;
 
 use bigint_sum::*;
+use float_sum::*;
 
 pub use rain_math::*;
 
@@ -54,6 +56,26 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
 
     if ret != SQLITE_OK {
         return Err("Failed to register BIGINT_SUM function".to_string());
+    }
+
+    // Register FLOAT_SUM aggregate function
+    let float_sum_name = CString::new("FLOAT_SUM").unwrap();
+    let ret = unsafe {
+        sqlite3_create_function_v2(
+            db,
+            float_sum_name.as_ptr(),
+            1, // 1 argument
+            SQLITE_UTF8,
+            std::ptr::null_mut(),
+            None,                  // No xFunc for aggregate function
+            Some(float_sum_step),  // xStep callback
+            Some(float_sum_final), // xFinal callback
+            None,                  // No destructor
+        )
+    };
+
+    if ret != SQLITE_OK {
+        return Err("Failed to register FLOAT_SUM function".to_string());
     }
 
     Ok(())
