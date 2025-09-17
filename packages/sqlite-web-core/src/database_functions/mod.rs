@@ -13,6 +13,8 @@ mod float_negate;
 mod float_sum;
 mod rain_math;
 
+use float_is_zero::float_is_zero;
+
 // Re-export the functions
 pub use bigint_sum::*;
 pub use float_negate::*;

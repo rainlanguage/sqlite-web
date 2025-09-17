@@ -15,7 +15,7 @@ fn float_is_zero_hex(input_hex: &str) -> Result<bool, String> {
         .map_err(|e| format!("Failed to evaluate Float zero state: {e}"))
 }
 
-unsafe extern "C" fn float_is_zero(
+pub unsafe extern "C" fn float_is_zero(
     context: *mut sqlite3_context,
     argc: c_int,
     argv: *mut *mut sqlite3_value,
