@@ -7,7 +7,7 @@ pub struct FloatSumContext {
 impl FloatSumContext {
     fn new() -> Self {
         Self {
-            total: Float::parse("0".to_string()).unwrap(),
+            total: Float::default(),
         }
     }
 
@@ -96,29 +96,17 @@ pub unsafe extern "C" fn float_sum_step(
     // Add this value to the running total
     if let Err(e) = (*sum_context).add_value(&value_str) {
         let error_msg = format!("{}\0", e);
-        sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
+        sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1)
     }
 }
 
 // Aggregate function final - called to return the final result
 pub unsafe extern "C" fn float_sum_final(context: *mut sqlite3_context) {
-    let aggregate_context =
-        sqlite3_aggregate_context(context, std::mem::size_of::<FloatSumContext>() as c_int);
+    let aggregate_context = sqlite3_aggregate_context(context, 0);
 
     if aggregate_context.is_null() {
-        // No values were processed, return 0 in hex format
-        let zero_result =
-            CString::new("0x0000000000000000000000000000000000000000000000000000000000000000")
-                .unwrap();
-        sqlite3_result_text(
-            context,
-            zero_result.as_ptr(),
-            zero_result.as_bytes().len() as c_int,
-            Some(std::mem::transmute::<
-                isize,
-                unsafe extern "C" fn(*mut std::ffi::c_void),
-            >(-1isize)), // SQLITE_TRANSIENT
-        );
+        // No rows were processed; propagate NULL like SQLite's SUM.
+        sqlite3_result_null(context);
         return;
     }
 
@@ -128,6 +116,7 @@ pub unsafe extern "C" fn float_sum_final(context: *mut sqlite3_context) {
         Err(e) => {
             let error_msg = format!("{}\0", e);
             sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
+            std::ptr::drop_in_place(sum_context);
             return;
         }
     };
@@ -137,6 +126,7 @@ pub unsafe extern "C" fn float_sum_final(context: *mut sqlite3_context) {
         Err(e) => {
             let error_msg = format!("Failed to create result string: {}\0", e);
             sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
+            std::ptr::drop_in_place(sum_context);
             return;
         }
     };
@@ -150,6 +140,8 @@ pub unsafe extern "C" fn float_sum_final(context: *mut sqlite3_context) {
             unsafe extern "C" fn(*mut std::ffi::c_void),
         >(-1isize)), // SQLITE_TRANSIENT
     );
+
+    std::ptr::drop_in_place(sum_context);
 }
 
 #[cfg(test)]
@@ -172,14 +164,14 @@ mod tests {
         let mut context = FloatSumContext::new();
 
         assert!(context
-            .add_value("0xffffffff00000000000000000000000000000000000000000000000000000001")
+            .add_value(Float::parse("0.1".to_string()).unwrap().as_hex().as_str())
             .is_ok()); // 0.1
         let result_hex = context.get_result().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
         assert_eq!(result_decimal, "0.1");
 
         assert!(context
-            .add_value("0xffffffff00000000000000000000000000000000000000000000000000000005")
+            .add_value(Float::parse("0.5".to_string()).unwrap().as_hex().as_str())
             .is_ok()); // 0.5
         let result_hex = context.get_result().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
@@ -231,15 +223,15 @@ mod tests {
     fn test_float_sum_context_large_hex_values() {
         let mut context = FloatSumContext::new();
 
-        let large_hex1 = "0xfffffffe00000000000000000000000000000000000000000000000000002729"; // 100.25
-        let large_hex2 = "0xfffffffd0000000000000000000000000000000000000000000000000001e240"; // 123.456
+        let large_hex1 = Float::parse("100.25".to_string()).unwrap();
+        let large_hex2 = Float::parse("123.456".to_string()).unwrap(); // 123.456
 
-        assert!(context.add_value(large_hex1).is_ok());
+        assert!(context.add_value(&large_hex1.as_hex()).is_ok());
         let result_hex = context.get_result().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
         assert_eq!(result_decimal, "100.25");
 
-        assert!(context.add_value(large_hex2).is_ok());
+        assert!(context.add_value(&large_hex2.as_hex()).is_ok());
         let result_hex = context.get_result().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
         assert_eq!(result_decimal, "223.706"); // 100.25 + 123.456 = 223.706
@@ -250,14 +242,14 @@ mod tests {
         let mut context = FloatSumContext::new();
 
         assert!(context
-            .add_value("0x0000000000000000000000000000000000000000000000000000000000000000")
+            .add_value(Float::default().as_hex().as_str())
             .is_ok()); // 0
         let result_hex = context.get_result().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
         assert_eq!(result_decimal, "0");
 
         assert!(context
-            .add_value("0xffffffff00000000000000000000000000000000000000000000000000000001")
+            .add_value(Float::parse("0.1".to_string()).unwrap().as_hex().as_str())
             .is_ok()); // 0.1
         let result_hex = context.get_result().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
@@ -269,14 +261,14 @@ mod tests {
         let mut context = FloatSumContext::new();
 
         assert!(context
-            .add_value("0xFfFfFfFf0000000000000000000000000000000000000000000000000000000F")
+            .add_value(Float::parse("1.5".to_string()).unwrap().as_hex().as_str())
             .is_ok()); // 1.5
         let result_hex = context.get_result().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
         assert_eq!(result_decimal, "1.5");
 
         assert!(context
-            .add_value("0xFfFfFfFe000000000000000000000000000000000000000000000000000000E1")
+            .add_value(Float::parse("2.25".to_string()).unwrap().as_hex().as_str())
             .is_ok()); // 2.25
         let result_hex = context.get_result().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
@@ -296,14 +288,20 @@ mod tests {
         let mut context = FloatSumContext::new();
 
         assert!(context
-            .add_value("  0x000000000000000000000000000000000000000000000000000000000000000a  ")
+            .add_value(&format!(
+                " {} ",
+                Float::parse("10".to_string()).unwrap().as_hex()
+            ))
             .is_ok()); // 10
         let result_hex = context.get_result().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
         assert_eq!(result_decimal, "10");
 
         assert!(context
-            .add_value("\t0x0000000000000000000000000000000000000000000000000000000000000014\n")
+            .add_value(&format!(
+                "\t{}\n",
+                Float::parse("20".to_string()).unwrap().as_hex()
+            ))
             .is_ok()); // 20
         let result_hex = context.get_result().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
@@ -315,15 +313,15 @@ mod tests {
         let mut context = FloatSumContext::new();
 
         let high_precision_hex_values = vec![
-            "0xffffffee0000000000000000000000000000000000000010450cb5d3cf60f34e", // 300.123456789012345678
-            "0xffffffee0000000000000000000000000000000000000010510af4e77328b478", // 300.987654321098765432
-            "0xffffffee00000000000000000000000000000000000000104b0bd55dbf1238e3", // 300.555555555555555555
-            "0xffffffee00000000000000000000000000000000000000104e21534cc7d31c71", // 300.777777777777777777
-            "0xffffffee00000000000000000000000000000000000000105136d13bd093ffff", // 300.999999999999999999
+            Float::parse("300.123456789012345678".to_string()).unwrap(),
+            Float::parse("300.987654321098765432".to_string()).unwrap(),
+            Float::parse("300.555555555555555555".to_string()).unwrap(),
+            Float::parse("300.777777777777777777".to_string()).unwrap(),
+            Float::parse("300.999999999999999999".to_string()).unwrap(),
         ];
 
         for hex_val in high_precision_hex_values {
-            assert!(context.add_value(hex_val).is_ok());
+            assert!(context.add_value(&hex_val.as_hex()).is_ok());
         }
 
         let result_hex = context.get_result().unwrap();
