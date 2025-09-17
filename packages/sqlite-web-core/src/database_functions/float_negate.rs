@@ -35,12 +35,14 @@ pub unsafe extern "C" fn float_negate(
         return;
     }
 
-    // Get the text value
-    let value_ptr = sqlite3_value_text(*argv);
-    if value_ptr.is_null() {
+    // Return early for NULL inputs using the documented type check.
+    if sqlite3_value_type(*argv) == SQLITE_NULL {
         sqlite3_result_null(context);
         return;
     }
+
+    // Get the text value (now known to be non-NULL).
+    let value_ptr = sqlite3_value_text(*argv);
 
     let value_cstr = CStr::from_ptr(value_ptr as *const c_char);
     let value_str = match value_cstr.to_str() {
