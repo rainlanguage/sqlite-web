@@ -324,6 +324,31 @@ describe("FLOAT_SUM Database Function", () => {
       expect(result.error?.msg).toContain("Failed to parse hex number");
     });
 
+    it("should sum signed float values correctly", async () => {
+      await db.query("DELETE FROM float_test");
+
+      const negative = encodeFloatHex("-2.5");
+      const positive = encodeFloatHex("3.1");
+
+      await db.query(`
+				INSERT INTO float_test (amount) VALUES
+				('${negative}'),
+				('${positive}')
+			`);
+
+      const result = await db.query(
+        "SELECT FLOAT_SUM(amount) as total FROM float_test",
+      );
+      expect(result.error).toBeUndefined();
+
+      const data = JSON.parse(result.value || "[]") as Array<{ total: string }>;
+      expect(Array.isArray(data)).toBe(true);
+      expect(data).toHaveLength(1);
+
+      const decodedTotal = decodeFloatHex(data[0].total);
+      expect(decodedTotal).toBe("0.6");
+    });
+
     it("should handle only valid hex values", async () => {
       await db.query(`
 				INSERT INTO float_test (amount) VALUES
