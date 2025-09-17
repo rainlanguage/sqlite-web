@@ -5,6 +5,20 @@ import {
   PerformanceTracker,
 } from "../fixtures/test-helpers.js";
 import type { SQLiteWasmDatabase } from "sqlite-web";
+import {
+  createFloatHexMap,
+  decodeFloatHex,
+  toMixedCase,
+  withoutPrefix,
+} from "../fixtures/float-utils";
+
+const floatHex = createFloatHexMap({
+  zero: "0",
+  smallPositive: "0.000000000000000123",
+  onePointFive: "1.5",
+  twoPointTwoFive: "2.25",
+  highPrecision: "300.123456789012345678",
+} as const);
 
 describe("FLOAT_NEGATE Database Function", () => {
   let db: SQLiteWasmDatabase;
@@ -36,8 +50,7 @@ describe("FLOAT_NEGATE Database Function", () => {
         expect(entry).toBeDefined();
       } catch (e) {}
 
-      const sampleHex =
-        "0xffffffff00000000000000000000000000000000000000000000000000000001";
+      const sampleHex = floatHex.onePointFive;
       const neg = await db.query(`SELECT FLOAT_NEGATE('${sampleHex}') as neg`);
       expect(neg).toBeDefined();
       expect(neg.value).toBeDefined();
@@ -49,12 +62,12 @@ describe("FLOAT_NEGATE Database Function", () => {
   });
 
   describe("Basic FLOAT_NEGATE Functionality", () => {
-    const samples = [
-      "0xffffffff00000000000000000000000000000000000000000000000000000001",
-      "0xffffffff00000000000000000000000000000000000000000000000000000005",
-      "ffffffff0000000000000000000000000000000000000000000000000000000f",
-      "0xfffffffe00000000000000000000000000000000000000000000000000002729",
-      "0x0000000000000000000000000000000000000000000000000000000000000000",
+    const samples: string[] = [
+      floatHex.smallPositive,
+      floatHex.onePointFive,
+      withoutPrefix(floatHex.twoPointTwoFive),
+      floatHex.highPrecision,
+      floatHex.zero,
     ];
 
     it("should produce negation that sums to zero with original", async () => {
@@ -67,13 +80,14 @@ describe("FLOAT_NEGATE Database Function", () => {
           )
         `);
         const data = JSON.parse(result.value || "[]");
-        expect(data[0].total).toBe("0");
+        const total = data[0].total as string;
+        const decimalTotal = total === "0" ? total : decodeFloatHex(total);
+        expect(decimalTotal).toBe("0");
       }
     });
 
     it("should handle whitespace around input", async () => {
-      const hex =
-        "0xffffffff00000000000000000000000000000000000000000000000000000005";
+      const hex = floatHex.twoPointTwoFive;
       const wrapped = `  ${hex}  `;
       const result = await db.query(`
         SELECT FLOAT_SUM(amount) as total FROM (
@@ -83,13 +97,14 @@ describe("FLOAT_NEGATE Database Function", () => {
         )
       `);
       const data = JSON.parse(result.value || "[]");
-      expect(data[0].total).toBe("0");
+      const total = data[0].total as string;
+      const decimalTotal = total === "0" ? total : decodeFloatHex(total);
+      expect(decimalTotal).toBe("0");
     });
 
     it("should accept mixed-case 0x prefix and characters", async () => {
       await db.query("DELETE FROM float_negate_test");
-      const mixed =
-        "0xFfFfFfFf0000000000000000000000000000000000000000000000000000000F";
+      const mixed = toMixedCase(floatHex.highPrecision);
       const result = await db.query(`
         SELECT FLOAT_SUM(amount) as total FROM (
           SELECT '${mixed}' as amount
@@ -98,7 +113,9 @@ describe("FLOAT_NEGATE Database Function", () => {
         )
       `);
       const data = JSON.parse(result.value || "[]");
-      expect(data[0].total).toBe("0");
+      const total = data[0].total as string;
+      const decimalTotal = total === "0" ? total : decodeFloatHex(total);
+      expect(decimalTotal).toBe("0");
     });
   });
 
@@ -110,8 +127,7 @@ describe("FLOAT_NEGATE Database Function", () => {
     });
 
     it("should reject uppercase 0X prefix", async () => {
-      const bad =
-        "0XFFFFFFFF00000000000000000000000000000000000000000000000000000069";
+      const bad = floatHex.twoPointTwoFive.replace("0x", "0X");
       const result = await db.query(`SELECT FLOAT_NEGATE('${bad}') as neg`);
       expect(result.error).toBeDefined();
       expect(result.error?.msg).toContain("Failed to parse Float hex");
