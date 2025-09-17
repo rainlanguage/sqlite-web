@@ -1,7 +1,7 @@
 use super::*;
 
-// Helper to negate a Rain Float hex string by formatting to decimal, toggling sign,
-// parsing back to Float, and returning the hex representation.
+// Helper to negate a Rain Float hex string while keeping full precision by
+// operating on the binary representation directly.
 fn float_negate_hex_to_hex(input_hex: &str) -> Result<String, String> {
     let trimmed = input_hex.trim();
 
@@ -9,21 +9,8 @@ fn float_negate_hex_to_hex(input_hex: &str) -> Result<String, String> {
     let float_val =
         Float::from_hex(trimmed).map_err(|e| format!("Failed to parse Float hex: {e}"))?;
 
-    // Convert to human-readable decimal
-    let decimal = float_val
-        .format()
-        .map_err(|e| format!("Failed to format Float to decimal: {e}"))?;
-
-    // Toggle sign on the decimal string
-    let neg_decimal = if decimal.starts_with('-') {
-        decimal.trim_start_matches('-').to_string()
-    } else {
-        format!("-{decimal}")
-    };
-
-    // Parse back to Float from decimal
-    let neg_float = Float::parse(neg_decimal)
-        .map_err(|e| format!("Failed to parse negated decimal to Float: {e}"))?;
+    // Negate the float directly to avoid any formatting or precision loss.
+    let neg_float = (-float_val).map_err(|e| format!("Failed to negate Float value: {e}"))?;
 
     // Return as hex string
     Ok(neg_float.as_hex())
