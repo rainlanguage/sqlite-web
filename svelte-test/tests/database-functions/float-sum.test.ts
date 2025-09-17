@@ -34,6 +34,43 @@ describe("FLOAT_SUM Database Function", () => {
     return fmtRes.value as string;
   }
 
+  function encodeFloatHex(decimal: string): `0x${string}` {
+    const parseRes = Float.parse(decimal);
+    if (parseRes.error) {
+      throw new Error(`Float.parse failed: ${String(parseRes.error.msg ?? parseRes.error)}`);
+    }
+    return parseRes.value.asHex();
+  }
+
+  function withoutPrefix(hex: `0x${string}`): string {
+    return hex.slice(2);
+  }
+
+  function toMixedCase(hex: `0x${string}`): string {
+    let result = "";
+    for (let i = 0; i < hex.length; i++) {
+      const char = hex[i];
+      if (/[a-f]/.test(char)) {
+        result += i % 2 === 0 ? char.toUpperCase() : char.toLowerCase();
+      } else {
+        result += char;
+      }
+    }
+    return result;
+  }
+
+  const floatHex = {
+    zero: encodeFloatHex("0"),
+    zeroPointOne: encodeFloatHex("0.1"),
+    zeroPointFive: encodeFloatHex("0.5"),
+    onePointFive: encodeFloatHex("1.5"),
+    twoPointTwoFive: encodeFloatHex("2.25"),
+    ten: encodeFloatHex("10"),
+    twenty: encodeFloatHex("20"),
+    hundredPointTwentyFive: encodeFloatHex("100.25"),
+    oneHundredTwentyThreePointFourFiveSix: encodeFloatHex("123.456"),
+  } as const;
+
   beforeEach(async () => {
     db = await createTestDatabase();
     perf = new PerformanceTracker();
@@ -76,7 +113,7 @@ describe("FLOAT_SUM Database Function", () => {
 
       try {
         const result = await db.query(
-          'SELECT FLOAT_SUM("0xffffffff00000000000000000000000000000000000000000000000000000001") as test',
+          `SELECT FLOAT_SUM("${floatHex.zeroPointOne}") as test`,
         );
         expect(result).toBeDefined();
         expect(result.value).toBeDefined();
@@ -93,9 +130,9 @@ describe("FLOAT_SUM Database Function", () => {
     beforeEach(async () => {
       await db.query(`
 				INSERT INTO float_test (amount, category, description) VALUES
-				('0xffffffff00000000000000000000000000000000000000000000000000000001', 'income', 'payment'),
-				('0xffffffff00000000000000000000000000000000000000000000000000000005', 'income', 'deposit'),
-				('ffffffff0000000000000000000000000000000000000000000000000000000f', 'income', 'amount')
+				('${floatHex.zeroPointOne}', 'income', 'payment'),
+				('${floatHex.zeroPointFive}', 'income', 'deposit'),
+				('${withoutPrefix(floatHex.onePointFive)}', 'income', 'amount')
 			`);
     });
 
@@ -145,9 +182,9 @@ describe("FLOAT_SUM Database Function", () => {
     beforeEach(async () => {
       await db.query(`
 				INSERT INTO float_test (amount, category, description) VALUES
-				('0xfffffffe00000000000000000000000000000000000000000000000000002729', 'income', 'large payment'),
-				('fffffffd0000000000000000000000000000000000000000000000000001e240', 'income', 'large deposit'),
-				('0x0000000000000000000000000000000000000000000000000000000000000000', 'zero', 'zero value')
+				('${floatHex.hundredPointTwentyFive}', 'income', 'large payment'),
+				('${withoutPrefix(floatHex.oneHundredTwentyThreePointFourFiveSix)}', 'income', 'large deposit'),
+				('${floatHex.zero}', 'zero', 'zero value')
 			`);
     });
 
@@ -165,8 +202,8 @@ describe("FLOAT_SUM Database Function", () => {
       await db.query("DELETE FROM float_test");
       await db.query(`
 				INSERT INTO float_test (amount) VALUES
-				('0xFfFfFfFf0000000000000000000000000000000000000000000000000000000F'),
-				('0xFfFfFfFe000000000000000000000000000000000000000000000000000000E1')
+				('${toMixedCase(floatHex.onePointFive)}'),
+				('${toMixedCase(floatHex.twoPointTwoFive)}')
 			`);
 
       const result = await db.query(
@@ -196,10 +233,10 @@ describe("FLOAT_SUM Database Function", () => {
     beforeEach(async () => {
       await db.query(`
 				INSERT INTO float_test (amount, category) VALUES
-				('0xffffffff00000000000000000000000000000000000000000000000000000001', 'income'),
-				('0xffffffff00000000000000000000000000000000000000000000000000000005', 'income'),
-				('0x000000000000000000000000000000000000000000000000000000000000000a', 'bonus'),
-				('ffffffff0000000000000000000000000000000000000000000000000000000f', 'expense')
+				('${floatHex.zeroPointOne}', 'income'),
+				('${floatHex.zeroPointFive}', 'income'),
+				('${floatHex.ten}', 'bonus'),
+				('${withoutPrefix(floatHex.onePointFive)}', 'expense')
 			`);
     });
 
@@ -290,8 +327,8 @@ describe("FLOAT_SUM Database Function", () => {
     it("should handle only valid hex values", async () => {
       await db.query(`
 				INSERT INTO float_test (amount) VALUES
-				('0xffffffff00000000000000000000000000000000000000000000000000000001'),
-				('0xffffffff00000000000000000000000000000000000000000000000000000005')
+				('${floatHex.zeroPointOne}'),
+				('${floatHex.zeroPointFive}')
 			`);
 
       const result = await db.query(
@@ -306,8 +343,7 @@ describe("FLOAT_SUM Database Function", () => {
 
   describe("Edge Cases and Limits", () => {
     it("should handle very small float values", async () => {
-      const smallValue =
-        "0xffffffff00000000000000000000000000000000000000000000000000000001";
+      const smallValue = floatHex.zeroPointOne;
 
       await db.query(`
 				INSERT INTO float_test (amount) VALUES ('${smallValue}')
@@ -337,8 +373,8 @@ describe("FLOAT_SUM Database Function", () => {
     it("should handle whitespace in hex values", async () => {
       await db.query(`
 				INSERT INTO float_test (amount) VALUES
-				('  0x000000000000000000000000000000000000000000000000000000000000000a  '),
-				('\t0x0000000000000000000000000000000000000000000000000000000000000014\n')
+				('  ${floatHex.ten}  '),
+				('\t${floatHex.twenty}\n')
 			`);
 
       const result = await db.query(
@@ -355,8 +391,8 @@ describe("FLOAT_SUM Database Function", () => {
     it("should handle bulk aggregation efficiently", async () => {
       const values = Array.from(
         { length: 10 },
-        (_, i) =>
-          `('0xffffffff00000000000000000000000000000000000000000000000000000001', 'bulk')`,
+        () =>
+          `('${floatHex.zeroPointOne}', 'bulk')`,
       ).join(",");
 
       await db.query(`
@@ -397,8 +433,8 @@ describe("FLOAT_SUM Database Function", () => {
 
       await db.query(`
 				INSERT INTO float_test (amount, category) VALUES
-				('0xffffffff00000000000000000000000000000000000000000000000000000001', 'income'),
-				('0xffffffff00000000000000000000000000000000000000000000000000000005', 'expense')
+				('${floatHex.zeroPointOne}', 'income'),
+				('${floatHex.zeroPointFive}', 'expense')
 			`);
 
       perf.start("complex-float-query");
@@ -444,10 +480,10 @@ describe("FLOAT_SUM Database Function", () => {
     it("should handle DeFi-like transaction amounts", async () => {
       await db.query(`
 				INSERT INTO float_test (amount, category, description) VALUES
-				('0xfffffffe00000000000000000000000000000000000000000000000000002729', 'swap', 'token swap'),
-				('0xfffffffd0000000000000000000000000000000000000000000000000001e240', 'liquidity', 'liquidity provision'),
-				('0xffffffff00000000000000000000000000000000000000000000000000000001', 'rewards', 'staking rewards'),
-				('0xffffffff00000000000000000000000000000000000000000000000000000005', 'fees', 'protocol fees')
+				('${floatHex.hundredPointTwentyFive}', 'swap', 'token swap'),
+				('${floatHex.oneHundredTwentyThreePointFourFiveSix}', 'liquidity', 'liquidity provision'),
+				('${floatHex.zeroPointOne}', 'rewards', 'staking rewards'),
+				('${floatHex.zeroPointFive}', 'fees', 'protocol fees')
 			`);
 
       const result = await db.query(`
@@ -472,8 +508,8 @@ describe("FLOAT_SUM Database Function", () => {
     it("should handle precision accounting that must balance", async () => {
       await db.query(`
 				INSERT INTO float_test (amount, description) VALUES
-				('0xfffffffe00000000000000000000000000000000000000000000000000002729', 'Initial balance'),
-				('0xffffffff00000000000000000000000000000000000000000000000000000001', 'Small addition')
+				('${floatHex.hundredPointTwentyFive}', 'Initial balance'),
+				('${floatHex.zeroPointOne}', 'Small addition')
 			`);
 
       const result = await db.query(
@@ -496,8 +532,8 @@ describe("FLOAT_SUM Database Function", () => {
     it("should skip NULL values like standard SQL aggregates", async () => {
       await db.query(`
 				INSERT INTO float_test (amount, category) VALUES
-				('0xffffffff00000000000000000000000000000000000000000000000000000001', 'test'),
-				('0xffffffff00000000000000000000000000000000000000000000000000000005', 'test')
+				('${floatHex.zeroPointOne}', 'test'),
+				('${floatHex.zeroPointFive}', 'test')
 			`);
 
       const result = await db.query(
