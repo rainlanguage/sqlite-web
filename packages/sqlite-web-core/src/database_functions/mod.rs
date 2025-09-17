@@ -1,4 +1,3 @@
-use alloy::primitives::I256;
 use sqlite_wasm_rs::export::*;
 use std::ffi::{c_int, CStr, CString};
 use std::os::raw::c_char;

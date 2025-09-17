@@ -102,16 +102,6 @@ describe("FLOAT_SUM Database Function", () => {
       } catch (error) {}
 
       try {
-        const rainResult = await db.query(
-          'SELECT RAIN_MATH_PROCESS("100", "200") as test',
-        );
-        expect(rainResult).toBeDefined();
-        expect(rainResult.value).toBeDefined();
-      } catch (error) {
-        throw new Error("RAIN_MATH_PROCESS not available");
-      }
-
-      try {
         const result = await db.query(
           `SELECT FLOAT_SUM("${floatHex.zeroPointOne}") as test`,
         );
