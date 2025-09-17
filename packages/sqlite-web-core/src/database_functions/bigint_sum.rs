@@ -115,7 +115,16 @@ pub unsafe extern "C" fn bigint_sum_final(context: *mut sqlite3_context) {
     let aggregate_context = sqlite3_aggregate_context(context, 0);
 
     if aggregate_context.is_null() {
-        sqlite3_result_null(context);
+        let zero_result = CString::new("0").unwrap();
+        sqlite3_result_text(
+            context,
+            zero_result.as_ptr(),
+            zero_result.as_bytes().len() as c_int,
+            Some(std::mem::transmute::<
+                isize,
+                unsafe extern "C" fn(*mut std::ffi::c_void),
+            >(-1isize)),
+        );
         return;
     }
 
