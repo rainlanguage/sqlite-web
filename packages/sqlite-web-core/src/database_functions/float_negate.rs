@@ -5,6 +5,10 @@ use super::*;
 fn float_negate_hex_to_hex(input_hex: &str) -> Result<String, String> {
     let trimmed = input_hex.trim();
 
+    if trimmed.is_empty() {
+        return Err("Empty string is not a valid hex number".to_string());
+    }
+
     // Parse the input hex into a Float
     let float_val =
         Float::from_hex(trimmed).map_err(|e| format!("Failed to parse Float hex: {e}"))?;

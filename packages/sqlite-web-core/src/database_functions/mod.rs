@@ -87,7 +87,7 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
             db,
             float_negate_name.as_ptr(),
             1, // 1 argument
-            SQLITE_UTF8,
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS,
             std::ptr::null_mut(),
             Some(float_negate), // xFunc for scalar
             None,               // No xStep
