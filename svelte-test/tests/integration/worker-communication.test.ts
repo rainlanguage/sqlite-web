@@ -6,7 +6,7 @@ import {
 	assertions,
 	PerformanceTracker 
 } from '../fixtures/test-helpers.js';
-import type { SQLiteWasmDatabase } from 'sqlite-web';
+import type { SQLiteWasmDatabase } from '@rainlanguage/sqlite-web';
 
 describe('Worker Communication Tests', () => {
 	let db1: SQLiteWasmDatabase;
