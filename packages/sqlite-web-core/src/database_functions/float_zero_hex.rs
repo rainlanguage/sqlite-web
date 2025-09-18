@@ -20,6 +20,7 @@ pub(crate) unsafe extern "C" fn float_zero_hex(
             c"FLOAT_ZERO_HEX() does not take any arguments".as_ptr(),
             -1,
         );
+        sqlite3_result_error_code(context, SQLITE_MISUSE);
         return;
     }
 
