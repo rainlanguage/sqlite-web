@@ -1,0 +1,15 @@
+{
+  "name": "sqlite-web",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "sqlite_web_bg.wasm",
+    "sqlite_web.js",
+    "sqlite_web.d.ts"
+  ],
+  "main": "sqlite_web.js",
+  "types": "sqlite_web.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
