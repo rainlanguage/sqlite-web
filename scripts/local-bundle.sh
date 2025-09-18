@@ -116,16 +116,16 @@ cd ../..
 # Package the result
 echo "📦 Packaging with npm pack..."
 cd pkg
-npm pack
+PACK_FILE=$(npm pack --silent)
 cd ..
 
 # Update Svelte integration with fresh package
 echo "🔄 Updating Svelte integration..."
 cd svelte-test
-npm remove sqlite-web
-npm remove sqlite-web
+npm remove @rainlanguage/sqlite-web || true
+npm remove @rainlanguage/sqlite-web || true
 rm -rf node_modules package-lock.json
-npm install ../pkg/sqlite-web-*.tgz
+npm install "../pkg/${PACK_FILE}"
 npm install
 cd ..
 

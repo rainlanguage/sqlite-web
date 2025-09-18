@@ -78,15 +78,15 @@ jobs:
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
           git add "pkg/package.json"
-          git commit -m "NPM Package Release v${{ env.NEW_VERSION }}"
-          git tag npm-v${{ env.NEW_VERSION }}
+          git commit -m "NPM Package Release ${{ env.NEW_VERSION }}"
+          git tag npm-${{ env.NEW_VERSION }}
 
       # Push the commit to remote
       - name: Push Changes To Remote
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
           git push origin
-          git push -u origin npm-v${{ env.NEW_VERSION }}
+          git push -u origin npm-${{ env.NEW_VERSION }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -116,8 +116,8 @@ jobs:
         id: gh_release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: npm-v${{ env.NEW_VERSION }}
-          name: NPM Package Release v${{ env.NEW_VERSION }}
+          tag_name: npm-${{ env.NEW_VERSION }}
+          name: NPM Package Release ${{ env.NEW_VERSION }}
           files: |
             sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz
         env:
