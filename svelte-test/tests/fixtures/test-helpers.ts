@@ -186,8 +186,10 @@ export async function cleanupDatabase(db: SQLiteWasmDatabase): Promise<void> {
 			// Worker communication test tables  
 			'workers_test', 'shared_data', 'worker_coordination', 'message_test',
 			// Multi-SQL commands (UI) test tables
-			'multi_ui', 'semi_ui', 'gate_ui', 'trg_src_ui', 'trg_log_ui'
-		];
+			'multi_ui', 'semi_ui', 'gate_ui', 'trg_src_ui', 'trg_log_ui',
+			// Database function test tables
+			'bigint_test', 'categories', 'float_test', 'float_categories'
+			];
 		for (const table of tables) {
 			try {
 				await db.query(`DROP TABLE IF EXISTS ${table}`);
