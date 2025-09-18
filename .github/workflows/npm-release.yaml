@@ -31,8 +31,13 @@ jobs:
           node-version: 22
 
       - run: nix develop -c build-submodules
-      
+
       - run: nix develop -c local-bundle
+
+      - name: Install Playwright browsers with dependencies
+        run: |
+          cd svelte-test
+          npx playwright install --with-deps
 
       - name: Test full integration
         run: nix develop -c test-full-integration
