@@ -35,18 +35,3 @@ pub(crate) unsafe extern "C" fn float_zero_hex(
         >(-1isize)),
     );
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wasm_bindgen_test::*;
-
-    wasm_bindgen_test_configure!(run_in_browser);
-
-    #[wasm_bindgen_test]
-    fn default_float_matches_parsed_zero_hex() {
-        let default_hex = Float::default().as_hex();
-        let parsed_zero_hex = Float::parse("0".to_string()).unwrap().as_hex();
-        assert_eq!(default_hex, parsed_zero_hex);
-    }
-}

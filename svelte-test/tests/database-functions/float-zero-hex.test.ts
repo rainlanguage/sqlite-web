@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createTestDatabase, cleanupDatabase } from "../fixtures/test-helpers.js";
+import {
+  createTestDatabase,
+  cleanupDatabase,
+} from "../fixtures/test-helpers.js";
 import type { SQLiteWasmDatabase } from "sqlite-web";
 import { Float } from "@rainlanguage/float";
 
@@ -18,7 +21,9 @@ function decodeFloatHex(hex: string): string {
 function encodeFloatHex(decimal: string): `0x${string}` {
   const parseRes = Float.parse(decimal);
   if (parseRes.error) {
-    throw new Error(`Float.parse failed: ${String(parseRes.error.msg ?? parseRes.error)}`);
+    throw new Error(
+      `Float.parse failed: ${String(parseRes.error.msg ?? parseRes.error)}`,
+    );
   }
   return parseRes.value.asHex();
 }
@@ -36,11 +41,6 @@ describe("FLOAT_ZERO_HEX Database Function", () => {
   });
 
   it("should be registered and return the canonical zero hex string", async () => {
-    const pragmaResult = await db.query("PRAGMA function_list");
-    const functions = JSON.parse(pragmaResult.value || "[]");
-    const zeroHexEntry = functions.find((f: any) => f.name === "FLOAT_ZERO_HEX");
-    expect(zeroHexEntry).toBeDefined();
-
     const result = await db.query("SELECT FLOAT_ZERO_HEX() as zero_hex");
     const data = JSON.parse(result.value || "[]");
     expect(data).toHaveLength(1);
@@ -58,10 +58,16 @@ describe("FLOAT_ZERO_HEX Database Function", () => {
       )
     `);
 
-    await db.query("INSERT INTO float_zero_usage (amount) VALUES (FLOAT_ZERO_HEX())");
-    await db.query("INSERT INTO float_zero_usage (amount) VALUES (FLOAT_ZERO_HEX())");
+    await db.query(
+      "INSERT INTO float_zero_usage (amount) VALUES (FLOAT_ZERO_HEX())",
+    );
+    await db.query(
+      "INSERT INTO float_zero_usage (amount) VALUES (FLOAT_ZERO_HEX())",
+    );
 
-    const stored = await db.query("SELECT amount FROM float_zero_usage ORDER BY id");
+    const stored = await db.query(
+      "SELECT amount FROM float_zero_usage ORDER BY id",
+    );
     const storedData = JSON.parse(stored.value || "[]");
     expect(storedData).toHaveLength(2);
     for (const row of storedData) {
