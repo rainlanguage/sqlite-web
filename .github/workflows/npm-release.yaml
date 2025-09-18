@@ -29,7 +29,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: "npm"
 
       - run: nix develop -c build-submodules
       
@@ -64,6 +63,7 @@ jobs:
       # set npm version in pkg directory
       - name: Set Version
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
+        working-directory: pkg
         run: |
           NEW_VERSION=$(npm version prerelease --preid alpha --no-git-tag-version)
           echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
