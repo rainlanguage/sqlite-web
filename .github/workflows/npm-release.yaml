@@ -68,25 +68,29 @@ jobs:
       # set npm version in pkg directory
       - name: Set Version
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
-        working-directory: pkg
         run: |
-          NEW_VERSION=$(npm version prerelease --preid alpha --no-git-tag-version)
+          NEW_NPM_VERSION=$(npm --prefix pkg version prerelease --preid alpha --no-git-tag-version)
+          NEW_VERSION=${NEW_NPM_VERSION#v}
           echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+          for manifest in packages/sqlite-web/Cargo.toml packages/sqlite-web-core/Cargo.toml; do
+            sed -i.bak "s/^version = \".*\"/version = \"$NEW_VERSION\"/" "$manifest"
+            rm "$manifest".bak
+          done
 
       # Commit changes and tag
       - name: Commit And Tag
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
-          git add "pkg/package.json"
-          git commit -m "NPM Package Release ${{ env.NEW_VERSION }}"
-          git tag npm-${{ env.NEW_VERSION }}
+          git add pkg/package.json packages/sqlite-web/Cargo.toml packages/sqlite-web-core/Cargo.toml
+          git commit -m "NPM Package Release v${{ env.NEW_VERSION }}"
+          git tag npm-v${{ env.NEW_VERSION }}
 
       # Push the commit to remote
       - name: Push Changes To Remote
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
           git push origin
-          git push -u origin npm-${{ env.NEW_VERSION }}
+          git push -u origin npm-v${{ env.NEW_VERSION }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -116,8 +120,8 @@ jobs:
         id: gh_release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: npm-${{ env.NEW_VERSION }}
-          name: NPM Package Release ${{ env.NEW_VERSION }}
+          tag_name: npm-v${{ env.NEW_VERSION }}
+          name: NPM Package Release v${{ env.NEW_VERSION }}
           files: |
             sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz
         env:

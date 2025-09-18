@@ -1,7 +1,7 @@
 {
-  "name": "sqlite-web",
+  "name": "@rainlanguage/sqlite-web",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "files": [
     "sqlite_web_bg.wasm",
     "sqlite_web.js",
