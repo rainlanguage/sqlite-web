@@ -31,9 +31,14 @@ pub unsafe extern "C" fn float_is_zero(
         return;
     }
 
+    let value_type = sqlite3_value_type(*argv);
     let value_ptr = sqlite3_value_text(*argv);
     if value_ptr.is_null() {
-        sqlite3_result_null(context);
+        if value_type == SQLITE_NULL {
+            sqlite3_result_null(context);
+        } else {
+            sqlite3_result_error_nomem(context);
+        }
         return;
     }
 
