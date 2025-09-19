@@ -8,11 +8,13 @@ use std::str::FromStr;
 
 // Import the individual function modules
 mod bigint_sum;
+mod float_negate;
 mod float_sum;
 mod float_zero_hex;
 mod rain_math;
 
 use bigint_sum::*;
+use float_negate::*;
 use float_sum::*;
 use float_zero_hex::*;
 
@@ -100,6 +102,26 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
         return Err("Failed to register FLOAT_ZERO_HEX function".to_string());
     }
 
+    // Register FLOAT_NEGATE scalar function
+    let float_negate_name = CString::new("FLOAT_NEGATE").unwrap();
+    let ret = unsafe {
+        sqlite3_create_function_v2(
+            db,
+            float_negate_name.as_ptr(),
+            1, // 1 argument
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS,
+            std::ptr::null_mut(),
+            Some(float_negate), // xFunc for scalar
+            None,               // No xStep
+            None,               // No xFinal
+            None,               // No destructor
+        )
+    };
+
+    if ret != SQLITE_OK {
+        return Err("Failed to register FLOAT_NEGATE function".to_string());
+    }
+
     Ok(())
 }
 
@@ -107,8 +129,6 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
 mod tests {
     use super::*;
     use wasm_bindgen_test::*;
-
-    wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
     fn test_cstring_conversion() {

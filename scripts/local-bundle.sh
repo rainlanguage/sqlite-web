@@ -113,19 +113,38 @@ cd packages/sqlite-web
 wasm-pack build --target web --out-dir ../../pkg
 cd ../..
 
+echo "🔧 Ensuring scoped package metadata..."
+if grep -q '"name": "sqlite-web"' pkg/package.json; then
+  sed -i.bak 's/"name": "sqlite-web"/"name": "@rainlanguage\/sqlite-web"/' pkg/package.json
+  rm pkg/package.json.bak
+  echo "Updated package name to @rainlanguage/sqlite-web"
+else
+  echo "Package name already scoped."
+fi
+
+echo "📌 Syncing package version with Cargo manifest..."
+CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' packages/sqlite-web/Cargo.toml | head -n 1)
+if [ -n "$CARGO_VERSION" ]; then
+  sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"$CARGO_VERSION\"/" pkg/package.json
+  rm pkg/package.json.bak
+  echo "Package version set to $CARGO_VERSION"
+else
+  echo "Warning: Could not determine Cargo version" >&2
+fi
+
 # Package the result
 echo "📦 Packaging with npm pack..."
 cd pkg
-npm pack
+PACK_FILE=$(npm pack --silent)
 cd ..
 
 # Update Svelte integration with fresh package
 echo "🔄 Updating Svelte integration..."
 cd svelte-test
-npm remove sqlite-web
-npm remove sqlite-web
+npm pkg delete dependencies.sqlite-web 2>/dev/null || true
+npm pkg delete dependencies."@rainlanguage/sqlite-web" 2>/dev/null || true
+npm pkg set dependencies."@rainlanguage/sqlite-web"="file:../pkg/${PACK_FILE}"
 rm -rf node_modules package-lock.json
-npm install ../pkg/sqlite-web-*.tgz
 npm install
 cd ..
 

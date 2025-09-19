@@ -1,5 +1,11 @@
 /// Generate self-contained worker with embedded WASM and JS glue code
-pub fn generate_self_contained_worker() -> String {
+/// and inject the database name into the worker global scope so core
+/// can read it during initialization.
+pub fn generate_self_contained_worker(db_name: &str) -> String {
+    // Safely JSON-encode the db name for JS embedding
+    let encoded = serde_json::to_string(db_name).unwrap_or_else(|_| "\"unknown\"".to_string());
+    let prefix = format!("self.__SQLITE_DB_NAME = {};\n", encoded);
     // Use the bundled worker template with embedded WASM
-    include_str!("embedded_worker.js").to_string()
+    let body = include_str!("embedded_worker.js");
+    format!("{}{}", prefix, body)
 }

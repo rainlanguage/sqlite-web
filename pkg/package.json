@@ -1,0 +1,15 @@
+{
+  "name": "@rainlanguage/sqlite-web",
+  "type": "module",
+  "version": "0.0.1-alpha.3",
+  "files": [
+    "sqlite_web_bg.wasm",
+    "sqlite_web.js",
+    "sqlite_web.d.ts"
+  ],
+  "main": "sqlite_web.js",
+  "types": "sqlite_web.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
