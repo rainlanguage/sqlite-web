@@ -41,6 +41,6 @@
 	"type": "module",
 	"dependencies": {
 		"@rainlanguage/float": "^0.0.0-alpha.22",
-		"@rainlanguage/sqlite-web": "file:../pkg/rainlanguage-sqlite-web-0.0.1-alpha.0.tgz"
+		"@rainlanguage/sqlite-web": "file:../pkg/rainlanguage-sqlite-web-0.0.1-alpha.1.tgz"
 	}
 }
