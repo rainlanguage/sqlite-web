@@ -1,4 +1,4 @@
-import init, { SQLiteWasmDatabase } from 'sqlite-web';
+import init, { SQLiteWasmDatabase } from '@rainlanguage/sqlite-web';
 
 /**
  * Initialize a new SQLite database instance for testing
