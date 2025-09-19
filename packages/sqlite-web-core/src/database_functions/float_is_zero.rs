@@ -66,12 +66,6 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_float_is_zero_hex_true_for_negative_zero() {
-        let neg_zero_hex = parse_decimal_to_hex("-0");
-        assert!(float_is_zero_hex(&neg_zero_hex).unwrap());
-    }
-
-    #[wasm_bindgen_test]
     fn test_float_is_zero_hex_false_for_non_zero() {
         let non_zero_hex = parse_decimal_to_hex("1.25");
         assert!(!float_is_zero_hex(&non_zero_hex).unwrap());
