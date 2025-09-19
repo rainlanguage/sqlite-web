@@ -1,5 +1,8 @@
 use super::*;
 
+const FLOAT_SUM_ARG_ERROR_MESSAGE: &[u8] = b"FLOAT_SUM() requires exactly 1 argument\0";
+const FLOAT_SUM_CONTEXT_ERROR_MESSAGE: &[u8] = b"Failed to allocate aggregate context\0";
+
 pub struct FloatSumContext {
     total: Float,
 }
@@ -46,7 +49,7 @@ pub(crate) unsafe extern "C" fn float_sum_step(
     if argc != 1 {
         sqlite3_result_error(
             context,
-            c"FLOAT_SUM() requires exactly 1 argument".as_ptr(),
+            FLOAT_SUM_ARG_ERROR_MESSAGE.as_ptr() as *const c_char,
             -1,
         );
         return;
@@ -66,7 +69,7 @@ pub(crate) unsafe extern "C" fn float_sum_step(
     if aggregate_context.is_null() {
         sqlite3_result_error(
             context,
-            c"Failed to allocate aggregate context".as_ptr(),
+            FLOAT_SUM_CONTEXT_ERROR_MESSAGE.as_ptr() as *const c_char,
             -1,
         );
         return;

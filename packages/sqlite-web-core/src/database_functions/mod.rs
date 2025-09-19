@@ -8,11 +8,13 @@ use std::str::FromStr;
 
 // Import the individual function modules
 mod bigint_sum;
+mod float_is_zero;
 mod float_negate;
 mod float_sum;
 mod rain_math;
 
 use bigint_sum::*;
+use float_is_zero::*;
 use float_negate::*;
 use float_sum::*;
 
@@ -98,6 +100,26 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
 
     if ret != SQLITE_OK {
         return Err("Failed to register FLOAT_NEGATE function".to_string());
+    }
+
+    // Register FLOAT_IS_ZERO scalar function
+    let float_is_zero_name = CString::new("FLOAT_IS_ZERO").unwrap();
+    let ret = unsafe {
+        sqlite3_create_function_v2(
+            db,
+            float_is_zero_name.as_ptr(),
+            1, // 1 argument
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS,
+            std::ptr::null_mut(),
+            Some(float_is_zero), // xFunc for scalar
+            None,                // No xStep
+            None,                // No xFinal
+            None,                // No destructor
+        )
+    };
+
+    if ret != SQLITE_OK {
+        return Err("Failed to register FLOAT_IS_ZERO function".to_string());
     }
 
     Ok(())

@@ -1,5 +1,10 @@
 use super::*;
 
+const FLOAT_NEGATE_ARG_ERROR_MESSAGE: &[u8] = b"FLOAT_NEGATE() requires exactly 1 argument\0";
+const FLOAT_NEGATE_INVALID_UTF8_MESSAGE: &[u8] = b"invalid UTF-8\0";
+const FLOAT_NEGATE_RESULT_STRING_ERROR_MESSAGE: &[u8] = b"Failed to create result string\0";
+const FLOAT_NEGATE_ERROR_MESSAGE_INTERIOR_NUL: &[u8] = b"Error message contained interior NUL\0";
+
 // Helper to negate a Rain Float hex string while keeping full precision by
 // operating on the binary representation directly.
 fn float_negate_hex_to_hex(input_hex: &str) -> Result<String, String> {
@@ -29,7 +34,7 @@ pub unsafe extern "C" fn float_negate(
     if argc != 1 {
         sqlite3_result_error(
             context,
-            c"FLOAT_NEGATE() requires exactly 1 argument".as_ptr(),
+            FLOAT_NEGATE_ARG_ERROR_MESSAGE.as_ptr() as *const c_char,
             -1,
         );
         return;
@@ -48,7 +53,11 @@ pub unsafe extern "C" fn float_negate(
     let value_str = match value_cstr.to_str() {
         Ok(value_str) => value_str,
         Err(_) => {
-            sqlite3_result_error(context, c"invalid UTF-8".as_ptr(), -1);
+            sqlite3_result_error(
+                context,
+                FLOAT_NEGATE_INVALID_UTF8_MESSAGE.as_ptr() as *const c_char,
+                -1,
+            );
             return;
         }
     };
@@ -63,7 +72,11 @@ pub unsafe extern "C" fn float_negate(
                     SQLITE_TRANSIENT(),
                 );
             } else {
-                sqlite3_result_error(context, c"Failed to create result string".as_ptr(), -1);
+                sqlite3_result_error(
+                    context,
+                    FLOAT_NEGATE_RESULT_STRING_ERROR_MESSAGE.as_ptr() as *const c_char,
+                    -1,
+                );
             }
         }
         Err(e) => match CString::new(e) {
@@ -73,7 +86,7 @@ pub unsafe extern "C" fn float_negate(
             Err(_) => {
                 sqlite3_result_error(
                     context,
-                    c"Error message contained interior NUL".as_ptr(),
+                    FLOAT_NEGATE_ERROR_MESSAGE_INTERIOR_NUL.as_ptr() as *const c_char,
                     -1,
                 );
             }
