@@ -53,18 +53,9 @@ describe('BIGINT_SUM Database Function', () => {
 				// SQLite version may not support function_list, skip this check
 			}
 
-			// Test RAIN_MATH_PROCESS (known working function) 
-			try {
-				const rainResult = await db.query('SELECT RAIN_MATH_PROCESS("100", "200") as test');
-				expect(rainResult).toBeDefined();
-				expect(rainResult.value).toBeDefined();
-			} catch (error) {
-				throw new Error('RAIN_MATH_PROCESS not available');
-			}
-
-			// Test if function exists by trying to use it
-			try {
-				const result = await db.query('SELECT BIGINT_SUM("123") as test');
+                        // Test if function exists by trying to use it
+                        try {
+                                const result = await db.query('SELECT BIGINT_SUM("123") as test');
 				expect(result).toBeDefined();
 				expect(result.value).toBeDefined();
 				const data = JSON.parse(result.value || '[]');

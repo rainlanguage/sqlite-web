@@ -1,4 +1,5 @@
 use super::*;
+use rain_math_float::Float;
 
 pub struct FloatSumContext {
     total: Float,

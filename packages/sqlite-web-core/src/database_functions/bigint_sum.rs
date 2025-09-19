@@ -1,4 +1,6 @@
 use super::*;
+use alloy::primitives::I256;
+use std::str::FromStr;
 
 // Context structure for BIGINT_SUM aggregate function
 pub struct BigIntSumContext {

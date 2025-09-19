@@ -404,82 +404,74 @@ describe('Error Handling Tests', () => {
 		});
 	});
 
-	describe('Custom Function Errors', () => {
-		it('should handle custom function errors gracefully', async () => {
-			await db.query(`
-				CREATE TABLE custom_function_test (
-					id INTEGER PRIMARY KEY,
-					input1 TEXT,
-					input2 TEXT,
-					result TEXT
-				)
-			`);
+        describe('Custom Function Errors', () => {
+                it('should handle custom function errors gracefully', async () => {
+                        await db.query(`
+                                CREATE TABLE custom_function_test (
+                                        id INTEGER PRIMARY KEY,
+                                        amount TEXT NOT NULL
+                                )
+                        `);
 
-			// Test custom function with invalid inputs
-			const invalidInputs = [
-				{ input1: 'not_a_number', input2: '123' },
-				{ input1: '123', input2: 'not_a_number' },
-				{ input1: '', input2: '123' },
-				{ input1: '123', input2: '' },
-				{ input1: 'null', input2: 'null' }
-			];
+                        const invalidValues = ['not_a_number', '', '-', '0x', '123abc'];
 
-			for (const inputs of invalidInputs) {
-				try {
-					const result = await db.query(`
-						SELECT RAIN_MATH_PROCESS('${inputs.input1}', '${inputs.input2}') as result
-					`);
-					
-					
-					// If it succeeds, the result might be an error message
-					if (result.error) {
-						// Handle error case
-						const errorMessage = result.error.msg || result.error.readableMsg || String(result.error);
-						expect(errorMessage.toLowerCase()).toMatch(/failed|error|invalid/);
-						continue;
-					}
-					
-					if (!result.value || result.value === 'undefined') {
-						throw new Error(`Custom function returned undefined: ${inputs.input1}, ${inputs.input2}`);
-					}
-					
-					const data = JSON.parse(result.value);
-					if (data[0].result && data[0].result.includes('Failed')) {
-						// Custom function returned an error message, which is valid
-						expect(data[0].result).toContain('Failed');
-					}
-				} catch (error) {
-					// Expected to fail with invalid inputs
-					expect(error).toBeDefined();
-					const errorMessage = error instanceof Error ? error.message : String(error);
-					expect(errorMessage.toLowerCase()).toMatch(/failed|error|invalid/);
-				}
-			}
+                        for (const value of invalidValues) {
+                                const sanitizedValue = value.replace(/'/g, "''");
 
-			// Verify database is still functional
-			await db.query("INSERT INTO custom_function_test (id, input1, input2) VALUES (1, 'test', 'test')");
-			await assertions.assertRowCount(db, 'SELECT * FROM custom_function_test', 1);
-		});
+                                await db.query('DELETE FROM custom_function_test');
+                                await db.query(`
+                                        INSERT INTO custom_function_test (amount) VALUES ('${sanitizedValue}')
+                                `);
 
-		it('should handle valid custom function calls', async () => {
-			// Test that valid inputs work correctly
-			try {
-				const result = await db.query("SELECT RAIN_MATH_PROCESS('10', '20') as result");
-				const data = JSON.parse(result.value || '[]');
+                                const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM custom_function_test');
 
-				expect(data).toHaveLength(1);
-				expect(data[0]).toHaveProperty('result');
-				
-				// Result should be a valid output (exact format depends on implementation)
-				expect(data[0].result).toBeDefined();
-				expect(typeof data[0].result).toBe('string');
-				
-			} catch (error) {
-				// Custom function might not be available in test environment
-				console.log('Custom function not available in test environment:', error);
-			}
-		});
-	});
+                                expect(result.error).toBeDefined();
+
+                                const errorMessage =
+                                        result.error?.msg || result.error?.readableMsg || String(result.error);
+
+                                expect(errorMessage.toLowerCase()).toMatch(/failed|invalid|empty|incomplete/);
+                        }
+
+                        // Verify database is still functional
+                        await db.query('DELETE FROM custom_function_test');
+                        await db.query(`
+                                INSERT INTO custom_function_test (amount) VALUES
+                                ('100'),
+                                ('200'),
+                                ('-50')
+                        `);
+
+                        const validResult = await db.query('SELECT BIGINT_SUM(amount) as total FROM custom_function_test');
+                        const validData = JSON.parse(validResult.value || '[]');
+
+                        expect(validData).toHaveLength(1);
+                        expect(validData[0].total).toBe('250');
+                });
+
+                it('should handle valid custom function calls', async () => {
+                        await db.query(`
+                                CREATE TABLE custom_function_valid_test (
+                                        id INTEGER PRIMARY KEY,
+                                        amount TEXT NOT NULL
+                                )
+                        `);
+
+                        await db.query(`
+                                INSERT INTO custom_function_valid_test (amount) VALUES
+                                ('10'),
+                                ('20'),
+                                ('30')
+                        `);
+
+                        const result = await db.query('SELECT BIGINT_SUM(amount) as total FROM custom_function_valid_test');
+                        const data = JSON.parse(result.value || '[]');
+
+                        expect(data).toHaveLength(1);
+                        expect(data[0]).toHaveProperty('total');
+                        expect(data[0].total).toBe('60');
+                });
+        });
 
 	describe('Edge Cases and Boundary Conditions', () => {
 		it('should handle empty query strings', async () => {
