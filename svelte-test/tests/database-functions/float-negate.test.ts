@@ -3,7 +3,7 @@ import {
   createTestDatabase,
   cleanupDatabase,
 } from "../fixtures/test-helpers.js";
-import type { SQLiteWasmDatabase } from "sqlite-web";
+import type { SQLiteWasmDatabase } from "@rainlanguage/sqlite-web";
 import {
   createFloatHexMap,
   decodeFloatHex,
@@ -160,7 +160,9 @@ describe("FLOAT_NEGATE Database Function", () => {
       const bad = "";
       const result = await db.query(`SELECT FLOAT_NEGATE('${bad}') as neg`);
       expect(result.error).toBeDefined();
-      expect(result.error?.msg).toContain("Empty string is not a valid hex number");
+      expect(result.error?.msg).toContain(
+        "Empty string is not a valid hex number",
+      );
     });
   });
 });
