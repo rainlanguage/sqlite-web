@@ -4,29 +4,10 @@ import {
   cleanupDatabase,
 } from "../fixtures/test-helpers.js";
 import type { SQLiteWasmDatabase } from "@rainlanguage/sqlite-web";
-import { Float } from "@rainlanguage/float";
-
-function decodeFloatHex(hex: string): string {
-  const floatRes = Float.fromHex(hex as `0x${string}`);
-  if (floatRes.error) {
-    throw new Error(`fromHex failed: ${String(floatRes.error)}`);
-  }
-  const fmtRes = floatRes.value.format();
-  if (fmtRes.error) {
-    throw new Error(`format failed: ${String(fmtRes.error)}`);
-  }
-  return fmtRes.value as string;
-}
-
-function encodeFloatHex(decimal: string): `0x${string}` {
-  const parseRes = Float.parse(decimal);
-  if (parseRes.error) {
-    throw new Error(
-      `Float.parse failed: ${String(parseRes.error.msg ?? parseRes.error)}`,
-    );
-  }
-  return parseRes.value.asHex();
-}
+import {
+  decodeFloatHex,
+  encodeFloatHex,
+} from "../fixtures/float-utils.js";
 
 describe("FLOAT_ZERO_HEX Database Function", () => {
   let db: SQLiteWasmDatabase;
