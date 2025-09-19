@@ -4,6 +4,7 @@ mod coordination;
 mod database;
 mod database_functions;
 mod messages;
+mod util;
 mod worker;
 
 // Export the worker entry point
