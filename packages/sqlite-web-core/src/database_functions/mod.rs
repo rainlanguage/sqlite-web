@@ -13,12 +13,10 @@ mod float_negate;
 mod float_sum;
 mod rain_math;
 
-use float_is_zero::float_is_zero;
+use bigint_sum::*;
+use float_negate::*;
+use float_sum::*;
 
-// Re-export the functions
-pub use bigint_sum::*;
-pub use float_negate::*;
-pub use float_sum::*;
 pub use rain_math::*;
 
 /// Register all custom functions with the SQLite database
@@ -90,7 +88,7 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
             db,
             float_negate_name.as_ptr(),
             1, // 1 argument
-            SQLITE_UTF8,
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS,
             std::ptr::null_mut(),
             Some(float_negate), // xFunc for scalar
             None,               // No xStep

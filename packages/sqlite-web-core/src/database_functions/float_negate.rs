@@ -1,29 +1,20 @@
 use super::*;
 
-// Helper to negate a Rain Float hex string by formatting to decimal, toggling sign,
-// parsing back to Float, and returning the hex representation.
+// Helper to negate a Rain Float hex string while keeping full precision by
+// operating on the binary representation directly.
 fn float_negate_hex_to_hex(input_hex: &str) -> Result<String, String> {
     let trimmed = input_hex.trim();
+
+    if trimmed.is_empty() {
+        return Err("Empty string is not a valid hex number".to_string());
+    }
 
     // Parse the input hex into a Float
     let float_val =
         Float::from_hex(trimmed).map_err(|e| format!("Failed to parse Float hex: {e}"))?;
 
-    // Convert to human-readable decimal
-    let decimal = float_val
-        .format()
-        .map_err(|e| format!("Failed to format Float to decimal: {e}"))?;
-
-    // Toggle sign on the decimal string
-    let neg_decimal = if decimal.starts_with('-') {
-        decimal.trim_start_matches('-').to_string()
-    } else {
-        format!("-{decimal}")
-    };
-
-    // Parse back to Float from decimal
-    let neg_float = Float::parse(neg_decimal)
-        .map_err(|e| format!("Failed to parse negated decimal to Float: {e}"))?;
+    // Negate the float directly to avoid any formatting or precision loss.
+    let neg_float = (-float_val).map_err(|e| format!("Failed to negate Float value: {e}"))?;
 
     // Return as hex string
     Ok(neg_float.as_hex())
@@ -44,35 +35,49 @@ pub unsafe extern "C" fn float_negate(
         return;
     }
 
-    // Get the text value
-    let value_ptr = sqlite3_value_text(*argv);
-    if value_ptr.is_null() {
+    // Return early for NULL inputs using the documented type check.
+    if sqlite3_value_type(*argv) == SQLITE_NULL {
         sqlite3_result_null(context);
         return;
     }
 
-    let value_str = CStr::from_ptr(value_ptr as *const c_char).to_string_lossy();
+    // Get the text value (now known to be non-NULL).
+    let value_ptr = sqlite3_value_text(*argv);
 
-    match float_negate_hex_to_hex(&value_str) {
+    let value_cstr = CStr::from_ptr(value_ptr as *const c_char);
+    let value_str = match value_cstr.to_str() {
+        Ok(value_str) => value_str,
+        Err(_) => {
+            sqlite3_result_error(context, c"invalid UTF-8".as_ptr(), -1);
+            return;
+        }
+    };
+
+    match float_negate_hex_to_hex(value_str) {
         Ok(result_hex) => {
             if let Ok(result_cstr) = CString::new(result_hex) {
                 sqlite3_result_text(
                     context,
                     result_cstr.as_ptr(),
                     result_cstr.as_bytes().len() as c_int,
-                    Some(std::mem::transmute::<
-                        isize,
-                        unsafe extern "C" fn(*mut std::ffi::c_void),
-                    >(-1isize)), // SQLITE_TRANSIENT
+                    SQLITE_TRANSIENT(),
                 );
             } else {
                 sqlite3_result_error(context, c"Failed to create result string".as_ptr(), -1);
             }
         }
-        Err(e) => {
-            let error_msg = format!("{e}\0");
-            sqlite3_result_error(context, error_msg.as_ptr() as *const c_char, -1);
-        }
+        Err(e) => match CString::new(e) {
+            Ok(error_msg) => {
+                sqlite3_result_error(context, error_msg.as_ptr(), -1);
+            }
+            Err(_) => {
+                sqlite3_result_error(
+                    context,
+                    c"Error message contained interior NUL".as_ptr(),
+                    -1,
+                );
+            }
+        },
     }
 }
 
