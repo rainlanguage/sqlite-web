@@ -38,16 +38,6 @@ describe("FLOAT_IS_ZERO Database Function", () => {
 
   describe("Function Availability", () => {
     it("should have FLOAT_IS_ZERO function available", async () => {
-      try {
-        const pragmaResult = await db.query("PRAGMA function_list");
-        expect(pragmaResult).toBeDefined();
-        const functions = JSON.parse(pragmaResult.value || "[]");
-        const isZeroEntry = functions.find(
-          (f: any) => f.name === "FLOAT_IS_ZERO",
-        );
-        expect(isZeroEntry).toBeDefined();
-      } catch (error) {}
-
       const result = await db.query(
         `SELECT FLOAT_IS_ZERO('${ZERO_HEX}') as is_zero`,
       );
@@ -135,6 +125,14 @@ describe("FLOAT_IS_ZERO Database Function", () => {
 
     it("should reject empty string inputs", async () => {
       const result = await db.query("SELECT FLOAT_IS_ZERO('') as flag");
+      expect(result.error).toBeDefined();
+      expect(result.error?.msg).toContain(
+        "Empty string is not a valid hex number",
+      );
+    });
+
+    it("should reject whitespace-only inputs", async () => {
+      const result = await db.query("SELECT FLOAT_IS_ZERO('   ') as flag");
       expect(result.error).toBeDefined();
       expect(result.error?.msg).toContain(
         "Empty string is not a valid hex number",

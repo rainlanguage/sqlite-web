@@ -1,5 +1,7 @@
 use super::*;
 
+const ARG_ERROR_MESSAGE: &[u8] = b"FLOAT_IS_ZERO() requires exactly 1 argument\0";
+
 fn float_is_zero_hex(input_hex: &str) -> Result<bool, String> {
     let trimmed = input_hex.trim();
 
@@ -21,11 +23,7 @@ pub unsafe extern "C" fn float_is_zero(
     argv: *mut *mut sqlite3_value,
 ) {
     if argc != 1 {
-        sqlite3_result_error(
-            context,
-            c"FLOAT_IS_ZERO() requires exactly 1 argument".as_ptr(),
-            -1,
-        );
+        sqlite3_result_error(context, ARG_ERROR_MESSAGE.as_ptr() as *const c_char, -1);
         return;
     }
 

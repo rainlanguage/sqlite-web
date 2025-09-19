@@ -1,5 +1,7 @@
 use super::*;
 
+const RAIN_MATH_ARG_ERROR_MESSAGE: &[u8] = b"rain_math_process() requires exactly 2 arguments\0";
+
 // Custom function using rain-math-float library - sums two Float values
 pub unsafe extern "C" fn rain_math_process(
     context: *mut sqlite3_context,
@@ -9,7 +11,7 @@ pub unsafe extern "C" fn rain_math_process(
     if argc != 2 {
         sqlite3_result_error(
             context,
-            c"rain_math_process() requires exactly 2 arguments".as_ptr(),
+            RAIN_MATH_ARG_ERROR_MESSAGE.as_ptr() as *const c_char,
             -1,
         );
         return;
