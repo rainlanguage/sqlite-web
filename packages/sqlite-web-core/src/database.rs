@@ -1,4 +1,5 @@
 use crate::database_functions::register_custom_functions;
+use crate::util::sanitize_db_filename;
 use sqlite_wasm_rs::export::{install_opfs_sahpool, *};
 use std::ffi::{CStr, CString};
 use wasm_bindgen::prelude::*;
@@ -13,15 +14,21 @@ unsafe impl Send for SQLiteDatabase {}
 unsafe impl Sync for SQLiteDatabase {}
 
 impl SQLiteDatabase {
-    pub async fn initialize_opfs() -> Result<Self, JsValue> {
+    pub async fn initialize_opfs(db_name: &str) -> Result<Self, JsValue> {
         // Install OPFS VFS and set as default
         install_opfs_sahpool(None, true)
             .await
             .map_err(|e| JsValue::from_str(&format!("Failed to install OPFS VFS: {e:?}")))?;
 
         // Open database with OPFS
-        let mut db = std::ptr::null_mut();
-        let db_name = CString::new("opfs-sahpool:worker.db").unwrap();
+        let mut db: *mut sqlite3 = std::ptr::null_mut();
+        let sanitized = sanitize_db_filename(db_name);
+        let open_uri = format!("opfs-sahpool:{}", sanitized);
+        let db_name = CString::new(open_uri.clone()).map_err(|e| {
+            JsValue::from_str(&format!(
+                "Invalid database URI (NUL found): {open_uri} ({e})"
+            ))
+        })?;
 
         let ret = unsafe {
             sqlite3_open_v2(
@@ -34,13 +41,20 @@ impl SQLiteDatabase {
 
         if ret != SQLITE_OK {
             let error_msg = unsafe {
-                let ptr = sqlite3_errmsg(db);
-                if !ptr.is_null() {
-                    CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                if db.is_null() {
+                    format!("SQLite open error code: {ret}")
                 } else {
-                    format!("SQLite error code: {ret}")
+                    let ptr = sqlite3_errmsg(db);
+                    if !ptr.is_null() {
+                        CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                    } else {
+                        format!("SQLite open error code: {ret}")
+                    }
                 }
             };
+            if !db.is_null() {
+                unsafe { sqlite3_close(db) };
+            }
             return Err(JsValue::from_str(&format!(
                 "Failed to open SQLite database: {error_msg}"
             )));
@@ -331,7 +345,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_opfs_initialization_success() {
-        let result = SQLiteDatabase::initialize_opfs().await;
+        let result = SQLiteDatabase::initialize_opfs("testdb").await;
         if result.is_err() {
             return;
         }
@@ -347,7 +361,7 @@ mod tests {
     }
 
     async fn get_test_db() -> Option<SQLiteDatabase> {
-        (SQLiteDatabase::initialize_opfs().await).ok()
+        (SQLiteDatabase::initialize_opfs("testdb").await).ok()
     }
 
     #[wasm_bindgen_test]

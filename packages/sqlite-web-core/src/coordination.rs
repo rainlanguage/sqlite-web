@@ -9,6 +9,7 @@ use web_sys::BroadcastChannel;
 
 use crate::database::SQLiteDatabase;
 use crate::messages::{ChannelMessage, PendingQuery};
+use crate::util::sanitize_identifier;
 
 // Worker state
 pub struct WorkerState {
@@ -16,19 +17,43 @@ pub struct WorkerState {
     pub is_leader: Rc<RefCell<bool>>,
     pub db: Rc<RefCell<Option<SQLiteDatabase>>>,
     pub channel: BroadcastChannel,
+    pub db_name: String,
     pub pending_queries: Rc<RefCell<HashMap<String, PendingQuery>>>,
 }
 
 impl WorkerState {
     pub fn new() -> Result<Self, JsValue> {
+        fn get_db_name_from_global() -> Result<String, JsValue> {
+            let global = js_sys::global();
+            let val = Reflect::get(&global, &JsValue::from_str("__SQLITE_DB_NAME"))
+                .unwrap_or(JsValue::UNDEFINED);
+            if let Some(s) = val.as_string() {
+                let trimmed = s.trim().to_string();
+                if trimmed.is_empty() {
+                    return Err(JsValue::from_str("Database name is required"));
+                }
+                Ok(trimmed)
+            } else {
+                #[cfg(test)]
+                {
+                    return Ok("testdb".to_string());
+                }
+                #[allow(unreachable_code)]
+                Err(JsValue::from_str("Database name is required"))
+            }
+        }
+
         let worker_id = Uuid::new_v4().to_string();
-        let channel = BroadcastChannel::new("sqlite-queries")?;
+        let db_name_raw = get_db_name_from_global()?;
+        let channel_name = format!("sqlite-queries-{}", sanitize_identifier(&db_name_raw));
+        let channel = BroadcastChannel::new(&channel_name)?;
 
         Ok(WorkerState {
             worker_id,
             is_leader: Rc::new(RefCell::new(false)),
             db: Rc::new(RefCell::new(None)),
             channel,
+            db_name: db_name_raw,
             pending_queries: Rc::new(RefCell::new(HashMap::new())),
         })
     }
@@ -114,6 +139,7 @@ impl WorkerState {
         let is_leader = Rc::clone(&self.is_leader);
         let db = Rc::clone(&self.db);
         let channel = self.channel.clone();
+        let db_name_for_handler = self.db_name.clone();
 
         // Get navigator.locks from WorkerGlobalScope
         let global = js_sys::global();
@@ -134,9 +160,10 @@ impl WorkerState {
             let db = Rc::clone(&db);
             let channel = channel.clone();
             let worker_id = worker_id.clone();
+            let db_name = db_name_for_handler.clone();
 
             spawn_local(async move {
-                match SQLiteDatabase::initialize_opfs().await {
+                match SQLiteDatabase::initialize_opfs(&db_name).await {
                     Ok(database) => {
                         *db.borrow_mut() = Some(database);
 
@@ -157,9 +184,10 @@ impl WorkerState {
         let request_fn = Reflect::get(&locks, &JsValue::from_str("request")).unwrap();
         let request_fn = request_fn.dyn_ref::<Function>().unwrap();
 
+        let lock_id: String = format!("sqlite-database-{}", sanitize_identifier(&self.db_name));
         let _ = request_fn.call3(
             &locks,
-            &JsValue::from_str("sqlite-database"),
+            &JsValue::from_str(&lock_id),
             &options,
             handler.as_ref().unchecked_ref(),
         );
