@@ -7,11 +7,11 @@ export default defineConfig({
 	plugins: [
 		sveltekit(),
 		{
-			name: 'sqlite-web-serve',
+			name: 'rainlanguage-sqlite-web-serve',
 			configureServer(server) {
 				server.middlewares.use('/pkg', (req, res, next) => {
 					const filePath = req.url?.substring(1); // remove leading slash
-					const fullPath = path.join(process.cwd(), 'node_modules/sqlite-web', filePath || '');
+					const fullPath = path.join(process.cwd(), 'node_modules/@rainlanguage/sqlite-web', filePath || '');
 					
 					if (fs.existsSync(fullPath)) {
 						if (fullPath.endsWith('.wasm')) {
@@ -33,7 +33,7 @@ export default defineConfig({
 		}
 	},
 	optimizeDeps: {
-		exclude: ['sqlite-web']
+		exclude: ['@rainlanguage/sqlite-web']
 	},
 	assetsInclude: ['**/*.wasm']
 });

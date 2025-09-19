@@ -2,10 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   createTestDatabase,
   cleanupDatabase,
-  assertions,
   PerformanceTracker,
 } from "../fixtures/test-helpers.js";
-import type { SQLiteWasmDatabase } from "sqlite-web";
+import type { SQLiteWasmDatabase } from "@rainlanguage/sqlite-web";
 import {
   createFloatHexMap,
   decodeFloatHex,
@@ -385,8 +384,7 @@ describe("FLOAT_SUM Database Function", () => {
     it("should handle bulk aggregation efficiently", async () => {
       const values = Array.from(
         { length: 10 },
-        () =>
-          `('${floatHex.zeroPointOne}', 'bulk')`,
+        () => `('${floatHex.zeroPointOne}', 'bulk')`,
       ).join(",");
 
       await db.query(`

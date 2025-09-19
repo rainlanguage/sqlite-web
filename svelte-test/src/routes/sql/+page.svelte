@@ -1,7 +1,7 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { browser } from '$app/environment';
-    import init, { SQLiteWasmDatabase } from 'sqlite-web';
+    import init, { SQLiteWasmDatabase } from '@rainlanguage/sqlite-web';
 
     let db: SQLiteWasmDatabase | undefined;
     let sqlQuery = $state('SELECT * FROM users;');
