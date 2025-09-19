@@ -3,7 +3,7 @@ import {
   createTestDatabase,
   cleanupDatabase,
 } from "../fixtures/test-helpers.js";
-import type { SQLiteWasmDatabase } from "sqlite-web";
+import type { SQLiteWasmDatabase } from "@rainlanguage/sqlite-web";
 import { Float } from "@rainlanguage/float";
 
 function decodeFloatHex(hex: string): string {
