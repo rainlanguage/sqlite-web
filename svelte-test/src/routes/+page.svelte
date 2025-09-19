@@ -20,7 +20,7 @@
             await init();
 
             status = 'Creating database connection...';
-            let res = SQLiteWasmDatabase.new();
+            let res = SQLiteWasmDatabase.new('ui-app-db');
             if (res.error) {
                 throw new Error('Failed to create database connection');
             }
