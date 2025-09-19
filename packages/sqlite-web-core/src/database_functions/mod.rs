@@ -14,6 +14,7 @@ mod float_sum;
 mod rain_math;
 
 use bigint_sum::*;
+use float_is_zero::*;
 use float_negate::*;
 use float_sum::*;
 

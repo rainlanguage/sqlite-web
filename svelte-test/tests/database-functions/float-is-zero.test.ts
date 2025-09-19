@@ -4,7 +4,7 @@ import {
   cleanupDatabase,
   PerformanceTracker,
 } from "../fixtures/test-helpers.js";
-import type { SQLiteWasmDatabase } from "sqlite-web";
+import type { SQLiteWasmDatabase } from "@rainlanguage/sqlite-web";
 import { Float } from "@rainlanguage/float";
 
 const ZERO_HEX = Float.parse("0").value?.asHex() as string;
