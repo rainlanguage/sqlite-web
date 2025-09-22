@@ -10,11 +10,13 @@ use std::str::FromStr;
 mod bigint_sum;
 mod float_negate;
 mod float_sum;
+mod float_zero_hex;
 mod rain_math;
 
 use bigint_sum::*;
 use float_negate::*;
 use float_sum::*;
+use float_zero_hex::*;
 
 pub use rain_math::*;
 
@@ -78,6 +80,26 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
 
     if ret != SQLITE_OK {
         return Err("Failed to register FLOAT_SUM function".to_string());
+    }
+
+    // Register FLOAT_ZERO_HEX scalar function
+    let float_zero_hex_name = CString::new("FLOAT_ZERO_HEX").unwrap();
+    let ret = unsafe {
+        sqlite3_create_function_v2(
+            db,
+            float_zero_hex_name.as_ptr(),
+            0, // 0 arguments
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS,
+            std::ptr::null_mut(),
+            Some(float_zero_hex), // Scalar function
+            None,
+            None,
+            None,
+        )
+    };
+
+    if ret != SQLITE_OK {
+        return Err("Failed to register FLOAT_ZERO_HEX function".to_string());
     }
 
     // Register FLOAT_NEGATE scalar function
