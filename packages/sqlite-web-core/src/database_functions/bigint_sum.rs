@@ -1,4 +1,6 @@
 use super::*;
+use alloy::primitives::I256;
+use std::str::FromStr;
 
 const BIGINT_ARG_ERROR_MESSAGE: &[u8] = b"BIGINT_SUM() requires exactly 1 argument\0";
 const BIGINT_CONTEXT_ERROR_MESSAGE: &[u8] = b"Failed to allocate aggregate context\0";

@@ -1,10 +1,7 @@
-use alloy::primitives::{I256, U256};
 use rain_math_float::Float;
 use sqlite_wasm_rs::export::*;
 use std::ffi::{c_int, CStr, CString};
-use std::ops::Add;
 use std::os::raw::c_char;
-use std::str::FromStr;
 
 // Import the individual function modules
 mod bigint_sum;
@@ -12,7 +9,6 @@ mod float_is_zero;
 mod float_negate;
 mod float_sum;
 mod float_zero_hex;
-mod rain_math;
 
 use bigint_sum::*;
 use float_is_zero::*;
@@ -20,30 +16,8 @@ use float_negate::*;
 use float_sum::*;
 use float_zero_hex::*;
 
-pub use rain_math::*;
-
 /// Register all custom functions with the SQLite database
 pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
-    // Register rain_math_process function
-    let func_name = CString::new("RAIN_MATH_PROCESS").unwrap();
-    let ret = unsafe {
-        sqlite3_create_function_v2(
-            db,
-            func_name.as_ptr(),
-            2, // 2 arguments
-            SQLITE_UTF8,
-            std::ptr::null_mut(),
-            Some(rain_math_process),
-            None, // No xStep for scalar function
-            None, // No xFinal for scalar function
-            None, // No destructor
-        )
-    };
-
-    if ret != SQLITE_OK {
-        return Err("Failed to register RAIN_MATH_PROCESS function".to_string());
-    }
-
     // Register BIGINT_SUM aggregate function
     let bigint_sum_name = CString::new("BIGINT_SUM").unwrap();
     let ret = unsafe {

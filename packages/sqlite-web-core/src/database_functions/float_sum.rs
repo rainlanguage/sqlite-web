@@ -1,4 +1,5 @@
 use super::*;
+use rain_math_float::Float;
 
 const FLOAT_SUM_ARG_ERROR_MESSAGE: &[u8] = b"FLOAT_SUM() requires exactly 1 argument\0";
 const FLOAT_SUM_CONTEXT_ERROR_MESSAGE: &[u8] = b"Failed to allocate aggregate context\0";
