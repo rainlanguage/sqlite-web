@@ -1,7 +1,7 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { browser } from '$app/environment';
-    import init, { SQLiteWasmDatabase } from 'sqlite-web';
+    import init, { SQLiteWasmDatabase } from '@rainlanguage/sqlite-web';
 
     let db: SQLiteWasmDatabase | undefined;
     let users: Array<{ id: number; name: string; email: string; created_at: string }> = $state([]);
@@ -20,7 +20,7 @@
             await init();
 
             status = 'Creating database connection...';
-            let res = SQLiteWasmDatabase.new();
+            let res = SQLiteWasmDatabase.new('ui-app-db');
             if (res.error) {
                 throw new Error('Failed to create database connection');
             }

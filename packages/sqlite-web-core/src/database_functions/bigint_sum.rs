@@ -2,6 +2,9 @@ use super::*;
 use alloy::primitives::I256;
 use std::str::FromStr;
 
+const BIGINT_ARG_ERROR_MESSAGE: &[u8] = b"BIGINT_SUM() requires exactly 1 argument\0";
+const BIGINT_CONTEXT_ERROR_MESSAGE: &[u8] = b"Failed to allocate aggregate context\0";
+
 // Context structure for BIGINT_SUM aggregate function
 pub struct BigIntSumContext {
     total: I256,
@@ -58,7 +61,7 @@ pub unsafe extern "C" fn bigint_sum_step(
     if argc != 1 {
         sqlite3_result_error(
             context,
-            c"BIGINT_SUM() requires exactly 1 argument".as_ptr(),
+            BIGINT_ARG_ERROR_MESSAGE.as_ptr() as *const c_char,
             -1,
         );
         return;
@@ -78,7 +81,7 @@ pub unsafe extern "C" fn bigint_sum_step(
     if aggregate_context.is_null() {
         sqlite3_result_error(
             context,
-            c"Failed to allocate aggregate context".as_ptr(),
+            BIGINT_CONTEXT_ERROR_MESSAGE.as_ptr() as *const c_char,
             -1,
         );
         return;

@@ -1,14 +1,14 @@
-import init, { SQLiteWasmDatabase } from 'sqlite-web';
+import init, { SQLiteWasmDatabase } from '@rainlanguage/sqlite-web';
 
 /**
  * Initialize a new SQLite database instance for testing
  */
-export async function createTestDatabase(): Promise<SQLiteWasmDatabase> {
+export async function createTestDatabase(name: string = 'ui-test-db'): Promise<SQLiteWasmDatabase> {
 	// Initialize WASM module
 	await init();
 	
 	// Create database instance
-	const result = SQLiteWasmDatabase.new();
+	const result = SQLiteWasmDatabase.new(name);
 	if (result.error) {
 		throw new Error(`Failed to create database: ${result.error.msg}`);
 	}
@@ -185,8 +185,10 @@ export async function cleanupDatabase(db: SQLiteWasmDatabase): Promise<void> {
 			'recovery_test', 'custom_function_test', 'special_chars_test', 'concurrent_error_test',
 			// Worker communication test tables  
 			'workers_test', 'shared_data', 'worker_coordination', 'message_test',
+			// Multi-SQL commands (UI) test tables
+			'multi_ui', 'semi_ui', 'gate_ui', 'trg_src_ui', 'trg_log_ui',
 			// Database function test tables
-			'bigint_test', 'categories', 'float_test', 'float_categories'
+			'bigint_test', 'categories', 'float_test', 'float_categories', 'float_zero_usage', 'float_zero_defaults', 'float_is_zero_test'
 		];
 		for (const table of tables) {
 			try {

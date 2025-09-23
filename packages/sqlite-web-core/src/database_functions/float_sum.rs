@@ -1,6 +1,9 @@
 use super::*;
 use rain_math_float::Float;
 
+const FLOAT_SUM_ARG_ERROR_MESSAGE: &[u8] = b"FLOAT_SUM() requires exactly 1 argument\0";
+const FLOAT_SUM_CONTEXT_ERROR_MESSAGE: &[u8] = b"Failed to allocate aggregate context\0";
+
 pub struct FloatSumContext {
     total: Float,
 }
@@ -47,7 +50,7 @@ pub(crate) unsafe extern "C" fn float_sum_step(
     if argc != 1 {
         sqlite3_result_error(
             context,
-            c"FLOAT_SUM() requires exactly 1 argument".as_ptr(),
+            FLOAT_SUM_ARG_ERROR_MESSAGE.as_ptr() as *const c_char,
             -1,
         );
         return;
@@ -67,7 +70,7 @@ pub(crate) unsafe extern "C" fn float_sum_step(
     if aggregate_context.is_null() {
         sqlite3_result_error(
             context,
-            c"Failed to allocate aggregate context".as_ptr(),
+            FLOAT_SUM_CONTEXT_ERROR_MESSAGE.as_ptr() as *const c_char,
             -1,
         );
         return;
@@ -187,16 +190,18 @@ mod tests {
     fn test_float_sum_context_add_hex_without_prefix() {
         let mut context = FloatSumContext::new();
 
-        assert!(context
-            .add_value("ffffffff0000000000000000000000000000000000000000000000000000000f")
-            .is_ok()); // 1.5
+        let one_point_five = Float::parse("1.5".to_string()).unwrap().as_hex();
+        let one_point_five_no_prefix = one_point_five.trim_start_matches("0x").to_string();
+
+        assert!(context.add_value(&one_point_five_no_prefix).is_ok()); // 1.5
         let result_hex = context.get_total_as_hex().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
         assert_eq!(result_decimal, "1.5");
 
-        assert!(context
-            .add_value("fffffffe000000000000000000000000000000000000000000000000000000e1")
-            .is_ok()); // 2.25
+        let two_point_two_five = Float::parse("2.25".to_string()).unwrap().as_hex();
+        let two_point_two_five_no_prefix = two_point_two_five.trim_start_matches("0x").to_string();
+
+        assert!(context.add_value(&two_point_two_five_no_prefix).is_ok()); // 2.25
         let result_hex = context.get_total_as_hex().unwrap();
         let result_decimal = Float::from_hex(&result_hex).unwrap().format().unwrap();
         assert_eq!(result_decimal, "3.75"); // 1.5 + 2.25 = 3.75
@@ -206,12 +211,17 @@ mod tests {
     fn test_float_sum_context_add_uppercase_hex() {
         let mut context = FloatSumContext::new();
 
-        assert!(context
-            .add_value("0XFFFFFFFB0000000000000000000000000000000000000000000000000004CB2F")
-            .is_err()); // Should fail - uppercase 0X not supported
-        assert!(context
-            .add_value("0XFFFFFFFF00000000000000000000000000000000000000000000000000000069")
-            .is_err()); // Should fail - uppercase 0X not supported
+        let upper_case_bad = Float::parse("-12345.6789".to_string())
+            .unwrap()
+            .as_hex()
+            .replacen("0x", "0X", 1);
+        assert!(context.add_value(&upper_case_bad).is_err()); // Should fail - uppercase 0X not supported
+
+        let another_upper = Float::parse("1024.125".to_string())
+            .unwrap()
+            .as_hex()
+            .replacen("0x", "0X", 1);
+        assert!(context.add_value(&another_upper).is_err()); // Should fail - uppercase 0X not supported
     }
 
     #[wasm_bindgen_test]

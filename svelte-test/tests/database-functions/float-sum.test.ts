@@ -2,11 +2,16 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   createTestDatabase,
   cleanupDatabase,
-  assertions,
   PerformanceTracker,
 } from "../fixtures/test-helpers.js";
-import type { SQLiteWasmDatabase } from "sqlite-web";
-import { Float } from "@rainlanguage/float";
+import type { SQLiteWasmDatabase } from "@rainlanguage/sqlite-web";
+import {
+  createFloatHexMap,
+  decodeFloatHex,
+  encodeFloatHex,
+  toMixedCase,
+  withoutPrefix,
+} from "../fixtures/float-utils";
 
 interface CategoryRow {
   category: string;
@@ -22,54 +27,17 @@ describe("FLOAT_SUM Database Function", () => {
   let db: SQLiteWasmDatabase;
   let perf: PerformanceTracker;
 
-  function decodeFloatHex(hex: string): string {
-    const floatRes = Float.fromHex(hex as `0x${string}`);
-    if (floatRes.error) {
-      throw new Error(`fromHex failed: ${String(floatRes.error)}`);
-    }
-    const fmtRes = floatRes.value.format();
-    if (fmtRes.error) {
-      throw new Error(`format failed: ${String(fmtRes.error)}`);
-    }
-    return fmtRes.value as string;
-  }
-
-  function encodeFloatHex(decimal: string): `0x${string}` {
-    const parseRes = Float.parse(decimal);
-    if (parseRes.error) {
-      throw new Error(`Float.parse failed: ${String(parseRes.error.msg ?? parseRes.error)}`);
-    }
-    return parseRes.value.asHex();
-  }
-
-  function withoutPrefix(hex: `0x${string}`): string {
-    return hex.slice(2);
-  }
-
-  function toMixedCase(hex: `0x${string}`): string {
-    let result = "";
-    for (let i = 0; i < hex.length; i++) {
-      const char = hex[i];
-      if (/[a-f]/.test(char)) {
-        result += i % 2 === 0 ? char.toUpperCase() : char.toLowerCase();
-      } else {
-        result += char;
-      }
-    }
-    return result;
-  }
-
-  const floatHex = {
-    zero: encodeFloatHex("0"),
-    zeroPointOne: encodeFloatHex("0.1"),
-    zeroPointFive: encodeFloatHex("0.5"),
-    onePointFive: encodeFloatHex("1.5"),
-    twoPointTwoFive: encodeFloatHex("2.25"),
-    ten: encodeFloatHex("10"),
-    twenty: encodeFloatHex("20"),
-    hundredPointTwentyFive: encodeFloatHex("100.25"),
-    oneHundredTwentyThreePointFourFiveSix: encodeFloatHex("123.456"),
-  } as const;
+  const floatHex = createFloatHexMap({
+    zero: "0",
+    zeroPointOne: "0.1",
+    zeroPointFive: "0.5",
+    onePointFive: "1.5",
+    twoPointTwoFive: "2.25",
+    ten: "10",
+    twenty: "20",
+    hundredPointTwentyFive: "100.25",
+    oneHundredTwentyThreePointFourFiveSix: "123.456",
+  } as const);
 
   beforeEach(async () => {
     db = await createTestDatabase();
@@ -406,8 +374,7 @@ describe("FLOAT_SUM Database Function", () => {
     it("should handle bulk aggregation efficiently", async () => {
       const values = Array.from(
         { length: 10 },
-        () =>
-          `('${floatHex.zeroPointOne}', 'bulk')`,
+        () => `('${floatHex.zeroPointOne}', 'bulk')`,
       ).join(",");
 
       await db.query(`
