@@ -281,7 +281,7 @@ impl SQLiteWasmDatabase {
 
             // Unsupported
             return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
-                &format!("Unsupported parameter type at index {}", i + 1),
+                &format!("Unsupported parameter type at position {}", i + 1),
             )));
         }
 
