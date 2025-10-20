@@ -69,7 +69,11 @@ impl WorkerState {
 
             if let Ok(msg) = serde_wasm_bindgen::from_value::<ChannelMessage>(data) {
                 match msg {
-                    ChannelMessage::QueryRequest { query_id, sql } => {
+                    ChannelMessage::QueryRequest {
+                        query_id,
+                        sql,
+                        params,
+                    } => {
                         if *is_leader.borrow() {
                             let db = Rc::clone(&db);
                             let channel = channel.clone();
@@ -80,7 +84,10 @@ impl WorkerState {
                                     let db_opt = db.borrow_mut().take();
                                     match db_opt {
                                         Some(mut database) => {
-                                            let result = database.exec(&sql).await;
+                                            let result = match params {
+                                                Some(p) => database.exec_with_params(&sql, p).await,
+                                                None => database.exec(&sql).await,
+                                            };
                                             // Put the database back
                                             *db.borrow_mut() = Some(database);
                                             result
@@ -195,13 +202,20 @@ impl WorkerState {
         handler.forget();
     }
 
-    pub async fn execute_query(&self, sql: String) -> Result<String, String> {
+    pub async fn execute_query(
+        &self,
+        sql: String,
+        params: Option<Vec<serde_json::Value>>,
+    ) -> Result<String, String> {
         if *self.is_leader.borrow() {
             // Extract database temporarily to avoid holding RefCell across await
             let db_opt = self.db.borrow_mut().take();
             match db_opt {
                 Some(mut database) => {
-                    let result = database.exec(&sql).await;
+                    let result = match params {
+                        Some(p) => database.exec_with_params(&sql, p).await,
+                        None => database.exec(&sql).await,
+                    };
                     // Put the database back
                     *self.db.borrow_mut() = Some(database);
                     result
@@ -220,6 +234,7 @@ impl WorkerState {
             let msg = ChannelMessage::QueryRequest {
                 query_id: query_id.clone(),
                 sql,
+                params,
             };
             let msg_js = serde_wasm_bindgen::to_value(&msg).unwrap();
             let _ = self.channel.post_message(&msg_js);
@@ -404,7 +419,7 @@ mod tests {
             ];
 
             for query in test_queries {
-                let result = leader_state.execute_query(query.to_string()).await;
+                let result = leader_state.execute_query(query.to_string(), None).await;
                 match result {
                     Err(msg) => assert_eq!(
                         msg, "Database not initialized",
@@ -425,7 +440,9 @@ mod tests {
                 "Should start as follower"
             );
 
-            let result = follower_state.execute_query("SELECT 1".to_string()).await;
+            let result = follower_state
+                .execute_query("SELECT 1".to_string(), None)
+                .await;
             match result {
                 Err(msg) => assert!(
                     msg.contains("timeout") || msg.contains("Query timeout"),
