@@ -161,9 +161,6 @@ impl SQLiteDatabase {
 
         if has_numbered {
             // Ensure continuity 1..=max and param list size matches
-            if numbered_max == 0 {
-                return Err("No numbered parameters referenced.".to_string());
-            }
             for need in 1..=numbered_max {
                 if !numbered_present.contains(&need) {
                     return Err(format!(
@@ -181,36 +178,44 @@ impl SQLiteDatabase {
             }
         }
 
+        // Build a mapping from each placeholder position (1..=param_count)
+        // to its corresponding index in the params slice (0-based). This avoids
+        // re-parsing placeholder names during binding.
+        let mut param_map: Vec<usize> = Vec::with_capacity(param_count);
+        for i in 1..=param_count as i32 {
+            let name_ptr = unsafe { sqlite3_bind_parameter_name(stmt, i) };
+            let target_index = if name_ptr.is_null() {
+                // plain '?': 1..=param_count maps to params[0..]
+                (i as usize) - 1
+            } else {
+                let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
+                let s = name.as_ref();
+                if let Some(stripped) = s.strip_prefix('?') {
+                    let n: usize = stripped
+                        .parse()
+                        .map_err(|_| format!("Invalid parameter index: {}", s))?;
+                    if n == 0 {
+                        return Err(
+                            "Invalid parameter index: ?0 or negative indices are not allowed."
+                                .to_string(),
+                        );
+                    }
+                    n - 1
+                } else {
+                    // We reject named parameters earlier; keep a defensive error here.
+                    return Err("Named parameters not supported.".to_string());
+                }
+            };
+            param_map.push(target_index);
+        }
+
         // Keep owned buffers alive for text/blob while the statement executes
         let mut owned_texts: Vec<CString> = Vec::new();
         let mut owned_blobs: Vec<Vec<u8>> = Vec::new();
 
         for i in 1..=param_count as i32 {
-            // Determine which params index to use
-            let target_index = {
-                let name_ptr = unsafe { sqlite3_bind_parameter_name(stmt, i) };
-                if name_ptr.is_null() {
-                    // plain '?': 1..=param_count maps to params[0..]
-                    (i as usize) - 1
-                } else {
-                    let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
-                    let s = name.as_ref();
-                    if let Some(stripped) = s.strip_prefix('?') {
-                        let n: usize = stripped
-                            .parse()
-                            .map_err(|_| format!("Invalid parameter index: {}", s))?;
-                        if n == 0 {
-                            return Err(
-                                "Invalid parameter index: ?0 or negative indices are not allowed."
-                                    .to_string(),
-                            );
-                        }
-                        n - 1
-                    } else {
-                        return Err("Named parameters not supported.".to_string());
-                    }
-                }
-            };
+            // Determine which params index to use via precomputed mapping
+            let target_index = param_map[(i - 1) as usize];
 
             let val = params.get(target_index).ok_or_else(|| {
                 format!(
