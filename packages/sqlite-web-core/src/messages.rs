@@ -15,6 +15,9 @@ pub enum ChannelMessage {
         #[serde(rename = "queryId")]
         query_id: String,
         sql: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        params: Option<Vec<serde_json::Value>>,
     },
     #[serde(rename = "query-response")]
     QueryResponse {
@@ -30,7 +33,12 @@ pub enum ChannelMessage {
 #[serde(tag = "type")]
 pub enum WorkerMessage {
     #[serde(rename = "execute-query")]
-    ExecuteQuery { sql: String },
+    ExecuteQuery {
+        sql: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        params: Option<Vec<serde_json::Value>>,
+    },
 }
 
 // Messages to main thread
@@ -85,6 +93,7 @@ mod tests {
         let query_request = ChannelMessage::QueryRequest {
             query_id: "query-456".to_string(),
             sql: "SELECT * FROM users".to_string(),
+            params: None,
         };
         assert_serialization_roundtrip(query_request, "query-request", |json| {
             assert!(json.contains("\"queryId\":\"query-456\""));
@@ -117,6 +126,7 @@ mod tests {
     fn test_worker_message_execute_query_serialization() {
         let msg = WorkerMessage::ExecuteQuery {
             sql: "INSERT INTO table VALUES (1, 'test')".to_string(),
+            params: None,
         };
 
         let json = serde_json::to_string(&msg).expect("Should serialize");
@@ -125,7 +135,7 @@ mod tests {
 
         let deserialized: WorkerMessage = serde_json::from_str(&json).expect("Should deserialize");
         match deserialized {
-            WorkerMessage::ExecuteQuery { sql } => {
+            WorkerMessage::ExecuteQuery { sql, .. } => {
                 assert_eq!(sql, "INSERT INTO table VALUES (1, 'test')");
             }
         }
@@ -167,6 +177,7 @@ mod tests {
         let empty_sql = ChannelMessage::QueryRequest {
             query_id: "test".to_string(),
             sql: String::new(),
+            params: None,
         };
         assert_serialization_roundtrip(empty_sql, "query-request", |json| {
             assert!(json.contains("\"sql\":\"\""));
@@ -175,6 +186,7 @@ mod tests {
         let special_chars = ChannelMessage::QueryRequest {
             query_id: "query\"with\"quotes".to_string(),
             sql: "SELECT 'test\nwith\nnewlines'".to_string(),
+            params: None,
         };
         assert_serialization_roundtrip(special_chars, "query-request", |_| {});
     }
