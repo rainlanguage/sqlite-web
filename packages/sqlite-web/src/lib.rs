@@ -519,12 +519,11 @@ mod tests {
         arr.push(&JsValue::from_bool(true));
         // null
         arr.push(&JsValue::NULL);
-        // undefined (should be normalized to NULL)
-        arr.push(&JsValue::UNDEFINED);
-        // BigInt
+        // Create a sparse hole at index 4 (left unset, should normalize to NULL)
+        // Then set BigInt at index 5 to keep subsequent indices consistent
         let bi = js_sys::BigInt::from(1234u32);
         let bi_js: JsValue = bi.into();
-        arr.push(&bi_js);
+        js_sys::Reflect::set(&arr, &JsValue::from_f64(5.0), &bi_js).expect("set index 5");
         // Uint8Array
         let bytes: [u8; 3] = [1, 2, 3];
         let u8 = js_sys::Uint8Array::from(&bytes[..]);
@@ -571,7 +570,7 @@ mod tests {
             // null
             let v3 = params.get(3);
             assert!(v3.is_null());
-            // undefined mapped to null
+            // sparse hole mapped to null
             let v4 = params.get(4);
             assert!(v4.is_null());
             // BigInt encoded object { __type: "bigint", value: string }
@@ -640,5 +639,34 @@ mod tests {
         }
 
         uninstall_post_message_spy();
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_query_rejects_nan_infinity_params() {
+        let db = SQLiteWasmDatabase::new("testdb").expect("db created");
+
+        // NaN
+        {
+            let arr = js_sys::Array::new();
+            arr.push(&JsValue::from_f64(f64::NAN));
+            let res = db.query("SELECT ?", Some(arr)).await;
+            assert!(res.is_err(), "NaN should be rejected");
+        }
+
+        // +Infinity
+        {
+            let arr = js_sys::Array::new();
+            arr.push(&JsValue::from_f64(f64::INFINITY));
+            let res = db.query("SELECT ?", Some(arr)).await;
+            assert!(res.is_err(), "+Infinity should be rejected");
+        }
+
+        // -Infinity
+        {
+            let arr = js_sys::Array::new();
+            arr.push(&JsValue::from_f64(f64::NEG_INFINITY));
+            let res = db.query("SELECT ?", Some(arr)).await;
+            assert!(res.is_err(), "-Infinity should be rejected");
+        }
     }
 }
