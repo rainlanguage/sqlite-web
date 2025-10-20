@@ -43,71 +43,105 @@ pub fn main() -> Result<(), JsValue> {
                     if let Ok(sql_val) = js_sys::Reflect::get(&data, &JsValue::from_str("sql")) {
                         if let Some(sql) = sql_val.as_string() {
                             // Optional params array (already normalized by the main thread API)
-                            let params: Option<Vec<serde_json::Value>> = js_sys::Reflect::get(
-                                &data,
-                                &JsValue::from_str("params"),
-                            )
-                            .ok()
-                            .and_then(|v| {
-                                if v.is_undefined() || v.is_null() {
-                                    None
-                                } else {
-                                    serde_wasm_bindgen::from_value::<Vec<serde_json::Value>>(v).ok()
-                                }
-                            });
-                            WORKER_STATE.with(|s| {
-                                if let Some(state) = s.borrow().as_ref() {
-                                    let state = Rc::clone(state);
-                                    spawn_local(async move {
-                                        let result = state.execute_query(sql, params).await;
+                            let params_result: Result<Option<Vec<serde_json::Value>>, String> =
+                                js_sys::Reflect::get(&data, &JsValue::from_str("params"))
+                                    .map_err(|e| format!("Failed to read 'params': {e:?}"))
+                                    .and_then(|v| {
+                                        if v.is_undefined() || v.is_null() {
+                                            Ok(None)
+                                        } else {
+                                            serde_wasm_bindgen::from_value::<Vec<serde_json::Value>>(v)
+                                                .map(Some)
+                                                .map_err(|e| format!(
+                                                    "Invalid params format: {e:?}"
+                                                ))
+                                        }
+                                    });
 
-                                        // Send response as plain JavaScript object
-                                        let response = js_sys::Object::new();
-                                        js_sys::Reflect::set(
-                                            &response,
-                                            &JsValue::from_str("type"),
-                                            &JsValue::from_str("query-result"),
-                                        )
-                                        .unwrap();
+                            match params_result {
+                                Ok(params) => {
+                                    WORKER_STATE.with(|s| {
+                                        if let Some(state) = s.borrow().as_ref() {
+                                            let state = Rc::clone(state);
+                                            spawn_local(async move {
+                                                let result = state.execute_query(sql, params).await;
 
-                                        match result {
-                                            Ok(res) => {
+                                                // Send response as plain JavaScript object
+                                                let response = js_sys::Object::new();
                                                 js_sys::Reflect::set(
                                                     &response,
-                                                    &JsValue::from_str("result"),
-                                                    &JsValue::from_str(&res),
+                                                    &JsValue::from_str("type"),
+                                                    &JsValue::from_str("query-result"),
                                                 )
                                                 .unwrap();
-                                                js_sys::Reflect::set(
-                                                    &response,
-                                                    &JsValue::from_str("error"),
-                                                    &JsValue::NULL,
-                                                )
-                                                .unwrap();
-                                            }
-                                            Err(err) => {
-                                                js_sys::Reflect::set(
-                                                    &response,
-                                                    &JsValue::from_str("result"),
-                                                    &JsValue::NULL,
-                                                )
-                                                .unwrap();
-                                                js_sys::Reflect::set(
-                                                    &response,
-                                                    &JsValue::from_str("error"),
-                                                    &JsValue::from_str(&err),
-                                                )
-                                                .unwrap();
-                                            }
-                                        };
 
-                                        let global = js_sys::global();
-                                        let worker_scope: DedicatedWorkerGlobalScope =
-                                            global.unchecked_into();
-                                        let _ = worker_scope.post_message(&response);
+                                                match result {
+                                                    Ok(res) => {
+                                                        js_sys::Reflect::set(
+                                                            &response,
+                                                            &JsValue::from_str("result"),
+                                                            &JsValue::from_str(&res),
+                                                        )
+                                                        .unwrap();
+                                                        js_sys::Reflect::set(
+                                                            &response,
+                                                            &JsValue::from_str("error"),
+                                                            &JsValue::NULL,
+                                                        )
+                                                        .unwrap();
+                                                    }
+                                                    Err(err) => {
+                                                        js_sys::Reflect::set(
+                                                            &response,
+                                                            &JsValue::from_str("result"),
+                                                            &JsValue::NULL,
+                                                        )
+                                                        .unwrap();
+                                                        js_sys::Reflect::set(
+                                                            &response,
+                                                            &JsValue::from_str("error"),
+                                                            &JsValue::from_str(&err),
+                                                        )
+                                                        .unwrap();
+                                                    }
+                                                };
+
+                                                let global = js_sys::global();
+                                                let worker_scope: DedicatedWorkerGlobalScope =
+                                                    global.unchecked_into();
+                                                let _ = worker_scope.post_message(&response);
+                                            });
+                                        }
                                     });
                                 }
-                            });
+                                Err(err) => {
+                                    // Early error: send error response and skip execution
+                                    let response = js_sys::Object::new();
+                                    js_sys::Reflect::set(
+                                        &response,
+                                        &JsValue::from_str("type"),
+                                        &JsValue::from_str("query-result"),
+                                    )
+                                    .unwrap();
+                                    js_sys::Reflect::set(
+                                        &response,
+                                        &JsValue::from_str("result"),
+                                        &JsValue::NULL,
+                                    )
+                                    .unwrap();
+                                    js_sys::Reflect::set(
+                                        &response,
+                                        &JsValue::from_str("error"),
+                                        &JsValue::from_str(&err),
+                                    )
+                                    .unwrap();
+
+                                    let global = js_sys::global();
+                                    let worker_scope: DedicatedWorkerGlobalScope =
+                                        global.unchecked_into();
+                                    let _ = worker_scope.post_message(&response);
+                                }
+                            }
                         }
                     }
                 }

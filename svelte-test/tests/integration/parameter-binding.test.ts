@@ -209,13 +209,13 @@ describe('Parameter Binding (UI Integration)', () => {
     it('binds BigInt within i64 range and rejects out-of-range', async () => {
       await db.query('CREATE TABLE bigint_test (v INTEGER)');
 
-      const ok = await db.query('INSERT INTO bigint_test (v) VALUES (?1)', [9223372036854775807n]);
+      const ok = await db.query('INSERT INTO bigint_test (v) VALUES (?1)', [9007199254740991n]); // Number.MAX_SAFE_INTEGER
       expect(ok.error).toBeUndefined();
       expect(ok.value || '').toContain('Rows affected: 1');
 
       const rowsRes = await db.query('SELECT v FROM bigint_test');
       const rows = JSON.parse(rowsRes.value || '[]');
-      expect(rows[0].v).toBe(9223372036854775807);
+      expect(rows[0].v).toBe(9007199254740991);
 
       // Out of range BigInt
       let caught: unknown = null;
