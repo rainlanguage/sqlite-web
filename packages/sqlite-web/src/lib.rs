@@ -1,3 +1,4 @@
+use base64::Engine;
 use js_sys::Array;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -178,12 +179,126 @@ impl SQLiteWasmDatabase {
         })
     }
 
-    /// Execute a SQL query
+    fn normalize_params_js(params: &JsValue) -> Result<js_sys::Array, SQLiteWasmDatabaseError> {
+        // If undefined or null, treat as no params
+        if params.is_undefined() || params.is_null() {
+            return Ok(js_sys::Array::new());
+        }
+
+        // Ensure array input
+        let arr: js_sys::Array = if js_sys::Array::is_array(params) {
+            params.clone().unchecked_into()
+        } else {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "params must be an array",
+            )));
+        };
+
+        let normalized = js_sys::Array::new();
+        for (i, v) in arr.iter().enumerate() {
+            if v.is_null() {
+                normalized.push(&JsValue::NULL);
+                continue;
+            }
+            // BigInt
+            if let Ok(bi) = v.clone().dyn_into::<js_sys::BigInt>() {
+                // encode as { __type: "bigint", value: string }
+                let obj = js_sys::Object::new();
+                let s = bi
+                    .to_string(10)
+                    .map_err(|e| SQLiteWasmDatabaseError::JsError(e.into()))?;
+                js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("__type"),
+                    &JsValue::from_str("bigint"),
+                )
+                .unwrap();
+                js_sys::Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::from(s)).unwrap();
+                normalized.push(&obj);
+                continue;
+            }
+
+            // Uint8Array
+            if let Ok(typed) = v.clone().dyn_into::<js_sys::Uint8Array>() {
+                let rust_vec = typed.to_vec();
+                let b64 = base64::engine::general_purpose::STANDARD.encode(rust_vec);
+                let obj = js_sys::Object::new();
+                js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("__type"),
+                    &JsValue::from_str("blob"),
+                )
+                .unwrap();
+                js_sys::Reflect::set(&obj, &JsValue::from_str("base64"), &JsValue::from_str(&b64))
+                    .unwrap();
+                normalized.push(&obj);
+                continue;
+            }
+
+            // ArrayBuffer
+            if let Ok(buf) = v.clone().dyn_into::<js_sys::ArrayBuffer>() {
+                let typed = js_sys::Uint8Array::new(&buf);
+                let rust_vec = typed.to_vec();
+                let b64 = base64::engine::general_purpose::STANDARD.encode(rust_vec);
+                let obj = js_sys::Object::new();
+                js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("__type"),
+                    &JsValue::from_str("blob"),
+                )
+                .unwrap();
+                js_sys::Reflect::set(&obj, &JsValue::from_str("base64"), &JsValue::from_str(&b64))
+                    .unwrap();
+                normalized.push(&obj);
+                continue;
+            }
+
+            // Number
+            if let Some(n) = v.as_f64() {
+                if !n.is_finite() {
+                    return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                        "Invalid numeric value at index: NaN/Infinity not supported.",
+                    )));
+                }
+                normalized.push(&JsValue::from_f64(n));
+                continue;
+            }
+
+            // Boolean
+            if let Some(b) = v.as_bool() {
+                normalized.push(&JsValue::from_bool(b));
+                continue;
+            }
+
+            // String
+            if let Some(s) = v.as_string() {
+                normalized.push(&JsValue::from_str(&s));
+                continue;
+            }
+
+            // Unsupported
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                &format!("Unsupported parameter type at index {}", i + 1),
+            )));
+        }
+
+        Ok(normalized)
+    }
+
+    /// Execute a SQL query (optionally parameterized via JS Array)
+    ///
+    /// Passing `undefined`/`null` from JS maps to `None`.
     #[wasm_export(js_name = "query", unchecked_return_type = "string")]
-    pub async fn query(&self, sql: &str) -> Result<String, SQLiteWasmDatabaseError> {
+    pub async fn query(
+        &self,
+        sql: &str,
+        params: Option<js_sys::Array>,
+    ) -> Result<String, SQLiteWasmDatabaseError> {
         let worker = &self.worker;
         let pending_queries = Rc::clone(&self.pending_queries);
         let sql = sql.to_string();
+        let params_js = params.map(JsValue::from).unwrap_or(JsValue::UNDEFINED);
+        let params_array = Self::normalize_params_js(&params_js)?;
 
         let promise = js_sys::Promise::new(&mut |resolve, reject| {
             // Store the promise callbacks
@@ -203,6 +318,14 @@ impl SQLiteWasmDatabase {
                 &JsValue::from_str(&sql),
             )
             .unwrap();
+            if params_array.length() > 0 {
+                let params_js = JsValue::from(params_array.clone());
+                js_sys::Reflect::set(&message, &JsValue::from_str("params"), &params_js).unwrap();
+            } else {
+                // Explicitly set undefined for clarity
+                js_sys::Reflect::set(&message, &JsValue::from_str("params"), &JsValue::UNDEFINED)
+                    .unwrap();
+            }
 
             let _ = worker.post_message(&message);
         });
@@ -291,7 +414,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_query_message_format() {
         if let Ok(db) = SQLiteWasmDatabase::new("testdb") {
-            let result = db.query("SELECT 1").await;
+            let result = db.query("SELECT 1", None).await;
 
             match result {
                 Ok(_) => {}
