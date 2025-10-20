@@ -42,11 +42,24 @@ pub fn main() -> Result<(), JsValue> {
                 if type_str == "execute-query" {
                     if let Ok(sql_val) = js_sys::Reflect::get(&data, &JsValue::from_str("sql")) {
                         if let Some(sql) = sql_val.as_string() {
+                            // Optional params array (already normalized by the main thread API)
+                            let params: Option<Vec<serde_json::Value>> = js_sys::Reflect::get(
+                                &data,
+                                &JsValue::from_str("params"),
+                            )
+                            .ok()
+                            .and_then(|v| {
+                                if v.is_undefined() || v.is_null() {
+                                    None
+                                } else {
+                                    serde_wasm_bindgen::from_value::<Vec<serde_json::Value>>(v).ok()
+                                }
+                            });
                             WORKER_STATE.with(|s| {
                                 if let Some(state) = s.borrow().as_ref() {
                                     let state = Rc::clone(state);
                                     spawn_local(async move {
-                                        let result = state.execute_query(sql).await;
+                                        let result = state.execute_query(sql, params).await;
 
                                         // Send response as plain JavaScript object
                                         let response = js_sys::Object::new();
