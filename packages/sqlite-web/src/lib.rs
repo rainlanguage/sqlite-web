@@ -195,8 +195,10 @@ impl SQLiteWasmDatabase {
         };
 
         let normalized = js_sys::Array::new();
-        for (i, v) in arr.iter().enumerate() {
-            if v.is_null() {
+        let len = arr.length();
+        for i in 0..len {
+            let v = arr.get(i);
+            if v.is_null() || v.is_undefined() {
                 normalized.push(&JsValue::NULL);
                 continue;
             }
@@ -212,8 +214,9 @@ impl SQLiteWasmDatabase {
                     &JsValue::from_str("__type"),
                     &JsValue::from_str("bigint"),
                 )
-                .unwrap();
-                js_sys::Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::from(s)).unwrap();
+                .map_err(SQLiteWasmDatabaseError::from)?;
+                js_sys::Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::from(s))
+                    .map_err(SQLiteWasmDatabaseError::from)?;
                 normalized.push(&obj);
                 continue;
             }
@@ -228,9 +231,9 @@ impl SQLiteWasmDatabase {
                     &JsValue::from_str("__type"),
                     &JsValue::from_str("blob"),
                 )
-                .unwrap();
+                .map_err(SQLiteWasmDatabaseError::from)?;
                 js_sys::Reflect::set(&obj, &JsValue::from_str("base64"), &JsValue::from_str(&b64))
-                    .unwrap();
+                    .map_err(SQLiteWasmDatabaseError::from)?;
                 normalized.push(&obj);
                 continue;
             }
@@ -246,9 +249,9 @@ impl SQLiteWasmDatabase {
                     &JsValue::from_str("__type"),
                     &JsValue::from_str("blob"),
                 )
-                .unwrap();
+                .map_err(SQLiteWasmDatabaseError::from)?;
                 js_sys::Reflect::set(&obj, &JsValue::from_str("base64"), &JsValue::from_str(&b64))
-                    .unwrap();
+                    .map_err(SQLiteWasmDatabaseError::from)?;
                 normalized.push(&obj);
                 continue;
             }
@@ -301,31 +304,50 @@ impl SQLiteWasmDatabase {
         let params_array = Self::normalize_params_js(&params_js)?;
 
         let promise = js_sys::Promise::new(&mut |resolve, reject| {
-            // Store the promise callbacks
-            pending_queries.borrow_mut().push((resolve, reject));
-
-            // Send query to worker - create JavaScript object directly
+            // Create JavaScript message object and set fields with error handling
             let message = js_sys::Object::new();
-            js_sys::Reflect::set(
+            if let Err(e) = js_sys::Reflect::set(
                 &message,
                 &JsValue::from_str("type"),
                 &JsValue::from_str("execute-query"),
-            )
-            .unwrap();
-            js_sys::Reflect::set(
+            ) {
+                let err_js: JsValue = SQLiteWasmDatabaseError::from(e).into();
+                let _ = reject.call1(&JsValue::NULL, &err_js);
+                return;
+            }
+            if let Err(e) = js_sys::Reflect::set(
                 &message,
                 &JsValue::from_str("sql"),
                 &JsValue::from_str(&sql),
-            )
-            .unwrap();
+            ) {
+                let err_js: JsValue = SQLiteWasmDatabaseError::from(e).into();
+                let _ = reject.call1(&JsValue::NULL, &err_js);
+                return;
+            }
             if params_array.length() > 0 {
                 let params_js = JsValue::from(params_array.clone());
-                js_sys::Reflect::set(&message, &JsValue::from_str("params"), &params_js).unwrap();
+                if let Err(e) =
+                    js_sys::Reflect::set(&message, &JsValue::from_str("params"), &params_js)
+                {
+                    let err_js: JsValue = SQLiteWasmDatabaseError::from(e).into();
+                    let _ = reject.call1(&JsValue::NULL, &err_js);
+                    return;
+                }
             } else {
                 // Explicitly set undefined for clarity
-                js_sys::Reflect::set(&message, &JsValue::from_str("params"), &JsValue::UNDEFINED)
-                    .unwrap();
+                if let Err(e) = js_sys::Reflect::set(
+                    &message,
+                    &JsValue::from_str("params"),
+                    &JsValue::UNDEFINED,
+                ) {
+                    let err_js: JsValue = SQLiteWasmDatabaseError::from(e).into();
+                    let _ = reject.call1(&JsValue::NULL, &err_js);
+                    return;
+                }
             }
+
+            // Only store callbacks after successful message construction
+            pending_queries.borrow_mut().push((resolve, reject));
 
             let _ = worker.post_message(&message);
         });

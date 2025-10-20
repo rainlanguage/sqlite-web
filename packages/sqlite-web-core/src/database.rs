@@ -20,6 +20,31 @@ struct BoundBuffers {
     _blobs: Vec<Vec<u8>>,
 }
 
+struct StmtGuard {
+    stmt: *mut sqlite3_stmt,
+}
+
+impl StmtGuard {
+    fn new(stmt: *mut sqlite3_stmt) -> Self {
+        Self { stmt }
+    }
+
+    fn take(&mut self) -> *mut sqlite3_stmt {
+        let s = self.stmt;
+        self.stmt = std::ptr::null_mut();
+        s
+    }
+}
+
+impl Drop for StmtGuard {
+    fn drop(&mut self) {
+        if !self.stmt.is_null() {
+            unsafe { sqlite3_finalize(self.stmt) };
+            self.stmt = std::ptr::null_mut();
+        }
+    }
+}
+
 impl SQLiteDatabase {
     fn is_trivia_tail_only(tail: *const i8) -> bool {
         if tail.is_null() {
@@ -374,9 +399,11 @@ impl SQLiteDatabase {
             return Err("Parameterized queries must contain a single statement.".to_string());
         }
 
+        // Guard to ensure statement is finalized on any early-return (e.g., bind errors)
+        let mut stmt_guard = StmtGuard::new(stmt);
+
         // Ensure no non-trivial tail remains
         if !Self::is_trivia_tail_only(tail) {
-            unsafe { sqlite3_finalize(stmt) };
             return Err("Parameterized queries must contain a single statement.".to_string());
         }
 
@@ -384,19 +411,18 @@ impl SQLiteDatabase {
         let param_count = unsafe { sqlite3_bind_parameter_count(stmt) } as usize;
         if param_count == 0 {
             if !params.is_empty() {
-                unsafe { sqlite3_finalize(stmt) };
                 return Err(format!(
                     "No parameters expected but {} provided.",
                     params.len()
                 ));
             }
             // No params to bind; execute
-            return self.exec_prepared_statement(stmt);
+            return self.exec_prepared_statement(stmt_guard.take());
         }
 
         let _buffers_guard = self.bind_params_for_stmt(stmt, &params)?;
         // Execute while buffers are alive
-        self.exec_prepared_statement(stmt)
+        self.exec_prepared_statement(stmt_guard.take())
     }
     pub async fn initialize_opfs(db_name: &str) -> Result<Self, JsValue> {
         // Install OPFS VFS and set as default
@@ -744,6 +770,7 @@ impl Drop for SQLiteDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -969,6 +996,164 @@ mod tests {
         assert!(
             row["null_val"].is_null(),
             "NULL text column should be null in JSON"
+        );
+    }
+
+    // exec_with_params integration tests
+    // 1) Positional '?' bindings with multiple types
+    #[wasm_bindgen_test]
+    async fn test_exec_with_params_positional_multiple_types() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec(
+            "CREATE TABLE params_positional (
+                null_col TEXT,
+                bool_col INTEGER,
+                int_col INTEGER,
+                float_col REAL,
+                text_col TEXT
+            )",
+        )
+        .await
+        .expect("Create failed");
+
+        // Insert with plain positional placeholders
+        let insert_res = db
+            .exec_with_params(
+                "INSERT INTO params_positional (null_col, bool_col, int_col, float_col, text_col) VALUES (?, ?, ?, ?, ?)",
+                vec![json!(null), json!(true), json!(42), json!(3.5), json!("hello")],
+            )
+            .await;
+        assert!(insert_res.is_ok(), "INSERT with params should succeed");
+        assert!(
+            insert_res.unwrap().contains("Rows affected: 1"),
+            "INSERT should report 1 row affected"
+        );
+
+        // Select using positional binding as well
+        let select_json = db
+            .exec_with_params(
+                "SELECT null_col, bool_col, int_col, float_col, text_col FROM params_positional WHERE int_col = ?",
+                vec![json!(42)],
+            )
+            .await
+            .expect("SELECT with params failed");
+        let parsed: serde_json::Value = serde_json::from_str(&select_json).expect("Invalid JSON");
+        let rows = parsed.as_array().expect("Expected array JSON");
+        assert_eq!(rows.len(), 1, "Should return one matching row");
+        let row = &rows[0];
+        assert!(row["null_col"].is_null(), "Null round-trips as null");
+        assert_eq!(row["bool_col"].as_i64().unwrap(), 1, "true -> 1");
+        assert_eq!(row["int_col"].as_i64().unwrap(), 42);
+        assert!((row["float_col"].as_f64().unwrap() - 3.5).abs() < 1e-9);
+        assert_eq!(row["text_col"].as_str().unwrap(), "hello");
+    }
+
+    // 2) Numbered placeholders '?N' including gap detection and duplicates
+    #[wasm_bindgen_test]
+    async fn test_exec_with_params_numbered_duplicate_indices_allowed() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("CREATE TABLE numbered_dup (a INTEGER, b INTEGER)")
+            .await
+            .expect("Create failed");
+
+        // Duplicate ?1 should reuse the same bound value
+        let res = db
+            .exec_with_params(
+                "INSERT INTO numbered_dup (a, b) VALUES (?1, ?1)",
+                vec![json!(7)],
+            )
+            .await;
+        assert!(res.is_ok(), "Duplicate numbered index should succeed");
+
+        let out = db
+            .exec("SELECT a, b FROM numbered_dup")
+            .await
+            .expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("Invalid JSON");
+        let rows = parsed.as_array().expect("Expected array JSON");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["a"].as_i64().unwrap(), 7);
+        assert_eq!(rows[0]["b"].as_i64().unwrap(), 7);
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_exec_with_params_numbered_gap_error() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        // Use ?1 and ?3 with a missing ?2 to trigger continuity error
+        let err = db
+            .exec_with_params("SELECT ?1, ?3", vec![json!(10), json!(30)])
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("Missing parameter index ?2"),
+            "Should report missing index in numbered placeholders"
+        );
+    }
+
+    // 3) BLOB object and bigint-as-string handling
+    #[wasm_bindgen_test]
+    async fn test_exec_with_params_blob_and_bigint() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("CREATE TABLE binint_test (b BLOB, bi INTEGER)")
+            .await
+            .expect("Create failed");
+
+        // Base64 for bytes: "Rust" -> 52 75 73 74
+        let blob_b64 = base64::engine::general_purpose::STANDARD.encode(b"Rust");
+        let big_str = "9223372036854775807"; // i64::MAX
+
+        let res = db
+            .exec_with_params(
+                "INSERT INTO binint_test (b, bi) VALUES (?, ?)",
+                vec![
+                    json!({"__type":"blob","base64": blob_b64}),
+                    json!({"__type":"bigint","value": big_str}),
+                ],
+            )
+            .await;
+        assert!(res.is_ok(), "INSERT blob/bigint should succeed");
+
+        // Verify using a SELECT that returns numeric length and bigint value
+        let verify = db
+            .exec("SELECT length(b) AS blen, bi FROM binint_test")
+            .await
+            .expect("Select failed");
+        let parsed: serde_json::Value = serde_json::from_str(&verify).expect("Invalid JSON");
+        let rows = parsed.as_array().expect("Expected array JSON");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["blen"].as_i64().unwrap(), 4, "Blob length matches");
+        assert_eq!(
+            rows[0]["bi"].as_i64().unwrap(),
+            9_223_372_036_854_775_807,
+            "Bigint stored and returned as i64"
+        );
+
+        // Also check the blob pretty string form when selecting the BLOB directly
+        let blob_str = db
+            .exec("SELECT b FROM binint_test")
+            .await
+            .expect("Select blob failed");
+        let blob_val: serde_json::Value =
+            serde_json::from_str(&blob_str).expect("Invalid JSON for blob row");
+        let arr = blob_val.as_array().expect("Expected array JSON");
+        let bstr = arr[0]["b"]
+            .as_str()
+            .expect("Expected string marker for blob");
+        assert!(
+            bstr.contains("<blob 4 bytes>"),
+            "Blob marker includes length"
         );
     }
 

@@ -6,6 +6,7 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
 use crate::coordination::WorkerState;
+use crate::messages::WorkerMessage;
 
 // Global state
 thread_local! {
@@ -36,93 +37,40 @@ pub fn main() -> Result<(), JsValue> {
     let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
         let data = event.data();
 
-        // Parse JavaScript message directly
-        if let Ok(msg_type) = js_sys::Reflect::get(&data, &JsValue::from_str("type")) {
-            if let Some(type_str) = msg_type.as_string() {
-                if type_str == "execute-query" {
-                    if let Ok(sql_val) = js_sys::Reflect::get(&data, &JsValue::from_str("sql")) {
-                        if let Some(sql) = sql_val.as_string() {
-                            // Optional params array (already normalized by the main thread API)
-                            let params_result: Result<Option<Vec<serde_json::Value>>, String> =
-                                js_sys::Reflect::get(&data, &JsValue::from_str("params"))
-                                    .map_err(|e| format!("Failed to read 'params': {e:?}"))
-                                    .and_then(|v| {
-                                        if v.is_undefined() || v.is_null() {
-                                            Ok(None)
-                                        } else {
-                                            serde_wasm_bindgen::from_value::<Vec<serde_json::Value>>(v)
-                                                .map(Some)
-                                                .map_err(|e| format!(
-                                                    "Invalid params format: {e:?}"
-                                                ))
-                                        }
-                                    });
+        // Deserialize into canonical WorkerMessage and handle variants
+        match serde_wasm_bindgen::from_value::<WorkerMessage>(data) {
+            Ok(WorkerMessage::ExecuteQuery { sql, params }) => {
+                WORKER_STATE.with(|s| {
+                    if let Some(state) = s.borrow().as_ref() {
+                        let state = Rc::clone(state);
+                        spawn_local(async move {
+                            let result = state.execute_query(sql, params).await;
 
-                            match params_result {
-                                Ok(params) => {
-                                    WORKER_STATE.with(|s| {
-                                        if let Some(state) = s.borrow().as_ref() {
-                                            let state = Rc::clone(state);
-                                            spawn_local(async move {
-                                                let result = state.execute_query(sql, params).await;
+                            // Send response as plain JavaScript object
+                            let response = js_sys::Object::new();
+                            js_sys::Reflect::set(
+                                &response,
+                                &JsValue::from_str("type"),
+                                &JsValue::from_str("query-result"),
+                            )
+                            .unwrap();
 
-                                                // Send response as plain JavaScript object
-                                                let response = js_sys::Object::new();
-                                                js_sys::Reflect::set(
-                                                    &response,
-                                                    &JsValue::from_str("type"),
-                                                    &JsValue::from_str("query-result"),
-                                                )
-                                                .unwrap();
-
-                                                match result {
-                                                    Ok(res) => {
-                                                        js_sys::Reflect::set(
-                                                            &response,
-                                                            &JsValue::from_str("result"),
-                                                            &JsValue::from_str(&res),
-                                                        )
-                                                        .unwrap();
-                                                        js_sys::Reflect::set(
-                                                            &response,
-                                                            &JsValue::from_str("error"),
-                                                            &JsValue::NULL,
-                                                        )
-                                                        .unwrap();
-                                                    }
-                                                    Err(err) => {
-                                                        js_sys::Reflect::set(
-                                                            &response,
-                                                            &JsValue::from_str("result"),
-                                                            &JsValue::NULL,
-                                                        )
-                                                        .unwrap();
-                                                        js_sys::Reflect::set(
-                                                            &response,
-                                                            &JsValue::from_str("error"),
-                                                            &JsValue::from_str(&err),
-                                                        )
-                                                        .unwrap();
-                                                    }
-                                                };
-
-                                                let global = js_sys::global();
-                                                let worker_scope: DedicatedWorkerGlobalScope =
-                                                    global.unchecked_into();
-                                                let _ = worker_scope.post_message(&response);
-                                            });
-                                        }
-                                    });
-                                }
-                                Err(err) => {
-                                    // Early error: send error response and skip execution
-                                    let response = js_sys::Object::new();
+                            match result {
+                                Ok(res) => {
                                     js_sys::Reflect::set(
                                         &response,
-                                        &JsValue::from_str("type"),
-                                        &JsValue::from_str("query-result"),
+                                        &JsValue::from_str("result"),
+                                        &JsValue::from_str(&res),
                                     )
                                     .unwrap();
+                                    js_sys::Reflect::set(
+                                        &response,
+                                        &JsValue::from_str("error"),
+                                        &JsValue::NULL,
+                                    )
+                                    .unwrap();
+                                }
+                                Err(err) => {
                                     js_sys::Reflect::set(
                                         &response,
                                         &JsValue::from_str("result"),
@@ -135,16 +83,37 @@ pub fn main() -> Result<(), JsValue> {
                                         &JsValue::from_str(&err),
                                     )
                                     .unwrap();
-
-                                    let global = js_sys::global();
-                                    let worker_scope: DedicatedWorkerGlobalScope =
-                                        global.unchecked_into();
-                                    let _ = worker_scope.post_message(&response);
                                 }
-                            }
-                        }
+                            };
+
+                            let global = js_sys::global();
+                            let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
+                            let _ = worker_scope.post_message(&response);
+                        });
                     }
-                }
+                });
+            }
+            Err(err) => {
+                // Early error: send error response and skip execution
+                let response = js_sys::Object::new();
+                js_sys::Reflect::set(
+                    &response,
+                    &JsValue::from_str("type"),
+                    &JsValue::from_str("query-result"),
+                )
+                .unwrap();
+                js_sys::Reflect::set(&response, &JsValue::from_str("result"), &JsValue::NULL)
+                    .unwrap();
+                js_sys::Reflect::set(
+                    &response,
+                    &JsValue::from_str("error"),
+                    &JsValue::from_str(&format!("Invalid worker message: {err:?}")),
+                )
+                .unwrap();
+
+                let global = js_sys::global();
+                let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
+                let _ = worker_scope.post_message(&response);
             }
         }
     }) as Box<dyn FnMut(MessageEvent)>);
