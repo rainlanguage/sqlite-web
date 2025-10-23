@@ -45,7 +45,349 @@ impl Drop for StmtGuard {
     }
 }
 
+// Placeholder detection mode used during parameter binding
+enum PlaceholderMode {
+    Plain {
+        count: usize,
+    },
+    Numbered {
+        max: usize,
+        present: std::collections::BTreeSet<usize>,
+    },
+}
+
+// Normalized parameter kinds for binding
+enum ParamKind {
+    Null,
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Text(CString),
+    Blob(Vec<u8>),
+}
+
 impl SQLiteDatabase {
+    fn sqlite_errmsg(&self) -> String {
+        unsafe {
+            let p = sqlite3_errmsg(self.db);
+            if !p.is_null() {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            } else {
+                "Unknown SQLite error".to_string()
+            }
+        }
+    }
+
+    fn collect_column_names(stmt: *mut sqlite3_stmt) -> Vec<String> {
+        let col_count = unsafe { sqlite3_column_count(stmt) };
+        let mut names = Vec::with_capacity(col_count as usize);
+        for i in 0..col_count {
+            let col_name = unsafe {
+                let ptr = sqlite3_column_name(stmt, i);
+                if !ptr.is_null() {
+                    CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                } else {
+                    format!("column_{i}")
+                }
+            };
+            names.push(col_name);
+        }
+        names
+    }
+
+    fn read_column_value(stmt: *mut sqlite3_stmt, i: i32) -> serde_json::Value {
+        let col_type = unsafe { sqlite3_column_type(stmt, i) };
+        match col_type {
+            SQLITE_INTEGER => {
+                let val = unsafe { sqlite3_column_int64(stmt, i) };
+                serde_json::Value::Number(serde_json::Number::from(val))
+            }
+            SQLITE_FLOAT => {
+                let val = unsafe { sqlite3_column_double(stmt, i) };
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(val)
+                        .unwrap_or_else(|| serde_json::Number::from(0)),
+                )
+            }
+            SQLITE_TEXT => {
+                let ptr = unsafe { sqlite3_column_text(stmt, i) };
+                if !ptr.is_null() {
+                    let text = unsafe {
+                        CStr::from_ptr(ptr as *const i8)
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    serde_json::Value::String(text)
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            SQLITE_BLOB => {
+                let len = unsafe { sqlite3_column_bytes(stmt, i) };
+                serde_json::Value::String(format!("<blob {len} bytes>"))
+            }
+            _ => serde_json::Value::Null,
+        }
+    }
+
+    fn detect_placeholder_mode(&self, stmt: *mut sqlite3_stmt) -> Result<PlaceholderMode, String> {
+        let param_count = unsafe { sqlite3_bind_parameter_count(stmt) } as usize;
+        let mut has_plain = false;
+        let mut has_numbered = false;
+        let mut has_named = false;
+        let mut numbered_max: usize = 0;
+        let mut numbered_present = std::collections::BTreeSet::new();
+
+        for i in 1..=param_count as i32 {
+            let name_ptr = unsafe { sqlite3_bind_parameter_name(stmt, i) };
+            if name_ptr.is_null() {
+                has_plain = true;
+            } else {
+                let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
+                let s = name.as_ref();
+                if let Some(digits) = s.strip_prefix('?') {
+                    if digits.is_empty() {
+                        has_plain = true;
+                    } else if let Ok(n) = digits.parse::<isize>() {
+                        if n <= 0 {
+                            return Err(
+                                "Invalid parameter index: ?0 or negative indices are not allowed."
+                                    .to_string(),
+                            );
+                        }
+                        has_numbered = true;
+                        let n_u = n as usize;
+                        numbered_present.insert(n_u);
+                        if n_u > numbered_max {
+                            numbered_max = n_u;
+                        }
+                    } else {
+                        return Err(format!("Invalid parameter index: {}", s));
+                    }
+                } else {
+                    has_named = true; // :name/@name/$name not supported
+                }
+            }
+        }
+
+        if has_named {
+            return Err("Named parameters not supported.".to_string());
+        }
+        if has_plain && has_numbered {
+            return Err("Mixing '?' and '?N' placeholders is not supported.".to_string());
+        }
+
+        if has_plain {
+            Ok(PlaceholderMode::Plain { count: param_count })
+        } else {
+            Ok(PlaceholderMode::Numbered {
+                max: numbered_max,
+                present: numbered_present,
+            })
+        }
+    }
+
+    fn validate_params_against_mode(
+        &self,
+        mode: &PlaceholderMode,
+        params_len: usize,
+    ) -> Result<(), String> {
+        match mode {
+            PlaceholderMode::Plain { count } => {
+                if params_len != *count {
+                    return Err(format!(
+                        "Expected {} parameters but got {}.",
+                        count, params_len
+                    ));
+                }
+                Ok(())
+            }
+            PlaceholderMode::Numbered { max, present } => {
+                for need in 1..=*max {
+                    if !present.contains(&need) {
+                        return Err(format!(
+                            "Missing parameter index ?{} in statement (indices must be continuous).",
+                            need
+                        ));
+                    }
+                }
+                if params_len != *max {
+                    return Err(format!(
+                        "Expected {} parameters but got {}.",
+                        max, params_len
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn build_param_map(
+        &self,
+        stmt: *mut sqlite3_stmt,
+        mode: &PlaceholderMode,
+    ) -> Result<Vec<usize>, String> {
+        let param_count = unsafe { sqlite3_bind_parameter_count(stmt) } as usize;
+        let mut param_map: Vec<usize> = Vec::with_capacity(param_count);
+        for i in 1..=param_count as i32 {
+            let name_ptr = unsafe { sqlite3_bind_parameter_name(stmt, i) };
+            let target_index = if name_ptr.is_null() {
+                match mode {
+                    PlaceholderMode::Plain { .. } => (i as usize) - 1,
+                    PlaceholderMode::Numbered { .. } => {
+                        unreachable!("numbered placeholders never return null names")
+                    }
+                }
+            } else {
+                let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
+                let s = name.as_ref();
+                if let Some(stripped) = s.strip_prefix('?') {
+                    let n: usize = stripped
+                        .parse()
+                        .map_err(|_| format!("Invalid parameter index: {}", s))?;
+                    if n == 0 {
+                        return Err(
+                            "Invalid parameter index: ?0 or negative indices are not allowed."
+                                .to_string(),
+                        );
+                    }
+                    n - 1
+                } else {
+                    return Err("Named parameters not supported.".to_string());
+                }
+            };
+            param_map.push(target_index);
+        }
+        Ok(param_map)
+    }
+
+    fn parse_json_param(&self, idx0: usize, v: &serde_json::Value) -> Result<ParamKind, String> {
+        Ok(match v {
+            serde_json::Value::Null => ParamKind::Null,
+            serde_json::Value::Bool(b) => ParamKind::Bool(*b),
+            serde_json::Value::Number(num) => {
+                if let Some(v) = num.as_i64() {
+                    ParamKind::I64(v)
+                } else if let Some(v) = num.as_f64() {
+                    ParamKind::F64(v)
+                } else {
+                    return Err(format!("Unsupported numeric value at index {}", idx0 + 1));
+                }
+            }
+            serde_json::Value::String(s) => {
+                let c = CString::new(s.clone())
+                    .map_err(|_| format!("String contains NUL at index {}", idx0 + 1))?;
+                ParamKind::Text(c)
+            }
+            serde_json::Value::Object(map) => {
+                let t = map
+                    .get("__type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("Invalid extended param at index {}", idx0 + 1))?;
+                match t {
+                    "blob" => {
+                        let b64 = map.get("base64").and_then(|v| v.as_str()).ok_or_else(|| {
+                            format!("Invalid blob parameter at index {}", idx0 + 1)
+                        })?;
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(b64)
+                            .map_err(|_| {
+                                format!("Invalid base64 for blob at index {}", idx0 + 1)
+                            })?;
+                        ParamKind::Blob(bytes)
+                    }
+                    "bigint" => {
+                        let s = map.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
+                            format!("Invalid bigint parameter at index {}", idx0 + 1)
+                        })?;
+                        let v: i64 = s.parse().map_err(|_| {
+                            format!("BigInt out of i64 range at index {}.", idx0 + 1)
+                        })?;
+                        ParamKind::I64(v)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "Unsupported extended param type '{}' at index {}",
+                            t,
+                            idx0 + 1
+                        ))
+                    }
+                }
+            }
+            _ => return Err(format!("Unsupported parameter value at index {}", idx0 + 1)),
+        })
+    }
+
+    fn bind_param(
+        &self,
+        stmt: *mut sqlite3_stmt,
+        i: i32,
+        kind: &ParamKind,
+        buffers: &mut BoundBuffers,
+    ) -> Result<(), String> {
+        match kind {
+            ParamKind::Null => unsafe {
+                let rc = sqlite3_bind_null(stmt, i);
+                if rc != SQLITE_OK {
+                    return Err(format!("Failed to bind NULL at {i}"));
+                }
+                Ok(())
+            },
+            ParamKind::Bool(b) => unsafe {
+                let rc = sqlite3_bind_int(stmt, i, if *b { 1 } else { 0 });
+                if rc != SQLITE_OK {
+                    return Err(format!("Failed to bind boolean at {i}"));
+                }
+                Ok(())
+            },
+            ParamKind::I64(v) => unsafe {
+                let rc = sqlite3_bind_int64(stmt, i, *v);
+                if rc != SQLITE_OK {
+                    return Err(format!("Failed to bind int64 at {i}"));
+                }
+                Ok(())
+            },
+            ParamKind::F64(v) => unsafe {
+                let rc = sqlite3_bind_double(stmt, i, *v);
+                if rc != SQLITE_OK {
+                    return Err(format!("Failed to bind double at {i}"));
+                }
+                Ok(())
+            },
+            ParamKind::Text(c) => {
+                buffers._texts.push(c.clone());
+                let last = buffers._texts.last().unwrap();
+                let ptr = last.as_ptr();
+                let len = last.as_bytes().len() as i32;
+                let rc = unsafe {
+                    sqlite3_bind_text(stmt, i, ptr, len, None::<unsafe extern "C" fn(*mut c_void)>)
+                };
+                if rc != SQLITE_OK {
+                    return Err(format!("Failed to bind text at {i}"));
+                }
+                Ok(())
+            }
+            ParamKind::Blob(bytes) => {
+                buffers._blobs.push(bytes.clone());
+                let last = buffers._blobs.last().unwrap();
+                let buf_ptr = last.as_ptr() as *const _;
+                let len = last.len() as i32;
+                let rc = unsafe {
+                    sqlite3_bind_blob(
+                        stmt,
+                        i,
+                        buf_ptr,
+                        len,
+                        None::<unsafe extern "C" fn(*mut c_void)>,
+                    )
+                };
+                if rc != SQLITE_OK {
+                    return Err(format!("Failed to bind blob at {i}"));
+                }
+                Ok(())
+            }
+        }
+    }
     fn is_trivia_tail_only(tail: *const i8) -> bool {
         if tail.is_null() {
             return true;
@@ -100,123 +442,20 @@ impl SQLiteDatabase {
         stmt: *mut sqlite3_stmt,
         params: &[serde_json::Value],
     ) -> Result<BoundBuffers, String> {
-        let param_count = unsafe { sqlite3_bind_parameter_count(stmt) } as usize;
-
-        // Inspect placeholder names to determine mode and validate
-        let mut has_plain = false;
-        let mut has_numbered = false;
-        let mut has_named = false;
-        let mut numbered_max: usize = 0;
-        let mut numbered_present = std::collections::BTreeSet::new();
-
-        for i in 1..=param_count as i32 {
-            let name_ptr = unsafe { sqlite3_bind_parameter_name(stmt, i) };
-            if name_ptr.is_null() {
-                has_plain = true;
-            } else {
-                let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
-                let s = name.as_ref();
-                if let Some(digits) = s.strip_prefix('?') {
-                    // ?N form
-                    if digits.is_empty() {
-                        // A bare '?' might still show up here as empty? SQLite docs say bare '?' yields NULL name. So treat as plain.
-                        has_plain = true;
-                    } else if let Ok(n) = digits.parse::<isize>() {
-                        if n <= 0 {
-                            return Err(
-                                "Invalid parameter index: ?0 or negative indices are not allowed."
-                                    .to_string(),
-                            );
-                        }
-                        has_numbered = true;
-                        let n_u = n as usize;
-                        numbered_present.insert(n_u);
-                        if n_u > numbered_max {
-                            numbered_max = n_u;
-                        }
-                    } else {
-                        return Err(format!("Invalid parameter index: {}", s));
-                    }
-                } else {
-                    // named: :name, @name, $name
-                    has_named = true;
-                }
-            }
-        }
-
-        if has_named {
-            return Err("Named parameters not supported.".to_string());
-        }
-        if has_plain && has_numbered {
-            return Err("Mixing '?' and '?N' placeholders is not supported.".to_string());
-        }
-
-        if has_plain && params.len() != param_count {
-            return Err(format!(
-                "Expected {} parameters but got {}.",
-                param_count,
-                params.len()
-            ));
-        }
-
-        if has_numbered {
-            // Ensure continuity 1..=max and param list size matches
-            for need in 1..=numbered_max {
-                if !numbered_present.contains(&need) {
-                    return Err(format!(
-                        "Missing parameter index ?{} in statement (indices must be continuous).",
-                        need
-                    ));
-                }
-            }
-            if params.len() != numbered_max {
-                return Err(format!(
-                    "Expected {} parameters but got {}.",
-                    numbered_max,
-                    params.len()
-                ));
-            }
-        }
-
-        // Build a mapping from each placeholder position (1..=param_count)
-        // to its corresponding index in the params slice (0-based). This avoids
-        // re-parsing placeholder names during binding.
-        let mut param_map: Vec<usize> = Vec::with_capacity(param_count);
-        for i in 1..=param_count as i32 {
-            let name_ptr = unsafe { sqlite3_bind_parameter_name(stmt, i) };
-            let target_index = if name_ptr.is_null() {
-                // plain '?': 1..=param_count maps to params[0..]
-                (i as usize) - 1
-            } else {
-                let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
-                let s = name.as_ref();
-                if let Some(stripped) = s.strip_prefix('?') {
-                    let n: usize = stripped
-                        .parse()
-                        .map_err(|_| format!("Invalid parameter index: {}", s))?;
-                    if n == 0 {
-                        return Err(
-                            "Invalid parameter index: ?0 or negative indices are not allowed."
-                                .to_string(),
-                        );
-                    }
-                    n - 1
-                } else {
-                    // We reject named parameters earlier; keep a defensive error here.
-                    return Err("Named parameters not supported.".to_string());
-                }
-            };
-            param_map.push(target_index);
-        }
+        // Derive placeholder mode, validate with provided params, and build mapping
+        let mode = self.detect_placeholder_mode(stmt)?;
+        self.validate_params_against_mode(&mode, params.len())?;
+        let param_map = self.build_param_map(stmt, &mode)?;
 
         // Keep owned buffers alive for text/blob while the statement executes
-        let mut owned_texts: Vec<CString> = Vec::new();
-        let mut owned_blobs: Vec<Vec<u8>> = Vec::new();
+        let mut buffers = BoundBuffers {
+            _texts: Vec::new(),
+            _blobs: Vec::new(),
+        };
 
+        let param_count = unsafe { sqlite3_bind_parameter_count(stmt) } as usize;
         for i in 1..=param_count as i32 {
-            // Determine which params index to use via precomputed mapping
             let target_index = param_map[(i - 1) as usize];
-
             let val = params.get(target_index).ok_or_else(|| {
                 format!(
                     "Missing parameter value at index {} (0-based {})",
@@ -225,153 +464,11 @@ impl SQLiteDatabase {
                 )
             })?;
 
-            // Bind based on value type
-            match val {
-                serde_json::Value::Null => unsafe {
-                    let rc = sqlite3_bind_null(stmt, i);
-                    if rc != SQLITE_OK {
-                        return Err(format!("Failed to bind NULL at {i}"));
-                    }
-                },
-                serde_json::Value::Bool(b) => unsafe {
-                    let rc = sqlite3_bind_int(stmt, i, if *b { 1 } else { 0 });
-                    if rc != SQLITE_OK {
-                        return Err(format!("Failed to bind boolean at {i}"));
-                    }
-                },
-                serde_json::Value::Number(num) => {
-                    if let Some(v) = num.as_i64() {
-                        let rc = unsafe { sqlite3_bind_int64(stmt, i, v) };
-                        if rc != SQLITE_OK {
-                            return Err(format!("Failed to bind int64 at {i}"));
-                        }
-                    } else if let Some(v) = num.as_f64() {
-                        // serde_json never represents NaN/Infinity
-                        let rc = unsafe { sqlite3_bind_double(stmt, i, v) };
-                        if rc != SQLITE_OK {
-                            return Err(format!("Failed to bind double at {i}"));
-                        }
-                    } else {
-                        return Err(format!(
-                            "Unsupported numeric value at index {}",
-                            target_index + 1
-                        ));
-                    }
-                }
-                serde_json::Value::String(s) => {
-                    let c = CString::new(s.clone()).map_err(|_| {
-                        format!("String contains NUL at index {}", target_index + 1)
-                    })?;
-                    let ptr = c.as_ptr();
-                    let len = c.as_bytes().len() as i32;
-                    owned_texts.push(c);
-                    let rc = unsafe {
-                        sqlite3_bind_text(
-                            stmt,
-                            i,
-                            ptr,
-                            len,
-                            None::<unsafe extern "C" fn(*mut c_void)>,
-                        )
-                    };
-                    if rc != SQLITE_OK {
-                        return Err(format!("Failed to bind text at {i}"));
-                    }
-                }
-                serde_json::Value::Object(map) => {
-                    // Expect extended forms: {__type:"blob", base64}, {__type:"bigint", value}
-                    if let Some(t) = map.get("__type").and_then(|v| v.as_str()) {
-                        match t {
-                            "blob" => {
-                                let b64 = map.get("base64").and_then(|v| v.as_str()).ok_or_else(
-                                    || {
-                                        format!(
-                                            "Invalid blob parameter at index {}",
-                                            target_index + 1
-                                        )
-                                    },
-                                )?;
-                                let bytes = base64::engine::general_purpose::STANDARD
-                                    .decode(b64)
-                                    .map_err(|_| {
-                                    format!("Invalid base64 for blob at index {}", target_index + 1)
-                                })?;
-                                let len = bytes.len() as i32;
-                                owned_blobs.push(bytes);
-                                let buf_ptr = owned_blobs
-                                    .last()
-                                    .map(|blob| blob.as_ptr() as *const _)
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "Failed to store blob parameter at index {}",
-                                            target_index + 1
-                                        )
-                                    })?;
-                                let rc = unsafe {
-                                    sqlite3_bind_blob(
-                                        stmt,
-                                        i,
-                                        buf_ptr,
-                                        len,
-                                        None::<unsafe extern "C" fn(*mut c_void)>,
-                                    )
-                                };
-                                if rc != SQLITE_OK {
-                                    return Err(format!("Failed to bind blob at {i}"));
-                                }
-                            }
-                            "bigint" => {
-                                let s =
-                                    map.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
-                                        format!(
-                                            "Invalid bigint parameter at index {}",
-                                            target_index + 1
-                                        )
-                                    })?;
-                                let v: i64 = s.parse().map_err(|_| {
-                                    format!(
-                                        "BigInt out of i64 range at index {}.",
-                                        target_index + 1
-                                    )
-                                })?;
-                                let rc = unsafe { sqlite3_bind_int64(stmt, i, v) };
-                                if rc != SQLITE_OK {
-                                    return Err(format!("Failed to bind bigint at {i}"));
-                                }
-                            }
-                            _ => {
-                                return Err(format!(
-                                    "Unsupported parameter type at index {}: {}",
-                                    target_index + 1,
-                                    t
-                                ));
-                            }
-                        }
-                    } else {
-                        return Err(format!(
-                            "Unsupported parameter type at index {}: object",
-                            target_index + 1
-                        ));
-                    }
-                }
-                other => {
-                    return Err(format!(
-                        "Unsupported parameter type at index {}: {}",
-                        target_index + 1,
-                        match other {
-                            serde_json::Value::Array(_) => "array",
-                            serde_json::Value::Object(_) => "object",
-                            _ => "unknown",
-                        }
-                    ));
-                }
-            }
+            let kind = self.parse_json_param(target_index, val)?;
+            self.bind_param(stmt, i, &kind, &mut buffers)?;
         }
 
-        Ok(BoundBuffers {
-            _texts: owned_texts,
-            _blobs: owned_blobs,
-        })
+        Ok(buffers)
     }
 
     async fn exec_single_statement_with_params(
@@ -501,96 +598,44 @@ impl SQLiteDatabase {
         &self,
         stmt: *mut sqlite3_stmt,
     ) -> Result<(Option<Vec<serde_json::Value>>, i32), String> {
-        // Determine if this statement produces rows (e.g., SELECT/PRAGMA)
+        let guard = StmtGuard::new(stmt);
+        let stmt = guard.stmt;
+
         let col_count = unsafe { sqlite3_column_count(stmt) };
         let is_query = col_count > 0;
 
         let mut results = Vec::new();
-        let mut column_names = Vec::new();
-        let mut first_row = true;
+        let mut column_names: Option<Vec<String>> = None;
 
         loop {
             let step_result = unsafe { sqlite3_step(stmt) };
-
             match step_result {
                 SQLITE_ROW => {
-                    if first_row {
-                        for i in 0..col_count {
-                            let col_name = unsafe {
-                                let ptr = sqlite3_column_name(stmt, i);
-                                if !ptr.is_null() {
-                                    CStr::from_ptr(ptr).to_string_lossy().into_owned()
-                                } else {
-                                    format!("column_{i}")
-                                }
-                            };
-                            column_names.push(col_name);
-                        }
-                        first_row = false;
+                    if column_names.is_none() {
+                        column_names = Some(Self::collect_column_names(stmt));
                     }
-
-                    let mut row_obj = std::collections::HashMap::new();
+                    let names = column_names.as_ref().unwrap();
+                    let mut row_obj = std::collections::BTreeMap::new();
                     for i in 0..col_count {
-                        let col_type = unsafe { sqlite3_column_type(stmt, i) };
-                        let value = match col_type {
-                            SQLITE_INTEGER => {
-                                let val = unsafe { sqlite3_column_int64(stmt, i) };
-                                serde_json::Value::Number(serde_json::Number::from(val))
-                            }
-                            SQLITE_FLOAT => {
-                                let val = unsafe { sqlite3_column_double(stmt, i) };
-                                serde_json::Value::Number(
-                                    serde_json::Number::from_f64(val)
-                                        .unwrap_or(serde_json::Number::from(0)),
-                                )
-                            }
-                            SQLITE_TEXT => {
-                                let ptr = unsafe { sqlite3_column_text(stmt, i) };
-                                if !ptr.is_null() {
-                                    let text = unsafe {
-                                        CStr::from_ptr(ptr as *const i8)
-                                            .to_string_lossy()
-                                            .into_owned()
-                                    };
-                                    serde_json::Value::String(text)
-                                } else {
-                                    serde_json::Value::Null
-                                }
-                            }
-                            SQLITE_BLOB => {
-                                let len = unsafe { sqlite3_column_bytes(stmt, i) };
-                                serde_json::Value::String(format!("<blob {len} bytes>"))
-                            }
-                            _ => serde_json::Value::Null,
-                        };
-
-                        if let Some(col_name) = column_names.get(i as usize) {
+                        let value = Self::read_column_value(stmt, i);
+                        if let Some(col_name) = names.get(i as usize) {
                             row_obj.insert(col_name.clone(), value);
                         }
                     }
-
                     results.push(serde_json::Value::Object(row_obj.into_iter().collect()));
                 }
                 SQLITE_DONE => break,
-                _ => {
-                    let error_msg = unsafe {
-                        let ptr = sqlite3_errmsg(self.db);
-                        if !ptr.is_null() {
-                            CStr::from_ptr(ptr).to_string_lossy().into_owned()
-                        } else {
-                            format!("SQLite error code: {step_result}")
-                        }
-                    };
-                    unsafe { sqlite3_finalize(stmt) };
-                    return Err(format!("Query execution failed: {error_msg}"));
+                other => {
+                    return Err(format!("Query execution failed: {}", self.sqlite_errmsg())
+                        .replace(
+                            "Unknown SQLite error",
+                            &format!("SQLite error code: {other}"),
+                        ));
                 }
             }
         }
 
         let changes = unsafe { sqlite3_changes(self.db) };
-
-        unsafe { sqlite3_finalize(stmt) };
-
         if is_query {
             Ok((Some(results), changes))
         } else {
