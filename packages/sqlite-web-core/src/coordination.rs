@@ -85,79 +85,8 @@ impl WorkerState {
 
         let onmessage = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
             let data = event.data();
-
             if let Ok(msg) = serde_wasm_bindgen::from_value::<ChannelMessage>(data) {
-                match msg {
-                    ChannelMessage::QueryRequest {
-                        query_id,
-                        sql,
-                        params,
-                    } => {
-                        if *is_leader.borrow() {
-                            let db = Rc::clone(&db);
-                            let channel = channel.clone();
-
-                            spawn_local(async move {
-                                let result = {
-                                    // Extract database temporarily to avoid holding RefCell across await
-                                    let db_opt = db.borrow_mut().take();
-                                    match db_opt {
-                                        Some(mut database) => {
-                                            let result = match params {
-                                                Some(p) => database.exec_with_params(&sql, p).await,
-                                                None => database.exec(&sql).await,
-                                            };
-                                            // Put the database back
-                                            *db.borrow_mut() = Some(database);
-                                            result
-                                        }
-                                        None => Err("Database not initialized".to_string()),
-                                    }
-                                };
-
-                                let response = match result {
-                                    Ok(res) => ChannelMessage::QueryResponse {
-                                        query_id: query_id.clone(),
-                                        result: Some(res),
-                                        error: None,
-                                    },
-                                    Err(err) => ChannelMessage::QueryResponse {
-                                        query_id: query_id.clone(),
-                                        result: None,
-                                        error: Some(err),
-                                    },
-                                };
-
-                                if let Err(err_msg) = send_channel_message(&channel, &response) {
-                                    let fallback = ChannelMessage::QueryResponse {
-                                        query_id: query_id.clone(),
-                                        result: None,
-                                        error: Some(err_msg),
-                                    };
-                                    let _ = send_channel_message(&channel, &fallback);
-                                }
-                            });
-                        }
-                    }
-                    ChannelMessage::QueryResponse {
-                        query_id,
-                        result,
-                        error,
-                    } => {
-                        if let Some(pending) = pending_queries.borrow_mut().remove(&query_id) {
-                            if let Some(err) = error {
-                                let _ = pending
-                                    .reject
-                                    .call1(&JsValue::NULL, &JsValue::from_str(&err));
-                            } else if let Some(res) = result {
-                                let _ = pending
-                                    .resolve
-                                    .call1(&JsValue::NULL, &JsValue::from_str(&res));
-                            }
-                        }
-                    }
-                    ChannelMessage::NewLeader { leader_id: _ } => {}
-                }
+                handle_channel_message(&is_leader, &db, &channel, &pending_queries, msg);
             }
         }) as Box<dyn FnMut(web_sys::MessageEvent)>);
 
@@ -238,20 +167,7 @@ impl WorkerState {
         params: Option<Vec<serde_json::Value>>,
     ) -> Result<String, String> {
         if *self.is_leader.borrow() {
-            // Extract database temporarily to avoid holding RefCell across await
-            let db_opt = self.db.borrow_mut().take();
-            match db_opt {
-                Some(mut database) => {
-                    let result = match params {
-                        Some(p) => database.exec_with_params(&sql, p).await,
-                        None => database.exec(&sql).await,
-                    };
-                    // Put the database back
-                    *self.db.borrow_mut() = Some(database);
-                    result
-                }
-                None => Err("Database not initialized".to_string()),
-            }
+            exec_on_db(Rc::clone(&self.db), sql, params).await
         } else {
             let query_id = Uuid::new_v4().to_string();
 
@@ -261,40 +177,13 @@ impl WorkerState {
                     .insert(query_id.clone(), PendingQuery { resolve, reject });
             });
 
-            let msg = ChannelMessage::QueryRequest {
-                query_id: query_id.clone(),
-                sql,
-                params,
-            };
-            let msg_js = serde_wasm_bindgen::to_value(&msg)
-                .map_err(|err| format!("Failed to serialize query request: {err:?}"))?;
-            self.channel
-                .post_message(&msg_js)
-                .map_err(|err| format!("Failed to post query request: {err:?}"))?;
+            post_query_request(&self.channel, &query_id, sql, params)?;
 
-            // Timeout handling
-            let timeout_promise = Promise::new(&mut |_, reject| {
-                let query_id = query_id.clone();
-                let pending_queries = Rc::clone(&self.pending_queries);
-
-                let callback = Closure::once(move || {
-                    if pending_queries.borrow_mut().remove(&query_id).is_some() {
-                        let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("Query timeout"));
-                    }
-                });
-
-                let global = js_sys::global();
-                if let Ok(set_timeout_value) = reflect_get(&global, "setTimeout") {
-                    if let Some(set_timeout_fn) = set_timeout_value.dyn_ref::<Function>() {
-                        let _ = set_timeout_fn.call2(
-                            &JsValue::NULL,
-                            callback.as_ref().unchecked_ref(),
-                            &JsValue::from_f64(5000.0),
-                        );
-                    }
-                }
-                callback.forget();
-            });
+            let timeout_promise = schedule_timeout_promise(
+                Rc::clone(&self.pending_queries),
+                query_id.clone(),
+                5000.0,
+            );
 
             let result = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::race(
                 &js_sys::Array::of2(&promise, &timeout_promise),
@@ -302,17 +191,155 @@ impl WorkerState {
             .await;
 
             match result {
-                Ok(val) => {
-                    if let Some(s) = val.as_string() {
-                        Ok(s)
-                    } else {
-                        Err("Invalid response".to_string())
-                    }
-                }
+                Ok(val) => val
+                    .as_string()
+                    .ok_or_else(|| "Invalid response".to_string()),
                 Err(e) => Err(format!("{e:?}")),
             }
         }
     }
+}
+
+fn handle_channel_message(
+    is_leader: &Rc<RefCell<bool>>,
+    db: &Rc<RefCell<Option<SQLiteDatabase>>>,
+    channel: &BroadcastChannel,
+    pending_queries: &Rc<RefCell<HashMap<String, PendingQuery>>>,
+    msg: ChannelMessage,
+) {
+    match msg {
+        ChannelMessage::QueryRequest {
+            query_id,
+            sql,
+            params,
+        } => {
+            if *is_leader.borrow() {
+                let db = Rc::clone(db);
+                let channel = channel.clone();
+                spawn_local(async move {
+                    let result = exec_on_db(db, sql, params).await;
+                    let response = build_query_response(query_id.clone(), result);
+                    if let Err(err_msg) = send_channel_message(&channel, &response) {
+                        let fallback = ChannelMessage::QueryResponse {
+                            query_id: query_id.clone(),
+                            result: None,
+                            error: Some(err_msg),
+                        };
+                        let _ = send_channel_message(&channel, &fallback);
+                    }
+                });
+            }
+        }
+        ChannelMessage::QueryResponse {
+            query_id,
+            result,
+            error,
+        } => handle_query_response(pending_queries, query_id, result, error),
+        ChannelMessage::NewLeader { leader_id: _ } => {}
+    }
+}
+
+fn build_query_response(
+    query_id: String,
+    result: Result<String, String>,
+) -> ChannelMessage {
+    match result {
+        Ok(res) => ChannelMessage::QueryResponse {
+            query_id,
+            result: Some(res),
+            error: None,
+        },
+        Err(err) => ChannelMessage::QueryResponse {
+            query_id,
+            result: None,
+            error: Some(err),
+        },
+    }
+}
+
+fn handle_query_response(
+    pending_queries: &Rc<RefCell<HashMap<String, PendingQuery>>>,
+    query_id: String,
+    result: Option<String>,
+    error: Option<String>,
+) {
+    if let Some(pending) = pending_queries.borrow_mut().remove(&query_id) {
+        if let Some(err) = error {
+            let _ = pending
+                .reject
+                .call1(&JsValue::NULL, &JsValue::from_str(&err));
+        } else if let Some(res) = result {
+            let _ = pending
+                .resolve
+                .call1(&JsValue::NULL, &JsValue::from_str(&res));
+        }
+    }
+}
+
+async fn exec_on_db(
+    db: Rc<RefCell<Option<SQLiteDatabase>>>,
+    sql: String,
+    params: Option<Vec<serde_json::Value>>,
+) -> Result<String, String> {
+    let db_opt = db.borrow_mut().take();
+    let result = match db_opt {
+        Some(mut database) => {
+            let result = match params {
+                Some(p) => database.exec_with_params(&sql, p).await,
+                None => database.exec(&sql).await,
+            };
+            *db.borrow_mut() = Some(database);
+            result
+        }
+        None => Err("Database not initialized".to_string()),
+    };
+    result
+}
+
+fn post_query_request(
+    channel: &BroadcastChannel,
+    query_id: &str,
+    sql: String,
+    params: Option<Vec<serde_json::Value>>,
+) -> Result<(), String> {
+    let msg = ChannelMessage::QueryRequest {
+        query_id: query_id.to_string(),
+        sql,
+        params,
+    };
+    let msg_js =
+        serde_wasm_bindgen::to_value(&msg).map_err(|e| format!("Failed to serialize query request: {e:?}"))?;
+    channel
+        .post_message(&msg_js)
+        .map_err(|e| format!("Failed to post query request: {e:?}"))
+}
+
+fn schedule_timeout_promise(
+    pending_queries: Rc<RefCell<HashMap<String, PendingQuery>>>,
+    query_id: String,
+    ms: f64,
+) -> Promise {
+    Promise::new(&mut move |_, reject| {
+        let query_id = query_id.clone();
+        let pending_queries = Rc::clone(&pending_queries);
+        let callback = Closure::once(move || {
+            if pending_queries.borrow_mut().remove(&query_id).is_some() {
+                let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("Query timeout"));
+            }
+        });
+
+        let global = js_sys::global();
+        if let Ok(set_timeout_value) = reflect_get(&global, "setTimeout") {
+            if let Some(set_timeout_fn) = set_timeout_value.dyn_ref::<Function>() {
+                let _ = set_timeout_fn.call2(
+                    &JsValue::NULL,
+                    callback.as_ref().unchecked_ref(),
+                    &JsValue::from_f64(ms),
+                );
+            }
+        }
+        callback.forget();
+    })
 }
 
 #[cfg(test)]
