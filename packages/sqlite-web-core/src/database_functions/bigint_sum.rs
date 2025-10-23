@@ -159,7 +159,7 @@ pub unsafe extern "C" fn bigint_sum_final(context: *mut sqlite3_context) {
     std::ptr::drop_in_place(sum_context);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use wasm_bindgen_test::*;

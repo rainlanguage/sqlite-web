@@ -151,7 +151,7 @@ pub fn main() -> Result<(), JsValue> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use js_sys::{Object, Reflect};

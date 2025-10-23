@@ -339,7 +339,7 @@ fn schedule_timeout_promise(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use js_sys::Function;

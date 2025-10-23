@@ -126,7 +126,7 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use wasm_bindgen_test::*;

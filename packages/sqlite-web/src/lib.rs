@@ -317,7 +317,7 @@ impl SQLiteWasmDatabase {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use wasm_bindgen::JsCast;

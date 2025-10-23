@@ -827,7 +827,7 @@ impl Drop for SQLiteDatabase {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use serde_json::json;
