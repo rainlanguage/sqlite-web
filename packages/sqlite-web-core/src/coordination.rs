@@ -239,10 +239,7 @@ fn handle_channel_message(
     }
 }
 
-fn build_query_response(
-    query_id: String,
-    result: Result<String, String>,
-) -> ChannelMessage {
+fn build_query_response(query_id: String, result: Result<String, String>) -> ChannelMessage {
     match result {
         Ok(res) => ChannelMessage::QueryResponse {
             query_id,
@@ -307,8 +304,8 @@ fn post_query_request(
         sql,
         params,
     };
-    let msg_js =
-        serde_wasm_bindgen::to_value(&msg).map_err(|e| format!("Failed to serialize query request: {e:?}"))?;
+    let msg_js = serde_wasm_bindgen::to_value(&msg)
+        .map_err(|e| format!("Failed to serialize query request: {e:?}"))?;
     channel
         .post_message(&msg_js)
         .map_err(|e| format!("Failed to post query request: {e:?}"))
