@@ -2,15 +2,41 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::throw_val;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
 use crate::coordination::WorkerState;
 use crate::messages::WorkerMessage;
+use crate::util::{js_value_to_string, set_js_property};
 
 // Global state
 thread_local! {
     static WORKER_STATE: RefCell<Option<Rc<WorkerState>>> = const { RefCell::new(None) };
+}
+
+fn send_worker_error_message(message: &str) -> Result<(), JsValue> {
+    let error_object = js_sys::Object::new();
+    set_js_property(
+        error_object.as_ref(),
+        "type",
+        &JsValue::from_str("worker-error"),
+    )?;
+    set_js_property(error_object.as_ref(), "error", &JsValue::from_str(message))?;
+    let global = js_sys::global();
+    let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
+    worker_scope.post_message(error_object.as_ref())
+}
+
+fn send_worker_error(err: JsValue) -> Result<(), JsValue> {
+    let message = js_value_to_string(&err);
+    send_worker_error_message(&message).map_err(|post_err| {
+        JsValue::from_str(&format!(
+            "Failed to deliver worker error '{message}': {}",
+            js_value_to_string(&post_err)
+        ))
+    })
 }
 
 /// Entry point for the worker - called from the blob
@@ -19,11 +45,15 @@ pub fn main() -> Result<(), JsValue> {
 
     let state = Rc::new(WorkerState::new()?);
 
-    state.setup_channel_listener();
+    state.setup_channel_listener()?;
 
     let state_clone = Rc::clone(&state);
     spawn_local(async move {
-        state_clone.attempt_leadership().await;
+        if let Err(err) = state_clone.attempt_leadership().await {
+            if let Err(send_err) = send_worker_error(err) {
+                throw_val(send_err);
+            }
+        }
     });
 
     WORKER_STATE.with(|s| {
@@ -48,47 +78,67 @@ pub fn main() -> Result<(), JsValue> {
 
                             // Send response as plain JavaScript object
                             let response = js_sys::Object::new();
-                            js_sys::Reflect::set(
+                            if let Err(err) = set_js_property(
                                 &response,
-                                &JsValue::from_str("type"),
+                                "type",
                                 &JsValue::from_str("query-result"),
-                            )
-                            .unwrap();
+                            ) {
+                                if let Err(send_err) = send_worker_error(err) {
+                                    throw_val(send_err);
+                                }
+                                return;
+                            }
 
                             match result {
                                 Ok(res) => {
-                                    js_sys::Reflect::set(
+                                    if let Err(err) = set_js_property(
                                         &response,
-                                        &JsValue::from_str("result"),
+                                        "result",
                                         &JsValue::from_str(&res),
-                                    )
-                                    .unwrap();
-                                    js_sys::Reflect::set(
-                                        &response,
-                                        &JsValue::from_str("error"),
-                                        &JsValue::NULL,
-                                    )
-                                    .unwrap();
+                                    ) {
+                                        if let Err(send_err) = send_worker_error(err) {
+                                            throw_val(send_err);
+                                        }
+                                        return;
+                                    }
+                                    if let Err(err) =
+                                        set_js_property(&response, "error", &JsValue::NULL)
+                                    {
+                                        if let Err(send_err) = send_worker_error(err) {
+                                            throw_val(send_err);
+                                        }
+                                        return;
+                                    }
                                 }
                                 Err(err) => {
-                                    js_sys::Reflect::set(
+                                    if let Err(set_err) =
+                                        set_js_property(&response, "result", &JsValue::NULL)
+                                    {
+                                        if let Err(send_err) = send_worker_error(set_err) {
+                                            throw_val(send_err);
+                                        }
+                                        return;
+                                    }
+                                    if let Err(set_err) = set_js_property(
                                         &response,
-                                        &JsValue::from_str("result"),
-                                        &JsValue::NULL,
-                                    )
-                                    .unwrap();
-                                    js_sys::Reflect::set(
-                                        &response,
-                                        &JsValue::from_str("error"),
+                                        "error",
                                         &JsValue::from_str(&err),
-                                    )
-                                    .unwrap();
+                                    ) {
+                                        if let Err(send_err) = send_worker_error(set_err) {
+                                            throw_val(send_err);
+                                        }
+                                        return;
+                                    }
                                 }
                             };
 
                             let global = js_sys::global();
                             let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
-                            let _ = worker_scope.post_message(&response);
+                            if let Err(err) = worker_scope.post_message(&response) {
+                                if let Err(send_err) = send_worker_error(err) {
+                                    throw_val(send_err);
+                                }
+                            }
                         });
                     }
                 });
@@ -96,24 +146,37 @@ pub fn main() -> Result<(), JsValue> {
             Err(err) => {
                 // Early error: send error response and skip execution
                 let response = js_sys::Object::new();
-                js_sys::Reflect::set(
-                    &response,
-                    &JsValue::from_str("type"),
-                    &JsValue::from_str("query-result"),
-                )
-                .unwrap();
-                js_sys::Reflect::set(&response, &JsValue::from_str("result"), &JsValue::NULL)
-                    .unwrap();
-                js_sys::Reflect::set(
-                    &response,
-                    &JsValue::from_str("error"),
-                    &JsValue::from_str(&format!("Invalid worker message: {err:?}")),
-                )
-                .unwrap();
+                if let Err(set_err) =
+                    set_js_property(&response, "type", &JsValue::from_str("query-result"))
+                {
+                    if let Err(send_err) = send_worker_error(set_err) {
+                        throw_val(send_err);
+                    }
+                    return;
+                }
+                if let Err(set_err) = set_js_property(&response, "result", &JsValue::NULL) {
+                    if let Err(send_err) = send_worker_error(set_err) {
+                        throw_val(send_err);
+                    }
+                    return;
+                }
+                let error_text = format!("Invalid worker message: {err:?}");
+                if let Err(set_err) =
+                    set_js_property(&response, "error", &JsValue::from_str(&error_text))
+                {
+                    if let Err(send_err) = send_worker_error(set_err) {
+                        throw_val(send_err);
+                    }
+                    return;
+                }
 
                 let global = js_sys::global();
                 let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
-                let _ = worker_scope.post_message(&response);
+                if let Err(err) = worker_scope.post_message(&response) {
+                    if let Err(send_err) = send_worker_error(err) {
+                        throw_val(send_err);
+                    }
+                }
             }
         }
     }) as Box<dyn FnMut(MessageEvent)>);
@@ -355,8 +418,8 @@ mod tests {
                 *leader_rc.is_leader.borrow_mut() = true;
                 assert!(!*follower_rc.is_leader.borrow());
 
-                leader_rc.setup_channel_listener();
-                follower_rc.setup_channel_listener();
+                assert!(leader_rc.setup_channel_listener().is_ok());
+                assert!(follower_rc.setup_channel_listener().is_ok());
 
                 assert_ne!(leader_rc.worker_id, follower_rc.worker_id);
             }

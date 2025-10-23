@@ -4,6 +4,7 @@ use std::str::FromStr;
 
 const BIGINT_ARG_ERROR_MESSAGE: &[u8] = b"BIGINT_SUM() requires exactly 1 argument\0";
 const BIGINT_CONTEXT_ERROR_MESSAGE: &[u8] = b"Failed to allocate aggregate context\0";
+const BIGINT_ZERO_RESULT_BYTES: &[u8] = b"0\0";
 
 // Context structure for BIGINT_SUM aggregate function
 pub struct BigIntSumContext {
@@ -120,11 +121,10 @@ pub unsafe extern "C" fn bigint_sum_final(context: *mut sqlite3_context) {
     let aggregate_context = sqlite3_aggregate_context(context, 0);
 
     if aggregate_context.is_null() {
-        let zero_result = CString::new("0").unwrap();
         sqlite3_result_text(
             context,
-            zero_result.as_ptr(),
-            zero_result.as_bytes().len() as c_int,
+            BIGINT_ZERO_RESULT_BYTES.as_ptr() as *const c_char,
+            1,
             Some(std::mem::transmute::<
                 isize,
                 unsafe extern "C" fn(*mut std::ffi::c_void),

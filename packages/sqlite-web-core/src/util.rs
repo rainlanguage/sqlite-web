@@ -1,3 +1,7 @@
+use js_sys::Reflect;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
+
 pub fn sanitize_identifier(name: &str) -> String {
     let s: String = name
         .trim()
@@ -20,6 +24,29 @@ pub fn sanitize_db_filename(name: &str) -> String {
         id.push_str(".db");
     }
     id
+}
+
+pub fn set_js_property(target: &JsValue, key: &str, value: &JsValue) -> Result<(), JsValue> {
+    match Reflect::set(target, &JsValue::from_str(key), value) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(JsValue::from_str(&format!(
+            "Reflect::set returned false for key {key}"
+        ))),
+        Err(err) => Err(err),
+    }
+}
+
+pub fn js_value_to_string(value: &JsValue) -> String {
+    if let Some(s) = value.as_string() {
+        return s;
+    }
+    if let Some(error) = value.dyn_ref::<js_sys::Error>() {
+        return error
+            .to_string()
+            .as_string()
+            .unwrap_or_else(|| format!("{value:?}"));
+    }
+    format!("{value:?}")
 }
 
 #[cfg(test)]

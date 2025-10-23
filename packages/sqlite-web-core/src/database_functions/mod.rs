@@ -19,7 +19,8 @@ use float_zero_hex::*;
 /// Register all custom functions with the SQLite database
 pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
     // Register BIGINT_SUM aggregate function
-    let bigint_sum_name = CString::new("BIGINT_SUM").unwrap();
+    let bigint_sum_name = CString::new("BIGINT_SUM")
+        .map_err(|_| "Function name BIGINT_SUM contains interior NUL bytes".to_string())?;
     let ret = unsafe {
         sqlite3_create_function_v2(
             db,
@@ -39,7 +40,8 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
     }
 
     // Register FLOAT_SUM aggregate function
-    let float_sum_name = CString::new("FLOAT_SUM").unwrap();
+    let float_sum_name = CString::new("FLOAT_SUM")
+        .map_err(|_| "Function name FLOAT_SUM contains interior NUL bytes".to_string())?;
     let ret = unsafe {
         sqlite3_create_function_v2(
             db,
@@ -59,7 +61,8 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
     }
 
     // Register FLOAT_ZERO_HEX scalar function
-    let float_zero_hex_name = CString::new("FLOAT_ZERO_HEX").unwrap();
+    let float_zero_hex_name = CString::new("FLOAT_ZERO_HEX")
+        .map_err(|_| "Function name FLOAT_ZERO_HEX contains interior NUL bytes".to_string())?;
     let ret = unsafe {
         sqlite3_create_function_v2(
             db,
@@ -79,7 +82,8 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
     }
 
     // Register FLOAT_NEGATE scalar function
-    let float_negate_name = CString::new("FLOAT_NEGATE").unwrap();
+    let float_negate_name = CString::new("FLOAT_NEGATE")
+        .map_err(|_| "Function name FLOAT_NEGATE contains interior NUL bytes".to_string())?;
     let ret = unsafe {
         sqlite3_create_function_v2(
             db,
@@ -99,7 +103,8 @@ pub fn register_custom_functions(db: *mut sqlite3) -> Result<(), String> {
     }
 
     // Register FLOAT_IS_ZERO scalar function
-    let float_is_zero_name = CString::new("FLOAT_IS_ZERO").unwrap();
+    let float_is_zero_name = CString::new("FLOAT_IS_ZERO")
+        .map_err(|_| "Function name FLOAT_IS_ZERO contains interior NUL bytes".to_string())?;
     let ret = unsafe {
         sqlite3_create_function_v2(
             db,

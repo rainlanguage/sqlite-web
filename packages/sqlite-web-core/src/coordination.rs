@@ -4,12 +4,13 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::BroadcastChannel;
 
 use crate::database::SQLiteDatabase;
 use crate::messages::{ChannelMessage, PendingQuery};
-use crate::util::sanitize_identifier;
+use crate::util::{js_value_to_string, sanitize_identifier, set_js_property};
 
 // Worker state
 pub struct WorkerState {
@@ -19,6 +20,24 @@ pub struct WorkerState {
     pub channel: BroadcastChannel,
     pub db_name: String,
     pub pending_queries: Rc<RefCell<HashMap<String, PendingQuery>>>,
+}
+
+fn reflect_get(target: &JsValue, key: &str) -> Result<JsValue, JsValue> {
+    Reflect::get(target, &JsValue::from_str(key))
+}
+
+fn send_channel_message(
+    channel: &BroadcastChannel,
+    message: &ChannelMessage,
+) -> Result<(), String> {
+    let value = serde_wasm_bindgen::to_value(message)
+        .map_err(|err| format!("Failed to serialize channel message: {err:?}"))?;
+    channel.post_message(&value).map_err(|err| {
+        format!(
+            "Failed to post channel message: {}",
+            js_value_to_string(&err)
+        )
+    })
 }
 
 impl WorkerState {
@@ -58,7 +77,7 @@ impl WorkerState {
         })
     }
 
-    pub fn setup_channel_listener(&self) {
+    pub fn setup_channel_listener(&self) -> Result<(), JsValue> {
         let is_leader = Rc::clone(&self.is_leader);
         let db = Rc::clone(&self.db);
         let pending_queries = Rc::clone(&self.pending_queries);
@@ -98,19 +117,25 @@ impl WorkerState {
 
                                 let response = match result {
                                     Ok(res) => ChannelMessage::QueryResponse {
-                                        query_id,
+                                        query_id: query_id.clone(),
                                         result: Some(res),
                                         error: None,
                                     },
                                     Err(err) => ChannelMessage::QueryResponse {
-                                        query_id,
+                                        query_id: query_id.clone(),
                                         result: None,
                                         error: Some(err),
                                     },
                                 };
 
-                                let msg_js = serde_wasm_bindgen::to_value(&response).unwrap();
-                                let _ = channel.post_message(&msg_js);
+                                if let Err(err_msg) = send_channel_message(&channel, &response) {
+                                    let fallback = ChannelMessage::QueryResponse {
+                                        query_id: query_id.clone(),
+                                        result: None,
+                                        error: Some(err_msg),
+                                    };
+                                    let _ = send_channel_message(&channel, &fallback);
+                                }
                             });
                         }
                     }
@@ -139,9 +164,10 @@ impl WorkerState {
         self.channel
             .set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
+        Ok(())
     }
 
-    pub async fn attempt_leadership(&self) {
+    pub async fn attempt_leadership(&self) -> Result<(), JsValue> {
         let worker_id = self.worker_id.clone();
         let is_leader = Rc::clone(&self.is_leader);
         let db = Rc::clone(&self.db);
@@ -150,16 +176,11 @@ impl WorkerState {
 
         // Get navigator.locks from WorkerGlobalScope
         let global = js_sys::global();
-        let navigator = Reflect::get(&global, &JsValue::from_str("navigator")).unwrap();
-        let locks = Reflect::get(&navigator, &JsValue::from_str("locks")).unwrap();
+        let navigator = reflect_get(&global, "navigator")?;
+        let locks = reflect_get(&navigator, "locks")?;
 
         let options = Object::new();
-        Reflect::set(
-            &options,
-            &JsValue::from_str("mode"),
-            &JsValue::from_str("exclusive"),
-        )
-        .unwrap();
+        set_js_property(&options, "mode", &JsValue::from_str("exclusive"))?;
 
         let handler = Closure::once(move |_lock: JsValue| -> Promise {
             *is_leader.borrow_mut() = true;
@@ -177,8 +198,14 @@ impl WorkerState {
                         let msg = ChannelMessage::NewLeader {
                             leader_id: worker_id.clone(),
                         };
-                        let msg_js = serde_wasm_bindgen::to_value(&msg).unwrap();
-                        let _ = channel.post_message(&msg_js);
+                        if let Err(err_msg) = send_channel_message(&channel, &msg) {
+                            let fallback = ChannelMessage::QueryResponse {
+                                query_id: worker_id.clone(),
+                                result: None,
+                                error: Some(err_msg),
+                            };
+                            let _ = send_channel_message(&channel, &fallback);
+                        }
                     }
                     Err(_e) => {}
                 }
@@ -188,18 +215,21 @@ impl WorkerState {
             Promise::new(&mut |_, _| {})
         });
 
-        let request_fn = Reflect::get(&locks, &JsValue::from_str("request")).unwrap();
-        let request_fn = request_fn.dyn_ref::<Function>().unwrap();
+        let request_fn = reflect_get(&locks, "request")?;
+        let request_fn = request_fn
+            .dyn_ref::<Function>()
+            .ok_or_else(|| JsValue::from_str("navigator.locks.request is not a function"))?;
 
         let lock_id: String = format!("sqlite-database-{}", sanitize_identifier(&self.db_name));
-        let _ = request_fn.call3(
+        request_fn.call3(
             &locks,
             &JsValue::from_str(&lock_id),
             &options,
             handler.as_ref().unchecked_ref(),
-        );
+        )?;
 
         handler.forget();
+        Ok(())
     }
 
     pub async fn execute_query(
@@ -236,8 +266,11 @@ impl WorkerState {
                 sql,
                 params,
             };
-            let msg_js = serde_wasm_bindgen::to_value(&msg).unwrap();
-            let _ = self.channel.post_message(&msg_js);
+            let msg_js = serde_wasm_bindgen::to_value(&msg)
+                .map_err(|err| format!("Failed to serialize query request: {err:?}"))?;
+            self.channel
+                .post_message(&msg_js)
+                .map_err(|err| format!("Failed to post query request: {err:?}"))?;
 
             // Timeout handling
             let timeout_promise = Promise::new(&mut |_, reject| {
@@ -251,15 +284,15 @@ impl WorkerState {
                 });
 
                 let global = js_sys::global();
-                let set_timeout = Reflect::get(&global, &JsValue::from_str("setTimeout")).unwrap();
-                let set_timeout = set_timeout.dyn_ref::<Function>().unwrap();
-                set_timeout
-                    .call2(
-                        &JsValue::NULL,
-                        callback.as_ref().unchecked_ref(),
-                        &JsValue::from_f64(5000.0),
-                    )
-                    .unwrap();
+                if let Ok(set_timeout_value) = reflect_get(&global, "setTimeout") {
+                    if let Some(set_timeout_fn) = set_timeout_value.dyn_ref::<Function>() {
+                        let _ = set_timeout_fn.call2(
+                            &JsValue::NULL,
+                            callback.as_ref().unchecked_ref(),
+                            &JsValue::from_f64(5000.0),
+                        );
+                    }
+                }
                 callback.forget();
             });
 
@@ -457,7 +490,10 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_setup_channel_listener() {
         if let Ok(state) = WorkerState::new() {
-            state.setup_channel_listener();
+            assert!(
+                state.setup_channel_listener().is_ok(),
+                "setup_channel_listener should succeed"
+            );
         }
     }
 
@@ -470,7 +506,7 @@ mod tests {
                 "Database should be uninitialized"
             );
 
-            state.attempt_leadership().await;
+            let _ = state.attempt_leadership().await;
         }
 
         let workers: Vec<_> = (0..3).filter_map(|_| WorkerState::new().ok()).collect();
@@ -480,7 +516,7 @@ mod tests {
             }
 
             for worker in &workers {
-                worker.attempt_leadership().await;
+                let _ = worker.attempt_leadership().await;
             }
         }
     }

@@ -298,7 +298,15 @@ impl SQLiteDatabase {
                                 })?;
                                 let len = bytes.len() as i32;
                                 owned_blobs.push(bytes);
-                                let buf_ptr = owned_blobs.last().unwrap().as_ptr() as *const _;
+                                let buf_ptr = owned_blobs
+                                    .last()
+                                    .map(|blob| blob.as_ptr() as *const _)
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "Failed to store blob parameter at index {}",
+                                            target_index + 1
+                                        )
+                                    })?;
                                 let rc = unsafe {
                                     sqlite3_bind_blob(
                                         stmt,
