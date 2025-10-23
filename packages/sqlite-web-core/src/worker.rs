@@ -39,6 +39,82 @@ fn send_worker_error(err: JsValue) -> Result<(), JsValue> {
     })
 }
 
+fn post_message(obj: &js_sys::Object) -> Result<(), JsValue> {
+    let global = js_sys::global();
+    let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
+    worker_scope.post_message(obj.as_ref())
+}
+
+fn make_query_result_message(result: Result<String, String>) -> Result<js_sys::Object, JsValue> {
+    let response = js_sys::Object::new();
+    set_js_property(&response, "type", &JsValue::from_str("query-result"))?;
+    match result {
+        Ok(res) => {
+            set_js_property(&response, "result", &JsValue::from_str(&res))?;
+            set_js_property(&response, "error", &JsValue::NULL)?;
+        }
+        Err(err) => {
+            set_js_property(&response, "result", &JsValue::NULL)?;
+            set_js_property(&response, "error", &JsValue::from_str(&err))?;
+        }
+    }
+    Ok(response)
+}
+
+fn handle_incoming_value(data: JsValue) {
+    match serde_wasm_bindgen::from_value::<WorkerMessage>(data) {
+        Ok(WorkerMessage::ExecuteQuery { sql, params }) => {
+            WORKER_STATE.with(|s| {
+                if let Some(state) = s.borrow().as_ref() {
+                    let state = Rc::clone(state);
+                    spawn_local(async move {
+                        let response =
+                            make_query_result_message(state.execute_query(sql, params).await)
+                                .unwrap_or_else(|err| {
+                                    let _ = send_worker_error(err);
+                                    let o = js_sys::Object::new();
+                                    let _ = set_js_property(
+                                        &o,
+                                        "type",
+                                        &JsValue::from_str("query-result"),
+                                    );
+                                    let _ = set_js_property(&o, "result", &JsValue::NULL);
+                                    let _ = set_js_property(
+                                        &o,
+                                        "error",
+                                        &JsValue::from_str("Failed to build response"),
+                                    );
+                                    o
+                                });
+                        if let Err(err) = post_message(&response) {
+                            if let Err(send_err) = send_worker_error(err) {
+                                throw_val(send_err);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        Err(err) => {
+            let error_text = format!("Invalid worker message: {err:?}");
+            let response = make_query_result_message(Err(error_text)).unwrap_or_else(|e| {
+                let _ = send_worker_error(e);
+                let o = js_sys::Object::new();
+                let _ = set_js_property(&o, "type", &JsValue::from_str("query-result"));
+                let _ = set_js_property(&o, "result", &JsValue::NULL);
+                let _ =
+                    set_js_property(&o, "error", &JsValue::from_str("Failed to build response"));
+                o
+            });
+            if let Err(err) = post_message(&response) {
+                if let Err(send_err) = send_worker_error(err) {
+                    throw_val(send_err);
+                }
+            }
+        }
+    }
+}
+
 /// Entry point for the worker - called from the blob
 pub fn main() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -66,119 +142,7 @@ pub fn main() -> Result<(), JsValue> {
 
     let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
         let data = event.data();
-
-        // Deserialize into canonical WorkerMessage and handle variants
-        match serde_wasm_bindgen::from_value::<WorkerMessage>(data) {
-            Ok(WorkerMessage::ExecuteQuery { sql, params }) => {
-                WORKER_STATE.with(|s| {
-                    if let Some(state) = s.borrow().as_ref() {
-                        let state = Rc::clone(state);
-                        spawn_local(async move {
-                            let result = state.execute_query(sql, params).await;
-
-                            // Send response as plain JavaScript object
-                            let response = js_sys::Object::new();
-                            if let Err(err) = set_js_property(
-                                &response,
-                                "type",
-                                &JsValue::from_str("query-result"),
-                            ) {
-                                if let Err(send_err) = send_worker_error(err) {
-                                    throw_val(send_err);
-                                }
-                                return;
-                            }
-
-                            match result {
-                                Ok(res) => {
-                                    if let Err(err) = set_js_property(
-                                        &response,
-                                        "result",
-                                        &JsValue::from_str(&res),
-                                    ) {
-                                        if let Err(send_err) = send_worker_error(err) {
-                                            throw_val(send_err);
-                                        }
-                                        return;
-                                    }
-                                    if let Err(err) =
-                                        set_js_property(&response, "error", &JsValue::NULL)
-                                    {
-                                        if let Err(send_err) = send_worker_error(err) {
-                                            throw_val(send_err);
-                                        }
-                                        return;
-                                    }
-                                }
-                                Err(err) => {
-                                    if let Err(set_err) =
-                                        set_js_property(&response, "result", &JsValue::NULL)
-                                    {
-                                        if let Err(send_err) = send_worker_error(set_err) {
-                                            throw_val(send_err);
-                                        }
-                                        return;
-                                    }
-                                    if let Err(set_err) = set_js_property(
-                                        &response,
-                                        "error",
-                                        &JsValue::from_str(&err),
-                                    ) {
-                                        if let Err(send_err) = send_worker_error(set_err) {
-                                            throw_val(send_err);
-                                        }
-                                        return;
-                                    }
-                                }
-                            };
-
-                            let global = js_sys::global();
-                            let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
-                            if let Err(err) = worker_scope.post_message(&response) {
-                                if let Err(send_err) = send_worker_error(err) {
-                                    throw_val(send_err);
-                                }
-                            }
-                        });
-                    }
-                });
-            }
-            Err(err) => {
-                // Early error: send error response and skip execution
-                let response = js_sys::Object::new();
-                if let Err(set_err) =
-                    set_js_property(&response, "type", &JsValue::from_str("query-result"))
-                {
-                    if let Err(send_err) = send_worker_error(set_err) {
-                        throw_val(send_err);
-                    }
-                    return;
-                }
-                if let Err(set_err) = set_js_property(&response, "result", &JsValue::NULL) {
-                    if let Err(send_err) = send_worker_error(set_err) {
-                        throw_val(send_err);
-                    }
-                    return;
-                }
-                let error_text = format!("Invalid worker message: {err:?}");
-                if let Err(set_err) =
-                    set_js_property(&response, "error", &JsValue::from_str(&error_text))
-                {
-                    if let Err(send_err) = send_worker_error(set_err) {
-                        throw_val(send_err);
-                    }
-                    return;
-                }
-
-                let global = js_sys::global();
-                let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
-                if let Err(err) = worker_scope.post_message(&response) {
-                    if let Err(send_err) = send_worker_error(err) {
-                        throw_val(send_err);
-                    }
-                }
-            }
-        }
+        handle_incoming_value(data);
     }) as Box<dyn FnMut(MessageEvent)>);
 
     worker_scope.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));

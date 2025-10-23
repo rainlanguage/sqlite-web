@@ -12,6 +12,144 @@ use web_sys::{Blob, BlobPropertyBag, MessageEvent, Url, Worker};
 mod worker_template;
 use worker_template::generate_self_contained_worker;
 
+fn create_worker_from_code(worker_code: &str) -> Result<Worker, JsValue> {
+    let blob_parts = Array::new();
+    blob_parts.push(&JsValue::from_str(worker_code));
+
+    let blob_options = BlobPropertyBag::new();
+    blob_options.set_type("application/javascript");
+
+    let blob = Blob::new_with_str_sequence_and_options(&blob_parts, &blob_options)?;
+    let worker_url = Url::create_object_url_with_blob(&blob)?;
+    let worker = Worker::new(&worker_url)?;
+    Url::revoke_object_url(&worker_url)?;
+    Ok(worker)
+}
+
+fn install_onmessage_handler(
+    worker: &Worker,
+    pending_queries: Rc<RefCell<Vec<(js_sys::Function, js_sys::Function)>>>,
+) {
+    let pending_queries_clone = Rc::clone(&pending_queries);
+    let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let data = event.data();
+        if handle_worker_control_message(&data) {
+            return;
+        }
+        handle_query_result_message(&data, &pending_queries_clone);
+    }) as Box<dyn FnMut(MessageEvent)>);
+
+    worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+    onmessage.forget();
+}
+
+fn handle_worker_control_message(data: &JsValue) -> bool {
+    if let Ok(obj) = js_sys::Reflect::get(data, &JsValue::from_str("type")) {
+        if let Some(msg_type) = obj.as_string() {
+            if msg_type == "worker-ready" {
+                return true;
+            } else if msg_type == "worker-error" {
+                let _ = js_sys::Reflect::get(data, &JsValue::from_str("error"));
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn handle_query_result_message(
+    data: &JsValue,
+    pending_queries: &Rc<RefCell<Vec<(js_sys::Function, js_sys::Function)>>>,
+) {
+    if let Ok(obj) = js_sys::Reflect::get(data, &JsValue::from_str("type")) {
+        if let Some(msg_type) = obj.as_string() {
+            if msg_type == "query-result" {
+                if let Some((resolve, reject)) = pending_queries.borrow_mut().pop() {
+                    if let Ok(error) = js_sys::Reflect::get(data, &JsValue::from_str("error")) {
+                        if !error.is_null() && !error.is_undefined() {
+                            let error_str =
+                                error.as_string().unwrap_or_else(|| format!("{error:?}"));
+                            let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&error_str));
+                            return;
+                        }
+                    }
+
+                    if let Ok(result) = js_sys::Reflect::get(data, &JsValue::from_str("result")) {
+                        if !result.is_null() && !result.is_undefined() {
+                            let result_str =
+                                result.as_string().unwrap_or_else(|| format!("{result:?}"));
+                            let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str(&result_str));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn encode_bigint_to_obj(bi: js_sys::BigInt) -> Result<JsValue, SQLiteWasmDatabaseError> {
+    let obj = js_sys::Object::new();
+    let s = bi
+        .to_string(10)
+        .map_err(|e| SQLiteWasmDatabaseError::JsError(e.into()))?;
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("__type"),
+        &JsValue::from_str("bigint"),
+    )
+    .map_err(SQLiteWasmDatabaseError::from)?;
+    js_sys::Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::from(s))
+        .map_err(SQLiteWasmDatabaseError::from)?;
+    Ok(obj.into())
+}
+
+fn encode_binary_to_obj(bytes: Vec<u8>) -> Result<JsValue, SQLiteWasmDatabaseError> {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("__type"),
+        &JsValue::from_str("blob"),
+    )
+    .map_err(SQLiteWasmDatabaseError::from)?;
+    js_sys::Reflect::set(&obj, &JsValue::from_str("base64"), &JsValue::from_str(&b64))
+        .map_err(SQLiteWasmDatabaseError::from)?;
+    Ok(obj.into())
+}
+
+fn normalize_one_param(v: &JsValue, index: u32) -> Result<JsValue, SQLiteWasmDatabaseError> {
+    if v.is_null() || v.is_undefined() {
+        return Ok(JsValue::NULL);
+    }
+    if let Ok(bi) = v.clone().dyn_into::<js_sys::BigInt>() {
+        return encode_bigint_to_obj(bi);
+    }
+    if let Ok(typed) = v.clone().dyn_into::<js_sys::Uint8Array>() {
+        return encode_binary_to_obj(typed.to_vec());
+    }
+    if let Ok(buf) = v.clone().dyn_into::<js_sys::ArrayBuffer>() {
+        let typed = js_sys::Uint8Array::new(&buf);
+        return encode_binary_to_obj(typed.to_vec());
+    }
+    if let Some(n) = v.as_f64() {
+        if !n.is_finite() {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Invalid numeric value at index: NaN/Infinity not supported.",
+            )));
+        }
+        return Ok(JsValue::from_f64(n));
+    }
+    if let Some(b) = v.as_bool() {
+        return Ok(JsValue::from_bool(b));
+    }
+    if let Some(s) = v.as_string() {
+        return Ok(JsValue::from_str(&s));
+    }
+    Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+        &format!("Unsupported parameter type at position {}", index + 1),
+    )))
+}
+
 #[wasm_bindgen]
 pub struct SQLiteWasmDatabase {
     worker: Worker,
@@ -92,86 +230,12 @@ impl SQLiteWasmDatabase {
                 "Database name is required",
             )));
         }
-        // Create the worker with embedded WASM and glue code
         let worker_code = generate_self_contained_worker(db_name);
-
-        // Create a Blob with the worker code
-        let blob_parts = Array::new();
-        blob_parts.push(&JsValue::from_str(&worker_code));
-
-        let blob_options = BlobPropertyBag::new();
-        blob_options.set_type("application/javascript");
-
-        let blob = Blob::new_with_str_sequence_and_options(&blob_parts, &blob_options)?;
-
-        // Create a blob URL
-        let worker_url = Url::create_object_url_with_blob(&blob)?;
-
-        // Create the worker from the blob URL
-        let worker = Worker::new(&worker_url)?;
-
-        // Clean up the blob URL
-        Url::revoke_object_url(&worker_url)?;
+        let worker = create_worker_from_code(&worker_code)?;
 
         let pending_queries: Rc<RefCell<Vec<(js_sys::Function, js_sys::Function)>>> =
             Rc::new(RefCell::new(Vec::new()));
-        let pending_queries_clone = Rc::clone(&pending_queries);
-
-        // Setup message handler
-        let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
-            let data = event.data();
-
-            // Handle worker ready message
-            if let Ok(obj) = js_sys::Reflect::get(&data, &JsValue::from_str("type")) {
-                if let Some(msg_type) = obj.as_string() {
-                    if msg_type == "worker-ready" {
-                        return;
-                    } else if msg_type == "worker-error" {
-                        if let Ok(_error) = js_sys::Reflect::get(&data, &JsValue::from_str("error"))
-                        {
-                        }
-                        return;
-                    }
-                }
-            }
-
-            // Handle query responses - parse JavaScript objects directly
-            if let Ok(obj) = js_sys::Reflect::get(&data, &JsValue::from_str("type")) {
-                if let Some(msg_type) = obj.as_string() {
-                    if msg_type == "query-result" {
-                        if let Some((resolve, reject)) = pending_queries_clone.borrow_mut().pop() {
-                            // Check for error first
-                            if let Ok(error) =
-                                js_sys::Reflect::get(&data, &JsValue::from_str("error"))
-                            {
-                                if !error.is_null() && !error.is_undefined() {
-                                    let error_str =
-                                        error.as_string().unwrap_or_else(|| format!("{error:?}"));
-                                    let _ = reject
-                                        .call1(&JsValue::NULL, &JsValue::from_str(&error_str));
-                                    return;
-                                }
-                            }
-
-                            // Handle successful result
-                            if let Ok(result) =
-                                js_sys::Reflect::get(&data, &JsValue::from_str("result"))
-                            {
-                                if !result.is_null() && !result.is_undefined() {
-                                    let result_str =
-                                        result.as_string().unwrap_or_else(|| format!("{result:?}"));
-                                    let _ = resolve
-                                        .call1(&JsValue::NULL, &JsValue::from_str(&result_str));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }) as Box<dyn FnMut(MessageEvent)>);
-
-        worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-        onmessage.forget();
+        install_onmessage_handler(&worker, Rc::clone(&pending_queries));
 
         Ok(SQLiteWasmDatabase {
             worker,
@@ -198,91 +262,8 @@ impl SQLiteWasmDatabase {
         let len = arr.length();
         for i in 0..len {
             let v = arr.get(i);
-            if v.is_null() || v.is_undefined() {
-                normalized.push(&JsValue::NULL);
-                continue;
-            }
-            // BigInt
-            if let Ok(bi) = v.clone().dyn_into::<js_sys::BigInt>() {
-                // encode as { __type: "bigint", value: string }
-                let obj = js_sys::Object::new();
-                let s = bi
-                    .to_string(10)
-                    .map_err(|e| SQLiteWasmDatabaseError::JsError(e.into()))?;
-                js_sys::Reflect::set(
-                    &obj,
-                    &JsValue::from_str("__type"),
-                    &JsValue::from_str("bigint"),
-                )
-                .map_err(SQLiteWasmDatabaseError::from)?;
-                js_sys::Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::from(s))
-                    .map_err(SQLiteWasmDatabaseError::from)?;
-                normalized.push(&obj);
-                continue;
-            }
-
-            // Uint8Array
-            if let Ok(typed) = v.clone().dyn_into::<js_sys::Uint8Array>() {
-                let rust_vec = typed.to_vec();
-                let b64 = base64::engine::general_purpose::STANDARD.encode(rust_vec);
-                let obj = js_sys::Object::new();
-                js_sys::Reflect::set(
-                    &obj,
-                    &JsValue::from_str("__type"),
-                    &JsValue::from_str("blob"),
-                )
-                .map_err(SQLiteWasmDatabaseError::from)?;
-                js_sys::Reflect::set(&obj, &JsValue::from_str("base64"), &JsValue::from_str(&b64))
-                    .map_err(SQLiteWasmDatabaseError::from)?;
-                normalized.push(&obj);
-                continue;
-            }
-
-            // ArrayBuffer
-            if let Ok(buf) = v.clone().dyn_into::<js_sys::ArrayBuffer>() {
-                let typed = js_sys::Uint8Array::new(&buf);
-                let rust_vec = typed.to_vec();
-                let b64 = base64::engine::general_purpose::STANDARD.encode(rust_vec);
-                let obj = js_sys::Object::new();
-                js_sys::Reflect::set(
-                    &obj,
-                    &JsValue::from_str("__type"),
-                    &JsValue::from_str("blob"),
-                )
-                .map_err(SQLiteWasmDatabaseError::from)?;
-                js_sys::Reflect::set(&obj, &JsValue::from_str("base64"), &JsValue::from_str(&b64))
-                    .map_err(SQLiteWasmDatabaseError::from)?;
-                normalized.push(&obj);
-                continue;
-            }
-
-            // Number
-            if let Some(n) = v.as_f64() {
-                if !n.is_finite() {
-                    return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
-                        "Invalid numeric value at index: NaN/Infinity not supported.",
-                    )));
-                }
-                normalized.push(&JsValue::from_f64(n));
-                continue;
-            }
-
-            // Boolean
-            if let Some(b) = v.as_bool() {
-                normalized.push(&JsValue::from_bool(b));
-                continue;
-            }
-
-            // String
-            if let Some(s) = v.as_string() {
-                normalized.push(&JsValue::from_str(&s));
-                continue;
-            }
-
-            // Unsupported
-            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
-                &format!("Unsupported parameter type at position {}", i + 1),
-            )));
+            let nv = normalize_one_param(&v, i)?;
+            normalized.push(&nv);
         }
 
         Ok(normalized)
