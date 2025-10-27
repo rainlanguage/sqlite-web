@@ -2,6 +2,7 @@ use base64::Engine;
 use js_sys::Array;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use thiserror::Error;
 use wasm_bindgen::prelude::*;
@@ -21,14 +22,14 @@ fn create_worker_from_code(worker_code: &str) -> Result<Worker, JsValue> {
 
     let blob = Blob::new_with_str_sequence_and_options(&blob_parts, &blob_options)?;
     let worker_url = Url::create_object_url_with_blob(&blob)?;
-    let worker = Worker::new(&worker_url)?;
+    let worker_res = Worker::new(&worker_url);
     Url::revoke_object_url(&worker_url)?;
-    Ok(worker)
+    worker_res
 }
 
 fn install_onmessage_handler(
     worker: &Worker,
-    pending_queries: Rc<RefCell<Vec<(js_sys::Function, js_sys::Function)>>>,
+    pending_queries: Rc<RefCell<VecDeque<(js_sys::Function, js_sys::Function)>>>,
 ) {
     let pending_queries_clone = Rc::clone(&pending_queries);
     let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
@@ -59,12 +60,12 @@ fn handle_worker_control_message(data: &JsValue) -> bool {
 
 fn handle_query_result_message(
     data: &JsValue,
-    pending_queries: &Rc<RefCell<Vec<(js_sys::Function, js_sys::Function)>>>,
+    pending_queries: &Rc<RefCell<VecDeque<(js_sys::Function, js_sys::Function)>>>,
 ) {
     if let Ok(obj) = js_sys::Reflect::get(data, &JsValue::from_str("type")) {
         if let Some(msg_type) = obj.as_string() {
             if msg_type == "query-result" {
-                if let Some((resolve, reject)) = pending_queries.borrow_mut().pop() {
+                if let Some((resolve, reject)) = pending_queries.borrow_mut().pop_front() {
                     if let Ok(error) = js_sys::Reflect::get(data, &JsValue::from_str("error")) {
                         if !error.is_null() && !error.is_undefined() {
                             let error_str =
@@ -140,7 +141,10 @@ fn normalize_one_param(v: &JsValue, index: u32) -> Result<JsValue, SQLiteWasmDat
     if let Some(n) = v.as_f64() {
         if !n.is_finite() {
             return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
-                "Invalid numeric value at index: NaN/Infinity not supported.",
+                &format!(
+                    "Invalid numeric value at position {} (NaN/Infinity not supported.)",
+                    index + 1
+                ),
             )));
         }
         return Ok(JsValue::from_f64(n));
@@ -159,7 +163,7 @@ fn normalize_one_param(v: &JsValue, index: u32) -> Result<JsValue, SQLiteWasmDat
 #[wasm_bindgen]
 pub struct SQLiteWasmDatabase {
     worker: Worker,
-    pending_queries: Rc<RefCell<Vec<(js_sys::Function, js_sys::Function)>>>,
+    pending_queries: Rc<RefCell<VecDeque<(js_sys::Function, js_sys::Function)>>>,
 }
 
 impl Serialize for SQLiteWasmDatabase {
@@ -250,8 +254,8 @@ impl SQLiteWasmDatabase {
         let worker_code = generate_self_contained_worker(db_name);
         let worker = create_worker_from_code(&worker_code)?;
 
-        let pending_queries: Rc<RefCell<Vec<(js_sys::Function, js_sys::Function)>>> =
-            Rc::new(RefCell::new(Vec::new()));
+        let pending_queries: Rc<RefCell<VecDeque<(js_sys::Function, js_sys::Function)>>> =
+            Rc::new(RefCell::new(VecDeque::new()));
         install_onmessage_handler(&worker, Rc::clone(&pending_queries));
 
         Ok(SQLiteWasmDatabase {
@@ -314,7 +318,7 @@ impl SQLiteWasmDatabase {
         let promise =
             js_sys::Promise::new(&mut |resolve, reject| match worker.post_message(&message) {
                 Ok(()) => {
-                    pending_queries.borrow_mut().push((resolve, reject));
+                    pending_queries.borrow_mut().push_back((resolve, reject));
                 }
                 Err(err) => {
                     let _ = reject.call1(&JsValue::NULL, &err);

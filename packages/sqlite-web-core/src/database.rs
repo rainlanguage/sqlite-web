@@ -132,10 +132,12 @@ impl SQLiteDatabase {
             }
             SQLITE_FLOAT => {
                 let val = unsafe { sqlite3_column_double(stmt, i) };
-                serde_json::Value::Number(
-                    serde_json::Number::from_f64(val)
-                        .unwrap_or_else(|| serde_json::Number::from(0)),
-                )
+                if val.is_finite() {
+                    // Safe to unwrap: serde_json rejects only non-finite floats
+                    serde_json::Value::Number(serde_json::Number::from_f64(val).unwrap())
+                } else {
+                    serde_json::Value::Null
+                }
             }
             SQLITE_TEXT => {
                 let ptr = unsafe { sqlite3_column_text(stmt, i) };
