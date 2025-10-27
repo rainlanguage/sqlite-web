@@ -359,7 +359,8 @@ impl SQLiteDatabase {
     fn bind_null(&self, stmt: *mut sqlite3_stmt, i: i32) -> Result<(), String> {
         let rc = unsafe { sqlite3_bind_null(stmt, i) };
         if rc != SQLITE_OK {
-            return Err(format!("Failed to bind NULL at {i}"));
+            let msg = self.sqlite_errmsg();
+            return Err(format!("Failed to bind NULL at {i}: {msg}"));
         }
         Ok(())
     }
@@ -367,7 +368,8 @@ impl SQLiteDatabase {
     fn bind_bool(&self, stmt: *mut sqlite3_stmt, i: i32, b: bool) -> Result<(), String> {
         let rc = unsafe { sqlite3_bind_int(stmt, i, if b { 1 } else { 0 }) };
         if rc != SQLITE_OK {
-            return Err(format!("Failed to bind boolean at {i}"));
+            let msg = self.sqlite_errmsg();
+            return Err(format!("Failed to bind boolean at {i}: {msg}"));
         }
         Ok(())
     }
@@ -375,7 +377,8 @@ impl SQLiteDatabase {
     fn bind_i64(&self, stmt: *mut sqlite3_stmt, i: i32, v: i64) -> Result<(), String> {
         let rc = unsafe { sqlite3_bind_int64(stmt, i, v) };
         if rc != SQLITE_OK {
-            return Err(format!("Failed to bind int64 at {i}"));
+            let msg = self.sqlite_errmsg();
+            return Err(format!("Failed to bind int64 at {i}: {msg}"));
         }
         Ok(())
     }
@@ -383,7 +386,8 @@ impl SQLiteDatabase {
     fn bind_f64(&self, stmt: *mut sqlite3_stmt, i: i32, v: f64) -> Result<(), String> {
         let rc = unsafe { sqlite3_bind_double(stmt, i, v) };
         if rc != SQLITE_OK {
-            return Err(format!("Failed to bind double at {i}"));
+            let msg = self.sqlite_errmsg();
+            return Err(format!("Failed to bind double at {i}: {msg}"));
         }
         Ok(())
     }
@@ -403,7 +407,8 @@ impl SQLiteDatabase {
             sqlite3_bind_text(stmt, i, ptr, len, None::<unsafe extern "C" fn(*mut c_void)>)
         };
         if rc != SQLITE_OK {
-            return Err(format!("Failed to bind text at {i}"));
+            let msg = self.sqlite_errmsg();
+            return Err(format!("Failed to bind text at {i}: {msg}"));
         }
         Ok(())
     }
@@ -429,7 +434,8 @@ impl SQLiteDatabase {
             )
         };
         if rc != SQLITE_OK {
-            return Err(format!("Failed to bind blob at {i}"));
+            let msg = self.sqlite_errmsg();
+            return Err(format!("Failed to bind blob at {i}: {msg}"));
         }
         Ok(())
     }
