@@ -69,7 +69,10 @@ fn handle_query_result_message(
                         if !error.is_null() && !error.is_undefined() {
                             let error_str =
                                 error.as_string().unwrap_or_else(|| format!("{error:?}"));
-                            let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&error_str));
+                            if let Err(_err) =
+                                reject.call1(&JsValue::NULL, &JsValue::from_str(&error_str))
+                            {
+                            }
                             return;
                         }
                     }
@@ -78,7 +81,10 @@ fn handle_query_result_message(
                         if !result.is_null() && !result.is_undefined() {
                             let result_str =
                                 result.as_string().unwrap_or_else(|| format!("{result:?}"));
-                            let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str(&result_str));
+                            if let Err(_err) =
+                                resolve.call1(&JsValue::NULL, &JsValue::from_str(&result_str))
+                            {
+                            }
                         }
                     }
                 }
@@ -221,6 +227,17 @@ impl From<SQLiteWasmDatabaseError> for WasmEncodedError {
 
 #[wasm_export]
 impl SQLiteWasmDatabase {
+    fn ensure_array(params: &JsValue) -> Result<js_sys::Array, SQLiteWasmDatabaseError> {
+        if params.is_undefined() || params.is_null() {
+            return Ok(js_sys::Array::new());
+        }
+        if js_sys::Array::is_array(params) {
+            return Ok(params.clone().unchecked_into());
+        }
+        Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+            "params must be an array",
+        )))
+    }
     /// Create a new database connection with fully embedded worker
     #[wasm_export(js_name = "new", preserve_js_class)]
     pub fn new(db_name: &str) -> Result<SQLiteWasmDatabase, SQLiteWasmDatabaseError> {
@@ -244,19 +261,7 @@ impl SQLiteWasmDatabase {
     }
 
     fn normalize_params_js(params: &JsValue) -> Result<js_sys::Array, SQLiteWasmDatabaseError> {
-        // If undefined or null, treat as no params
-        if params.is_undefined() || params.is_null() {
-            return Ok(js_sys::Array::new());
-        }
-
-        // Ensure array input
-        let arr: js_sys::Array = if js_sys::Array::is_array(params) {
-            params.clone().unchecked_into()
-        } else {
-            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
-                "params must be an array",
-            )));
-        };
+        let arr = Self::ensure_array(params)?;
 
         let normalized = js_sys::Array::new();
         let len = arr.length();
@@ -305,12 +310,16 @@ impl SQLiteWasmDatabase {
         }
 
         // Create the Promise that will resolve/reject when the worker responds
-        let promise = js_sys::Promise::new(&mut |resolve, reject| {
-            // Only store callbacks after successful message construction
-            pending_queries.borrow_mut().push((resolve, reject));
-
-            let _ = worker.post_message(&message);
-        });
+        // Attempt to post the message first; only track callbacks on success.
+        let promise =
+            js_sys::Promise::new(&mut |resolve, reject| match worker.post_message(&message) {
+                Ok(()) => {
+                    pending_queries.borrow_mut().push((resolve, reject));
+                }
+                Err(err) => {
+                    let _ = reject.call1(&JsValue::NULL, &err);
+                }
+            });
 
         let result = JsFuture::from(promise).await?;
         Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))

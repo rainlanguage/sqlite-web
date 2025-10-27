@@ -46,7 +46,10 @@ pub fn js_value_to_string(value: &JsValue) -> String {
             .as_string()
             .unwrap_or_else(|| format!("{value:?}"));
     }
-    format!("{value:?}")
+    match js_sys::JSON::stringify(value) {
+        Ok(s) => s.as_string().unwrap_or_else(|| format!("{value:?}")),
+        Err(_) => format!("{value:?}"),
+    }
 }
 
 #[cfg(test)]

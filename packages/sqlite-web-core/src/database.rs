@@ -67,17 +67,6 @@ enum ParamKind {
 }
 
 impl SQLiteDatabase {
-    fn sqlite_error_from_code(&self, code: i32) -> String {
-        unsafe {
-            let p = sqlite3_errmsg(self.db);
-            if !p.is_null() {
-                CStr::from_ptr(p).to_string_lossy().into_owned()
-            } else {
-                format!("SQLite error code: {code}")
-            }
-        }
-    }
-
     fn refresh_transaction_state(&mut self) {
         self.in_transaction = unsafe { sqlite3_get_autocommit(self.db) } == 0;
     }
@@ -96,7 +85,12 @@ impl SQLiteDatabase {
         let mut tail: *const i8 = std::ptr::null();
         let ret = unsafe { sqlite3_prepare_v2(self.db, ptr, -1, &mut stmt, &mut tail) };
         if ret != SQLITE_OK {
-            return Err(self.sqlite_error_from_code(ret));
+            let msg = self.sqlite_errmsg();
+            return Err(if msg == "Unknown SQLite error" {
+                format!("SQLite error code: {ret}")
+            } else {
+                msg
+            });
         }
         Ok((if stmt.is_null() { None } else { Some(stmt) }, tail))
     }
@@ -106,6 +100,7 @@ impl SQLiteDatabase {
             if !p.is_null() {
                 CStr::from_ptr(p).to_string_lossy().into_owned()
             } else {
+                // Fallback when SQLite does not provide an error message
                 "Unknown SQLite error".to_string()
             }
         }
