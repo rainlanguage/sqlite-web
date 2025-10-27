@@ -86,11 +86,12 @@ impl SQLiteDatabase {
         let ret = unsafe { sqlite3_prepare_v2(self.db, ptr, -1, &mut stmt, &mut tail) };
         if ret != SQLITE_OK {
             let msg = self.sqlite_errmsg();
-            return Err(if msg == "Unknown SQLite error" {
+            let detail = if msg == "Unknown SQLite error" {
                 format!("SQLite error code: {ret}")
             } else {
                 msg
-            });
+            };
+            return Err(format!("Failed to prepare statement: {detail}"));
         }
         Ok((if stmt.is_null() { None } else { Some(stmt) }, tail))
     }
