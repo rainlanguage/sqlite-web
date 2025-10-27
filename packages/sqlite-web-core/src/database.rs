@@ -85,6 +85,13 @@ impl SQLiteDatabase {
         let mut tail: *const i8 = std::ptr::null();
         let ret = unsafe { sqlite3_prepare_v2(self.db, ptr, -1, &mut stmt, &mut tail) };
         if ret != SQLITE_OK {
+            // If sqlite3_prepare_v2 returns an error, stmt may still be non-null.
+            // Finalize it to avoid leaking resources or retaining locks.
+            if !stmt.is_null() {
+                unsafe {
+                    let _ = sqlite3_finalize(stmt);
+                }
+            }
             let msg = self.sqlite_errmsg();
             let detail = if msg == "Unknown SQLite error" {
                 format!("SQLite error code: {ret}")
