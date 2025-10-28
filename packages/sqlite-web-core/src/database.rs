@@ -170,43 +170,57 @@ impl SQLiteDatabase {
 
     fn detect_placeholder_mode(&self, stmt: *mut sqlite3_stmt) -> Result<PlaceholderMode, String> {
         let param_count = unsafe { sqlite3_bind_parameter_count(stmt) } as usize;
-        let mut has_plain = false;
-        let mut has_numbered = false;
-        let mut has_named = false;
-        let mut numbered_max: usize = 0;
-        let mut numbered_present = std::collections::BTreeSet::new();
 
-        for i in 1..=param_count as i32 {
+        #[derive(Default)]
+        struct ParamAnalysis {
+            has_plain: bool,
+            has_numbered: bool,
+            has_named: bool,
+            numbered_max: usize,
+            numbered_present: std::collections::BTreeSet<usize>,
+        }
+
+        let ParamAnalysis {
+            has_plain,
+            has_numbered,
+            has_named,
+            numbered_max,
+            numbered_present,
+        } = (1..=param_count as i32).try_fold(ParamAnalysis::default(), |mut acc, i| {
             let name_ptr = unsafe { sqlite3_bind_parameter_name(stmt, i) };
             if name_ptr.is_null() {
-                has_plain = true;
-            } else {
-                let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
-                let s = name.as_ref();
-                if let Some(digits) = s.strip_prefix('?') {
-                    if digits.is_empty() {
-                        has_plain = true;
-                    } else if let Ok(n) = digits.parse::<isize>() {
-                        if n <= 0 {
-                            return Err(
-                                "Invalid parameter index: ?0 or negative indices are not allowed."
-                                    .to_string(),
-                            );
-                        }
-                        has_numbered = true;
-                        let n_u = n as usize;
-                        numbered_present.insert(n_u);
-                        if n_u > numbered_max {
-                            numbered_max = n_u;
-                        }
-                    } else {
-                        return Err(format!("Invalid parameter index: {}", s));
+                acc.has_plain = true;
+                return Ok(acc);
+            }
+
+            let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
+            let s = name.as_ref();
+
+            match s.strip_prefix('?') {
+                Some("") => {
+                    acc.has_plain = true;
+                }
+                Some(digits) => {
+                    let n = digits
+                        .parse::<isize>()
+                        .map_err(|_| format!("Invalid parameter index: {}", s))?;
+                    if n <= 0 {
+                        return Err(
+                            "Invalid parameter index: ?0 or negative indices are not allowed."
+                                .to_string(),
+                        );
                     }
-                } else {
-                    has_named = true; // :name/@name/$name not supported
+                    acc.has_numbered = true;
+                    let n_u = n as usize;
+                    acc.numbered_present.insert(n_u);
+                    acc.numbered_max = acc.numbered_max.max(n_u);
+                }
+                None => {
+                    acc.has_named = true;
                 }
             }
-        }
+            Ok(acc)
+        })?;
 
         if has_named {
             return Err("Named parameters not supported.".to_string());
@@ -231,31 +245,29 @@ impl SQLiteDatabase {
         params_len: usize,
     ) -> Result<(), String> {
         match mode {
-            PlaceholderMode::Plain { count } => {
-                if params_len != *count {
-                    return Err(format!(
-                        "Expected {} parameters but got {}.",
-                        count, params_len
-                    ));
-                }
-                Ok(())
+            PlaceholderMode::Plain { count } if params_len != *count => {
+                Err(format!(
+                    "Expected {count} parameters but got {params_len}."
+                ))
             }
+            PlaceholderMode::Plain { .. } => Ok(()),
             PlaceholderMode::Numbered { max, present } => {
-                for need in 1..=*max {
-                    if !present.contains(&need) {
-                        return Err(format!(
-                            "Missing parameter index ?{} in statement (indices must be continuous).",
-                            need
-                        ));
-                    }
-                }
-                if params_len != *max {
-                    return Err(format!(
-                        "Expected {} parameters but got {}.",
-                        max, params_len
-                    ));
-                }
-                Ok(())
+                (1..=*max)
+                    .find(|need| !present.contains(need))
+                    .map(|need| {
+                        Err(format!(
+                            "Missing parameter index ?{need} in statement (indices must be continuous)."
+                        ))
+                    })
+                    .unwrap_or_else(|| {
+                        if params_len != *max {
+                            Err(format!(
+                                "Expected {max} parameters but got {params_len}."
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    })
             }
         }
     }
@@ -266,36 +278,35 @@ impl SQLiteDatabase {
         mode: &PlaceholderMode,
     ) -> Result<Vec<usize>, String> {
         let param_count = unsafe { sqlite3_bind_parameter_count(stmt) } as usize;
-        let mut param_map: Vec<usize> = Vec::with_capacity(param_count);
-        for i in 1..=param_count as i32 {
-            let name_ptr = unsafe { sqlite3_bind_parameter_name(stmt, i) };
-            let target_index = if name_ptr.is_null() {
-                match mode {
-                    PlaceholderMode::Plain { .. } => (i as usize) - 1,
-                    PlaceholderMode::Numbered { .. } => {
-                        unreachable!("numbered placeholders never return null names")
+        let param_map: Vec<usize> = (1..=param_count as i32)
+            .map(|i| {
+                let name_ptr = unsafe { sqlite3_bind_parameter_name(stmt, i) };
+                if name_ptr.is_null() {
+                    match mode {
+                        PlaceholderMode::Plain { .. } => Ok((i as usize) - 1),
+                        PlaceholderMode::Numbered { .. } => {
+                            unreachable!("numbered placeholders never return null names")
+                        }
                     }
-                }
-            } else {
-                let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
-                let s = name.as_ref();
-                if let Some(stripped) = s.strip_prefix('?') {
-                    let n: usize = stripped
-                        .parse()
-                        .map_err(|_| format!("Invalid parameter index: {}", s))?;
-                    if n == 0 {
-                        return Err(
-                            "Invalid parameter index: ?0 or negative indices are not allowed."
-                                .to_string(),
-                        );
-                    }
-                    n - 1
                 } else {
-                    return Err("Named parameters not supported.".to_string());
+                    let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
+                    let s = name.as_ref();
+                    match s.strip_prefix('?') {
+                        Some(stripped) => {
+                            let n: usize = stripped
+                                .parse()
+                                .map_err(|_| format!("Invalid parameter index: {s}"))?;
+                            if n == 0 {
+                                Err("Invalid parameter index: ?0 or negative indices are not allowed.".to_string())
+                            } else {
+                                Ok(n - 1)
+                            }
+                        }
+                        None => Err("Named parameters not supported.".to_string())
+                    }
                 }
-            };
-            param_map.push(target_index);
-        }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(param_map)
     }
 
@@ -472,44 +483,30 @@ impl SQLiteDatabase {
         let rest = rest_c.to_bytes();
 
         // Simple scanner: skip whitespace and comments only
-        let mut i = 0usize;
-        while i < rest.len() {
-            match rest[i] {
-                b' ' | b'\t' | b'\r' | b'\n' => {
-                    i += 1;
+        let mut remaining = rest;
+        loop {
+            match remaining {
+                [] => return true,
+                [b' ' | b'\t' | b'\r' | b'\n', tail @ ..] => {
+                    remaining = tail;
                 }
-                b'-' => {
-                    if i + 1 < rest.len() && rest[i + 1] == b'-' {
-                        // line comment -- ... until newline
-                        i += 2;
-                        while i < rest.len() && rest[i] != b'\n' {
-                            i += 1;
-                        }
-                    } else {
-                        return false;
+                [b'-', b'-', tail @ ..] => {
+                    // line comment -- ... until newline
+                    match tail.iter().position(|&byte| byte == b'\n') {
+                        Some(pos) => remaining = &tail[pos..],
+                        None => return true, // comment to end of input
                     }
                 }
-                b'/' => {
-                    if i + 1 < rest.len() && rest[i + 1] == b'*' {
-                        // block comment /* ... */
-                        i += 2;
-                        while i + 1 < rest.len() && !(rest[i] == b'*' && rest[i + 1] == b'/') {
-                            i += 1;
-                        }
-                        if i + 1 < rest.len() {
-                            i += 2; // consume */
-                        } else {
-                            // unterminated comment: treat as non-trivia to be safe
-                            return false;
-                        }
-                    } else {
-                        return false;
+                [b'/', b'*', tail @ ..] => {
+                    // block comment /* ... */
+                    match tail.windows(2).position(|window| window == b"*/") {
+                        Some(pos) => remaining = &tail[pos + 2..],
+                        None => return false, // unterminated comment
                     }
                 }
                 _ => return false,
             }
         }
-        true
     }
 
     fn bind_params_for_stmt(
@@ -523,27 +520,25 @@ impl SQLiteDatabase {
         let param_map = self.build_param_map(stmt, &mode)?;
 
         // Keep owned buffers alive for text/blob while the statement executes
-        let mut buffers = BoundBuffers {
-            _texts: Vec::new(),
-            _blobs: Vec::new(),
-        };
-
         let param_count = unsafe { sqlite3_bind_parameter_count(stmt) } as usize;
-        for i in 1..=param_count as i32 {
-            let target_index = param_map[(i - 1) as usize];
-            let val = params.get(target_index).ok_or_else(|| {
-                format!(
-                    "Missing parameter value at index {} (0-based {})",
-                    target_index + 1,
-                    target_index
-                )
-            })?;
-
-            let kind = self.parse_json_param(target_index, val)?;
-            self.bind_param(stmt, i, &kind, &mut buffers)?;
-        }
-
-        Ok(buffers)
+        (1..=param_count as i32).try_fold(
+            BoundBuffers {
+                _texts: Vec::new(),
+                _blobs: Vec::new(),
+            },
+            |mut buffers, param_index| {
+                let target_index = param_map[(param_index - 1) as usize];
+                let val = params.get(target_index).ok_or_else(|| {
+                    format!(
+                        "Missing parameter value at index {} (0-based {target_index})",
+                        target_index + 1
+                    )
+                })?;
+                let kind = self.parse_json_param(target_index, val)?;
+                self.bind_param(stmt, param_index, &kind, &mut buffers)?;
+                Ok(buffers)
+            },
+        )
     }
 
     async fn exec_single_statement_with_params(
@@ -553,41 +548,37 @@ impl SQLiteDatabase {
     ) -> Result<(Option<Vec<serde_json::Value>>, i32), String> {
         let sql_cstr = CString::new(sql).map_err(|e| format!("Invalid SQL string: {e}"))?;
         let ptr = sql_cstr.as_ptr();
-
         let (stmt_opt, tail) = self.prepare_one(ptr)?;
-
-        if let Some(stmt) = stmt_opt {
-            let mut stmt_guard = StmtGuard::new(stmt);
-
+        let Some(stmt) = stmt_opt else {
             if !Self::is_trivia_tail_only(tail) {
                 return Err("Parameterized queries must contain a single statement.".to_string());
             }
-
-            let param_count = unsafe { sqlite3_bind_parameter_count(stmt) } as usize;
-            if param_count == 0 {
-                if !params.is_empty() {
-                    return Err(format!(
-                        "No parameters expected but {} provided.",
-                        params.len()
-                    ));
-                }
-                return self.exec_prepared_statement(stmt_guard.take());
-            }
-
-            let _buffers_guard = self.bind_params_for_stmt(stmt, &params)?;
-            self.exec_prepared_statement(stmt_guard.take())
-        } else if Self::is_trivia_tail_only(tail) {
             if !params.is_empty() {
                 return Err(format!(
-                    "No parameters expected but {} provided.",
-                    params.len()
+                    "No parameters expected but {params_len} provided.",
+                    params_len = params.len()
                 ));
             }
-            Ok((None, 0))
-        } else {
-            Err("Parameterized queries must contain a single statement.".to_string())
+            return Ok((None, 0));
+        };
+        let mut stmt_guard = StmtGuard::new(stmt);
+        if !Self::is_trivia_tail_only(tail) {
+            return Err("Parameterized queries must contain a single statement.".to_string());
         }
+        let param_count = unsafe { sqlite3_bind_parameter_count(stmt) } as usize;
+        if param_count == 0 {
+            if !params.is_empty() {
+                return Err(format!(
+                    "No parameters expected but {params_len} provided.",
+                    params_len = params.len()
+                ));
+            }
+            return self.exec_prepared_statement(stmt_guard.take());
+        }
+        let _buffers_guard = self.bind_params_for_stmt(stmt, &params)?;
+        self.exec_prepared_statement(stmt_guard.take())
     }
+
     pub async fn initialize_opfs(db_name: &str) -> Result<Self, JsValue> {
         // Install OPFS VFS and set as default
         install_opfs_sahpool(None, true)

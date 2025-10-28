@@ -62,55 +62,42 @@ fn make_query_result_message(result: Result<String, String>) -> Result<js_sys::O
 }
 
 fn handle_incoming_value(data: JsValue) {
+    let make_error_response = || {
+        let o = js_sys::Object::new();
+        let _ = set_js_property(&o, "type", &JsValue::from_str("query-result"));
+        let _ = set_js_property(&o, "result", &JsValue::NULL);
+        let _ = set_js_property(&o, "error", &JsValue::from_str("Failed to build response"));
+        o
+    };
+
+    let send_response = |response: &js_sys::Object| {
+        post_message(response)
+            .or_else(|err| send_worker_error(err).map_err(throw_val))
+            .ok();
+    };
     match serde_wasm_bindgen::from_value::<WorkerMessage>(data) {
         Ok(WorkerMessage::ExecuteQuery { sql, params }) => {
             WORKER_STATE.with(|s| {
-                if let Some(state) = s.borrow().as_ref() {
-                    let state = Rc::clone(state);
-                    spawn_local(async move {
-                        let response =
-                            make_query_result_message(state.execute_query(sql, params).await)
-                                .unwrap_or_else(|err| {
-                                    let _ = send_worker_error(err);
-                                    let o = js_sys::Object::new();
-                                    let _ = set_js_property(
-                                        &o,
-                                        "type",
-                                        &JsValue::from_str("query-result"),
-                                    );
-                                    let _ = set_js_property(&o, "result", &JsValue::NULL);
-                                    let _ = set_js_property(
-                                        &o,
-                                        "error",
-                                        &JsValue::from_str("Failed to build response"),
-                                    );
-                                    o
-                                });
-                        if let Err(err) = post_message(&response) {
-                            if let Err(send_err) = send_worker_error(err) {
-                                throw_val(send_err);
-                            }
-                        }
+                let Some(state) = s.borrow().as_ref().map(Rc::clone) else {
+                    return;
+                };
+                spawn_local(async move {
+                    let result = state.execute_query(sql, params).await;
+                    let response = make_query_result_message(result).unwrap_or_else(|err| {
+                        let _ = send_worker_error(err);
+                        make_error_response()
                     });
-                }
+                    send_response(&response);
+                });
             });
         }
         Err(err) => {
             let error_text = format!("Invalid worker message: {err:?}");
             let response = make_query_result_message(Err(error_text)).unwrap_or_else(|e| {
                 let _ = send_worker_error(e);
-                let o = js_sys::Object::new();
-                let _ = set_js_property(&o, "type", &JsValue::from_str("query-result"));
-                let _ = set_js_property(&o, "result", &JsValue::NULL);
-                let _ =
-                    set_js_property(&o, "error", &JsValue::from_str("Failed to build response"));
-                o
+                make_error_response()
             });
-            if let Err(err) = post_message(&response) {
-                if let Err(send_err) = send_worker_error(err) {
-                    throw_val(send_err);
-                }
-            }
+            send_response(&response);
         }
     }
 }

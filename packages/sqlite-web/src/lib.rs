@@ -62,35 +62,35 @@ fn handle_query_result_message(
     data: &JsValue,
     pending_queries: &Rc<RefCell<VecDeque<(js_sys::Function, js_sys::Function)>>>,
 ) {
-    if let Ok(obj) = js_sys::Reflect::get(data, &JsValue::from_str("type")) {
-        if let Some(msg_type) = obj.as_string() {
-            if msg_type == "query-result" {
-                if let Some((resolve, reject)) = pending_queries.borrow_mut().pop_front() {
-                    if let Ok(error) = js_sys::Reflect::get(data, &JsValue::from_str("error")) {
-                        if !error.is_null() && !error.is_undefined() {
-                            let error_str =
-                                error.as_string().unwrap_or_else(|| format!("{error:?}"));
-                            if let Err(_err) =
-                                reject.call1(&JsValue::NULL, &JsValue::from_str(&error_str))
-                            {
-                            }
-                            return;
-                        }
-                    }
+    let msg_type = js_sys::Reflect::get(data, &JsValue::from_str("type"))
+        .ok()
+        .and_then(|obj| obj.as_string());
 
-                    if let Ok(result) = js_sys::Reflect::get(data, &JsValue::from_str("result")) {
-                        if !result.is_null() && !result.is_undefined() {
-                            let result_str =
-                                result.as_string().unwrap_or_else(|| format!("{result:?}"));
-                            if let Err(_err) =
-                                resolve.call1(&JsValue::NULL, &JsValue::from_str(&result_str))
-                            {
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    let Some(msg_type) = msg_type else { return };
+    if msg_type != "query-result" {
+        return;
+    }
+
+    let Some((resolve, reject)) = pending_queries.borrow_mut().pop_front() else {
+        return;
+    };
+
+    let error = js_sys::Reflect::get(data, &JsValue::from_str("error"))
+        .ok()
+        .filter(|e| !e.is_null() && !e.is_undefined());
+
+    if let Some(error) = error {
+        let error_str = error.as_string().unwrap_or_else(|| format!("{error:?}"));
+        let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&error_str));
+        return;
+    }
+
+    if let Some(result) = js_sys::Reflect::get(data, &JsValue::from_str("result"))
+        .ok()
+        .filter(|r| !r.is_null() && !r.is_undefined())
+    {
+        let result_str = result.as_string().unwrap_or_else(|| format!("{result:?}"));
+        let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str(&result_str));
     }
 }
 
@@ -266,16 +266,11 @@ impl SQLiteWasmDatabase {
 
     fn normalize_params_js(params: &JsValue) -> Result<js_sys::Array, SQLiteWasmDatabaseError> {
         let arr = Self::ensure_array(params)?;
-
-        let normalized = js_sys::Array::new();
-        let len = arr.length();
-        for i in 0..len {
-            let v = arr.get(i);
-            let nv = normalize_one_param(&v, i)?;
+        (0..arr.length()).try_fold(js_sys::Array::new(), |normalized, i| {
+            let nv = normalize_one_param(&arr.get(i), i)?;
             normalized.push(&nv);
-        }
-
-        Ok(normalized)
+            Ok(normalized)
+        })
     }
 
     /// Execute a SQL query (optionally parameterized via JS Array)
