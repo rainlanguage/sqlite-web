@@ -2,7 +2,7 @@ use base64::Engine;
 use js_sys::Array;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::rc::Rc;
 use thiserror::Error;
 use wasm_bindgen::prelude::*;
@@ -29,7 +29,7 @@ fn create_worker_from_code(worker_code: &str) -> Result<Worker, JsValue> {
 
 fn install_onmessage_handler(
     worker: &Worker,
-    pending_queries: Rc<RefCell<VecDeque<(js_sys::Function, js_sys::Function)>>>,
+    pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>,
 ) {
     let pending_queries_clone = Rc::clone(&pending_queries);
     let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
@@ -60,7 +60,7 @@ fn handle_worker_control_message(data: &JsValue) -> bool {
 
 fn handle_query_result_message(
     data: &JsValue,
-    pending_queries: &Rc<RefCell<VecDeque<(js_sys::Function, js_sys::Function)>>>,
+    pending_queries: &Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>,
 ) {
     let msg_type = js_sys::Reflect::get(data, &JsValue::from_str("type"))
         .ok()
@@ -71,7 +71,12 @@ fn handle_query_result_message(
         return;
     }
 
-    let Some((resolve, reject)) = pending_queries.borrow_mut().pop_front() else {
+    // Lookup by requestId
+    let req_id_js = js_sys::Reflect::get(data, &JsValue::from_str("requestId")).ok();
+    let req_id = req_id_js.and_then(|v| v.as_f64()).map(|n| n as u32);
+    let Some(request_id) = req_id else { return };
+    let entry = pending_queries.borrow_mut().remove(&request_id);
+    let Some((resolve, reject)) = entry else {
         return;
     };
 
@@ -163,7 +168,8 @@ fn normalize_one_param(v: &JsValue, index: u32) -> Result<JsValue, SQLiteWasmDat
 #[wasm_bindgen]
 pub struct SQLiteWasmDatabase {
     worker: Worker,
-    pending_queries: Rc<RefCell<VecDeque<(js_sys::Function, js_sys::Function)>>>,
+    pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>,
+    next_request_id: Rc<RefCell<u32>>,
 }
 
 impl Serialize for SQLiteWasmDatabase {
@@ -254,13 +260,15 @@ impl SQLiteWasmDatabase {
         let worker_code = generate_self_contained_worker(db_name);
         let worker = create_worker_from_code(&worker_code)?;
 
-        let pending_queries: Rc<RefCell<VecDeque<(js_sys::Function, js_sys::Function)>>> =
-            Rc::new(RefCell::new(VecDeque::new()));
+        let pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>> =
+            Rc::new(RefCell::new(HashMap::new()));
         install_onmessage_handler(&worker, Rc::clone(&pending_queries));
+        let next_request_id = Rc::new(RefCell::new(1u32));
 
         Ok(SQLiteWasmDatabase {
             worker,
             pending_queries,
+            next_request_id,
         })
     }
 
@@ -296,6 +304,19 @@ impl SQLiteWasmDatabase {
             &JsValue::from_str("execute-query"),
         )
         .map_err(SQLiteWasmDatabaseError::JsError)?;
+        // Generate requestId and attach
+        let request_id = {
+            let mut n = self.next_request_id.borrow_mut();
+            let id = *n;
+            *n = n.wrapping_add(1).max(1); // keep non-zero
+            id
+        };
+        js_sys::Reflect::set(
+            &message,
+            &JsValue::from_str("requestId"),
+            &JsValue::from_f64(request_id as f64),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
         js_sys::Reflect::set(
             &message,
             &JsValue::from_str("sql"),
@@ -310,10 +331,13 @@ impl SQLiteWasmDatabase {
 
         // Create the Promise that will resolve/reject when the worker responds
         // Attempt to post the message first; only track callbacks on success.
+        let rid_for_insert = request_id;
         let promise =
             js_sys::Promise::new(&mut |resolve, reject| match worker.post_message(&message) {
                 Ok(()) => {
-                    pending_queries.borrow_mut().push_back((resolve, reject));
+                    pending_queries
+                        .borrow_mut()
+                        .insert(rid_for_insert, (resolve, reject));
                 }
                 Err(err) => {
                     let _ = reject.call1(&JsValue::NULL, &err);

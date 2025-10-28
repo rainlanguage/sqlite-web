@@ -45,9 +45,17 @@ fn post_message(obj: &js_sys::Object) -> Result<(), JsValue> {
     worker_scope.post_message(obj.as_ref())
 }
 
-fn make_query_result_message(result: Result<String, String>) -> Result<js_sys::Object, JsValue> {
+fn make_query_result_message(
+    request_id: u32,
+    result: Result<String, String>,
+) -> Result<js_sys::Object, JsValue> {
     let response = js_sys::Object::new();
     set_js_property(&response, "type", &JsValue::from_str("query-result"))?;
+    set_js_property(
+        &response,
+        "requestId",
+        &JsValue::from_f64(request_id as f64),
+    )?;
     match result {
         Ok(res) => {
             set_js_property(&response, "result", &JsValue::from_str(&res))?;
@@ -76,24 +84,37 @@ fn handle_incoming_value(data: JsValue) {
             .ok();
     };
     match serde_wasm_bindgen::from_value::<WorkerMessage>(data) {
-        Ok(WorkerMessage::ExecuteQuery { sql, params }) => {
+        Ok(WorkerMessage::ExecuteQuery {
+            request_id,
+            sql,
+            params,
+        }) => {
             WORKER_STATE.with(|s| {
                 let Some(state) = s.borrow().as_ref().map(Rc::clone) else {
                     return;
                 };
                 spawn_local(async move {
                     let result = state.execute_query(sql, params).await;
-                    let response = make_query_result_message(result).unwrap_or_else(|err| {
-                        let _ = send_worker_error(err);
-                        make_error_response()
-                    });
+                    let response =
+                        make_query_result_message(request_id, result).unwrap_or_else(|err| {
+                            let _ = send_worker_error(err);
+                            make_error_response()
+                        });
                     send_response(&response);
                 });
             });
         }
         Err(err) => {
             let error_text = format!("Invalid worker message: {err:?}");
-            let response = make_query_result_message(Err(error_text)).unwrap_or_else(|e| {
+            // No requestId available here; send error without it
+            let response = (|| {
+                let o = js_sys::Object::new();
+                set_js_property(&o, "type", &JsValue::from_str("query-result"))?;
+                set_js_property(&o, "result", &JsValue::NULL)?;
+                set_js_property(&o, "error", &JsValue::from_str(&error_text))?;
+                Ok(o)
+            })()
+            .unwrap_or_else(|e| {
                 let _ = send_worker_error(e);
                 make_error_response()
             });
