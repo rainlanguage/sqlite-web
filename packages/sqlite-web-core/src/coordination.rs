@@ -4,12 +4,13 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::BroadcastChannel;
 
 use crate::database::SQLiteDatabase;
 use crate::messages::{ChannelMessage, PendingQuery};
-use crate::util::sanitize_identifier;
+use crate::util::{js_value_to_string, sanitize_identifier, set_js_property};
 
 // Worker state
 pub struct WorkerState {
@@ -19,6 +20,24 @@ pub struct WorkerState {
     pub channel: BroadcastChannel,
     pub db_name: String,
     pub pending_queries: Rc<RefCell<HashMap<String, PendingQuery>>>,
+}
+
+fn reflect_get(target: &JsValue, key: &str) -> Result<JsValue, JsValue> {
+    Reflect::get(target, &JsValue::from_str(key))
+}
+
+fn send_channel_message(
+    channel: &BroadcastChannel,
+    message: &ChannelMessage,
+) -> Result<(), String> {
+    let value = serde_wasm_bindgen::to_value(message)
+        .map_err(|err| format!("Failed to serialize channel message: {err:?}"))?;
+    channel.post_message(&value).map_err(|err| {
+        format!(
+            "Failed to post channel message: {}",
+            js_value_to_string(&err)
+        )
+    })
 }
 
 impl WorkerState {
@@ -58,7 +77,7 @@ impl WorkerState {
         })
     }
 
-    pub fn setup_channel_listener(&self) {
+    pub fn setup_channel_listener(&self) -> Result<(), JsValue> {
         let is_leader = Rc::clone(&self.is_leader);
         let db = Rc::clone(&self.db);
         let pending_queries = Rc::clone(&self.pending_queries);
@@ -66,75 +85,18 @@ impl WorkerState {
 
         let onmessage = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
             let data = event.data();
-
             if let Ok(msg) = serde_wasm_bindgen::from_value::<ChannelMessage>(data) {
-                match msg {
-                    ChannelMessage::QueryRequest { query_id, sql } => {
-                        if *is_leader.borrow() {
-                            let db = Rc::clone(&db);
-                            let channel = channel.clone();
-
-                            spawn_local(async move {
-                                let result = {
-                                    // Extract database temporarily to avoid holding RefCell across await
-                                    let db_opt = db.borrow_mut().take();
-                                    match db_opt {
-                                        Some(mut database) => {
-                                            let result = database.exec(&sql).await;
-                                            // Put the database back
-                                            *db.borrow_mut() = Some(database);
-                                            result
-                                        }
-                                        None => Err("Database not initialized".to_string()),
-                                    }
-                                };
-
-                                let response = match result {
-                                    Ok(res) => ChannelMessage::QueryResponse {
-                                        query_id,
-                                        result: Some(res),
-                                        error: None,
-                                    },
-                                    Err(err) => ChannelMessage::QueryResponse {
-                                        query_id,
-                                        result: None,
-                                        error: Some(err),
-                                    },
-                                };
-
-                                let msg_js = serde_wasm_bindgen::to_value(&response).unwrap();
-                                let _ = channel.post_message(&msg_js);
-                            });
-                        }
-                    }
-                    ChannelMessage::QueryResponse {
-                        query_id,
-                        result,
-                        error,
-                    } => {
-                        if let Some(pending) = pending_queries.borrow_mut().remove(&query_id) {
-                            if let Some(err) = error {
-                                let _ = pending
-                                    .reject
-                                    .call1(&JsValue::NULL, &JsValue::from_str(&err));
-                            } else if let Some(res) = result {
-                                let _ = pending
-                                    .resolve
-                                    .call1(&JsValue::NULL, &JsValue::from_str(&res));
-                            }
-                        }
-                    }
-                    ChannelMessage::NewLeader { leader_id: _ } => {}
-                }
+                handle_channel_message(&is_leader, &db, &channel, &pending_queries, msg);
             }
         }) as Box<dyn FnMut(web_sys::MessageEvent)>);
 
         self.channel
             .set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
+        Ok(())
     }
 
-    pub async fn attempt_leadership(&self) {
+    pub async fn attempt_leadership(&self) -> Result<(), JsValue> {
         let worker_id = self.worker_id.clone();
         let is_leader = Rc::clone(&self.is_leader);
         let db = Rc::clone(&self.db);
@@ -143,16 +105,11 @@ impl WorkerState {
 
         // Get navigator.locks from WorkerGlobalScope
         let global = js_sys::global();
-        let navigator = Reflect::get(&global, &JsValue::from_str("navigator")).unwrap();
-        let locks = Reflect::get(&navigator, &JsValue::from_str("locks")).unwrap();
+        let navigator = reflect_get(&global, "navigator")?;
+        let locks = reflect_get(&navigator, "locks")?;
 
         let options = Object::new();
-        Reflect::set(
-            &options,
-            &JsValue::from_str("mode"),
-            &JsValue::from_str("exclusive"),
-        )
-        .unwrap();
+        set_js_property(&options, "mode", &JsValue::from_str("exclusive"))?;
 
         let handler = Closure::once(move |_lock: JsValue| -> Promise {
             *is_leader.borrow_mut() = true;
@@ -170,8 +127,14 @@ impl WorkerState {
                         let msg = ChannelMessage::NewLeader {
                             leader_id: worker_id.clone(),
                         };
-                        let msg_js = serde_wasm_bindgen::to_value(&msg).unwrap();
-                        let _ = channel.post_message(&msg_js);
+                        if let Err(err_msg) = send_channel_message(&channel, &msg) {
+                            let fallback = ChannelMessage::QueryResponse {
+                                query_id: worker_id.clone(),
+                                result: None,
+                                error: Some(err_msg),
+                            };
+                            let _ = send_channel_message(&channel, &fallback);
+                        }
                     }
                     Err(_e) => {}
                 }
@@ -181,33 +144,30 @@ impl WorkerState {
             Promise::new(&mut |_, _| {})
         });
 
-        let request_fn = Reflect::get(&locks, &JsValue::from_str("request")).unwrap();
-        let request_fn = request_fn.dyn_ref::<Function>().unwrap();
+        let request_fn = reflect_get(&locks, "request")?;
+        let request_fn = request_fn
+            .dyn_ref::<Function>()
+            .ok_or_else(|| JsValue::from_str("navigator.locks.request is not a function"))?;
 
         let lock_id: String = format!("sqlite-database-{}", sanitize_identifier(&self.db_name));
-        let _ = request_fn.call3(
+        request_fn.call3(
             &locks,
             &JsValue::from_str(&lock_id),
             &options,
             handler.as_ref().unchecked_ref(),
-        );
+        )?;
 
         handler.forget();
+        Ok(())
     }
 
-    pub async fn execute_query(&self, sql: String) -> Result<String, String> {
+    pub async fn execute_query(
+        &self,
+        sql: String,
+        params: Option<Vec<serde_json::Value>>,
+    ) -> Result<String, String> {
         if *self.is_leader.borrow() {
-            // Extract database temporarily to avoid holding RefCell across await
-            let db_opt = self.db.borrow_mut().take();
-            match db_opt {
-                Some(mut database) => {
-                    let result = database.exec(&sql).await;
-                    // Put the database back
-                    *self.db.borrow_mut() = Some(database);
-                    result
-                }
-                None => Err("Database not initialized".to_string()),
-            }
+            exec_on_db(Rc::clone(&self.db), sql, params).await
         } else {
             let query_id = Uuid::new_v4().to_string();
 
@@ -217,36 +177,13 @@ impl WorkerState {
                     .insert(query_id.clone(), PendingQuery { resolve, reject });
             });
 
-            let msg = ChannelMessage::QueryRequest {
-                query_id: query_id.clone(),
-                sql,
-            };
-            let msg_js = serde_wasm_bindgen::to_value(&msg).unwrap();
-            let _ = self.channel.post_message(&msg_js);
+            post_query_request(&self.channel, &query_id, sql, params)?;
 
-            // Timeout handling
-            let timeout_promise = Promise::new(&mut |_, reject| {
-                let query_id = query_id.clone();
-                let pending_queries = Rc::clone(&self.pending_queries);
-
-                let callback = Closure::once(move || {
-                    if pending_queries.borrow_mut().remove(&query_id).is_some() {
-                        let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("Query timeout"));
-                    }
-                });
-
-                let global = js_sys::global();
-                let set_timeout = Reflect::get(&global, &JsValue::from_str("setTimeout")).unwrap();
-                let set_timeout = set_timeout.dyn_ref::<Function>().unwrap();
-                set_timeout
-                    .call2(
-                        &JsValue::NULL,
-                        callback.as_ref().unchecked_ref(),
-                        &JsValue::from_f64(5000.0),
-                    )
-                    .unwrap();
-                callback.forget();
-            });
+            let timeout_promise = schedule_timeout_promise(
+                Rc::clone(&self.pending_queries),
+                query_id.clone(),
+                5000.0,
+            );
 
             let result = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::race(
                 &js_sys::Array::of2(&promise, &timeout_promise),
@@ -254,20 +191,155 @@ impl WorkerState {
             .await;
 
             match result {
-                Ok(val) => {
-                    if let Some(s) = val.as_string() {
-                        Ok(s)
-                    } else {
-                        Err("Invalid response".to_string())
-                    }
-                }
+                Ok(val) => val
+                    .as_string()
+                    .ok_or_else(|| "Invalid response".to_string()),
                 Err(e) => Err(format!("{e:?}")),
             }
         }
     }
 }
 
-#[cfg(test)]
+fn handle_channel_message(
+    is_leader: &Rc<RefCell<bool>>,
+    db: &Rc<RefCell<Option<SQLiteDatabase>>>,
+    channel: &BroadcastChannel,
+    pending_queries: &Rc<RefCell<HashMap<String, PendingQuery>>>,
+    msg: ChannelMessage,
+) {
+    match msg {
+        ChannelMessage::QueryRequest {
+            query_id,
+            sql,
+            params,
+        } => {
+            if *is_leader.borrow() {
+                let db = Rc::clone(db);
+                let channel = channel.clone();
+                spawn_local(async move {
+                    let result = exec_on_db(db, sql, params).await;
+                    let response = build_query_response(query_id.clone(), result);
+                    if let Err(err_msg) = send_channel_message(&channel, &response) {
+                        let fallback = ChannelMessage::QueryResponse {
+                            query_id: query_id.clone(),
+                            result: None,
+                            error: Some(err_msg),
+                        };
+                        let _ = send_channel_message(&channel, &fallback);
+                    }
+                });
+            }
+        }
+        ChannelMessage::QueryResponse {
+            query_id,
+            result,
+            error,
+        } => handle_query_response(pending_queries, query_id, result, error),
+        ChannelMessage::NewLeader { leader_id: _ } => {}
+    }
+}
+
+fn build_query_response(query_id: String, result: Result<String, String>) -> ChannelMessage {
+    match result {
+        Ok(res) => ChannelMessage::QueryResponse {
+            query_id,
+            result: Some(res),
+            error: None,
+        },
+        Err(err) => ChannelMessage::QueryResponse {
+            query_id,
+            result: None,
+            error: Some(err),
+        },
+    }
+}
+
+fn handle_query_response(
+    pending_queries: &Rc<RefCell<HashMap<String, PendingQuery>>>,
+    query_id: String,
+    result: Option<String>,
+    error: Option<String>,
+) {
+    if let Some(pending) = pending_queries.borrow_mut().remove(&query_id) {
+        if let Some(err) = error {
+            let _ = pending
+                .reject
+                .call1(&JsValue::NULL, &JsValue::from_str(&err));
+        } else if let Some(res) = result {
+            let _ = pending
+                .resolve
+                .call1(&JsValue::NULL, &JsValue::from_str(&res));
+        }
+    }
+}
+
+async fn exec_on_db(
+    db: Rc<RefCell<Option<SQLiteDatabase>>>,
+    sql: String,
+    params: Option<Vec<serde_json::Value>>,
+) -> Result<String, String> {
+    let db_opt = db.borrow_mut().take();
+    let result = match db_opt {
+        Some(mut database) => {
+            let result = match params {
+                Some(p) => database.exec_with_params(&sql, p).await,
+                None => database.exec(&sql).await,
+            };
+            *db.borrow_mut() = Some(database);
+            result
+        }
+        None => Err("Database not initialized".to_string()),
+    };
+    result
+}
+
+fn post_query_request(
+    channel: &BroadcastChannel,
+    query_id: &str,
+    sql: String,
+    params: Option<Vec<serde_json::Value>>,
+) -> Result<(), String> {
+    let msg = ChannelMessage::QueryRequest {
+        query_id: query_id.to_string(),
+        sql,
+        params,
+    };
+    let msg_js = serde_wasm_bindgen::to_value(&msg)
+        .map_err(|e| format!("Failed to serialize query request: {e:?}"))?;
+    channel
+        .post_message(&msg_js)
+        .map_err(|e| format!("Failed to post query request: {e:?}"))
+}
+
+fn schedule_timeout_promise(
+    pending_queries: Rc<RefCell<HashMap<String, PendingQuery>>>,
+    query_id: String,
+    ms: f64,
+) -> Promise {
+    Promise::new(&mut move |_, reject| {
+        let query_id = query_id.clone();
+        let pending_queries = Rc::clone(&pending_queries);
+        let callback = Closure::once(move || {
+            if pending_queries.borrow_mut().remove(&query_id).is_some() {
+                let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("Query timeout"));
+            }
+        });
+
+        let global = js_sys::global();
+        if let Ok(set_timeout_value) = reflect_get(&global, "setTimeout") {
+            if let Some(set_timeout_fn) = set_timeout_value.dyn_ref::<Function>() {
+                let _ = set_timeout_fn.call2(
+                    &JsValue::NULL,
+                    callback.as_ref().unchecked_ref(),
+                    &JsValue::from_f64(ms),
+                );
+            }
+        }
+        callback.forget();
+    })
+}
+
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use js_sys::Function;
@@ -404,7 +476,7 @@ mod tests {
             ];
 
             for query in test_queries {
-                let result = leader_state.execute_query(query.to_string()).await;
+                let result = leader_state.execute_query(query.to_string(), None).await;
                 match result {
                     Err(msg) => assert_eq!(
                         msg, "Database not initialized",
@@ -425,7 +497,9 @@ mod tests {
                 "Should start as follower"
             );
 
-            let result = follower_state.execute_query("SELECT 1".to_string()).await;
+            let result = follower_state
+                .execute_query("SELECT 1".to_string(), None)
+                .await;
             match result {
                 Err(msg) => assert!(
                     msg.contains("timeout") || msg.contains("Query timeout"),
@@ -440,7 +514,10 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_setup_channel_listener() {
         if let Ok(state) = WorkerState::new() {
-            state.setup_channel_listener();
+            assert!(
+                state.setup_channel_listener().is_ok(),
+                "setup_channel_listener should succeed"
+            );
         }
     }
 
@@ -453,7 +530,7 @@ mod tests {
                 "Database should be uninitialized"
             );
 
-            state.attempt_leadership().await;
+            let _ = state.attempt_leadership().await;
         }
 
         let workers: Vec<_> = (0..3).filter_map(|_| WorkerState::new().ok()).collect();
@@ -463,7 +540,7 @@ mod tests {
             }
 
             for worker in &workers {
-                worker.attempt_leadership().await;
+                let _ = worker.attempt_leadership().await;
             }
         }
     }

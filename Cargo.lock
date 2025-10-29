@@ -4070,7 +4070,7 @@ dependencies = [
 
 [[package]]
 name = "sqlite-web"
-version = "0.0.1-alpha.4"
+version = "0.0.1-alpha.6"
 dependencies = [
  "base64 0.21.7",
  "js-sys",
@@ -4086,9 +4086,10 @@ dependencies = [
 
 [[package]]
 name = "sqlite-web-core"
-version = "0.0.1-alpha.4"
+version = "0.0.1-alpha.6"
 dependencies = [
  "alloy",
+ "base64 0.21.7",
  "console_error_panic_hook",
  "js-sys",
  "rain-math-float",

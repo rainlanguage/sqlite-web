@@ -345,7 +345,7 @@ describe('Basic Database Operations', () => {
 		it('should handle INTEGER types correctly', async () => {
 			await db.query(`
 				INSERT INTO type_test (int_col) VALUES 
-				(42), (-1), (0), (9223372036854775807)
+				(42), (-1), (0), (9007199254740991) -- Number.MAX_SAFE_INTEGER
 			`);
 			
 			const result = await db.query('SELECT int_col FROM type_test ORDER BY int_col');
@@ -355,7 +355,7 @@ describe('Basic Database Operations', () => {
 			expect(data[0].int_col).toBe(-1);
 			expect(data[1].int_col).toBe(0);
 			expect(data[2].int_col).toBe(42);
-			expect(data[3].int_col).toBe(9223372036854775807);
+			expect(data[3].int_col).toBe(9007199254740991);
 		});
 
 		it('should handle REAL types correctly', async () => {

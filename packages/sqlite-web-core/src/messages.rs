@@ -15,6 +15,9 @@ pub enum ChannelMessage {
         #[serde(rename = "queryId")]
         query_id: String,
         sql: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        params: Option<Vec<serde_json::Value>>,
     },
     #[serde(rename = "query-response")]
     QueryResponse {
@@ -30,7 +33,14 @@ pub enum ChannelMessage {
 #[serde(tag = "type")]
 pub enum WorkerMessage {
     #[serde(rename = "execute-query")]
-    ExecuteQuery { sql: String },
+    ExecuteQuery {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        sql: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        params: Option<Vec<serde_json::Value>>,
+    },
 }
 
 // Messages to main thread
@@ -39,6 +49,8 @@ pub enum WorkerMessage {
 pub enum MainThreadMessage {
     #[serde(rename = "query-result")]
     QueryResult {
+        #[serde(rename = "requestId")]
+        request_id: u32,
         result: Option<String>,
         error: Option<String>,
     },
@@ -51,7 +63,7 @@ pub struct PendingQuery {
     pub reject: Function,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use wasm_bindgen_test::*;
@@ -85,6 +97,7 @@ mod tests {
         let query_request = ChannelMessage::QueryRequest {
             query_id: "query-456".to_string(),
             sql: "SELECT * FROM users".to_string(),
+            params: None,
         };
         assert_serialization_roundtrip(query_request, "query-request", |json| {
             assert!(json.contains("\"queryId\":\"query-456\""));
@@ -116,7 +129,9 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_worker_message_execute_query_serialization() {
         let msg = WorkerMessage::ExecuteQuery {
+            request_id: 42,
             sql: "INSERT INTO table VALUES (1, 'test')".to_string(),
+            params: None,
         };
 
         let json = serde_json::to_string(&msg).expect("Should serialize");
@@ -125,8 +140,11 @@ mod tests {
 
         let deserialized: WorkerMessage = serde_json::from_str(&json).expect("Should deserialize");
         match deserialized {
-            WorkerMessage::ExecuteQuery { sql } => {
+            WorkerMessage::ExecuteQuery {
+                sql, request_id, ..
+            } => {
                 assert_eq!(sql, "INSERT INTO table VALUES (1, 'test')");
+                assert_eq!(request_id, 42);
             }
         }
     }
@@ -134,21 +152,25 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_main_thread_messages_serialization() {
         let success_result = MainThreadMessage::QueryResult {
+            request_id: 7,
             result: Some("Success".to_string()),
             error: None,
         };
         assert_serialization_roundtrip(success_result, "query-result", |json| {
             assert!(json.contains("\"result\":\"Success\""));
             assert!(json.contains("\"error\":null"));
+            assert!(json.contains("\"requestId\":7"));
         });
 
         let error_result = MainThreadMessage::QueryResult {
+            request_id: 8,
             result: None,
             error: Some("Database error".to_string()),
         };
         assert_serialization_roundtrip(error_result, "query-result", |json| {
             assert!(json.contains("\"error\":\"Database error\""));
             assert!(json.contains("\"result\":null"));
+            assert!(json.contains("\"requestId\":8"));
         });
 
         let worker_ready = MainThreadMessage::WorkerReady;
@@ -167,6 +189,7 @@ mod tests {
         let empty_sql = ChannelMessage::QueryRequest {
             query_id: "test".to_string(),
             sql: String::new(),
+            params: None,
         };
         assert_serialization_roundtrip(empty_sql, "query-request", |json| {
             assert!(json.contains("\"sql\":\"\""));
@@ -175,6 +198,7 @@ mod tests {
         let special_chars = ChannelMessage::QueryRequest {
             query_id: "query\"with\"quotes".to_string(),
             sql: "SELECT 'test\nwith\nnewlines'".to_string(),
+            params: None,
         };
         assert_serialization_roundtrip(special_chars, "query-request", |_| {});
     }

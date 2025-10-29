@@ -3,6 +3,7 @@ use rain_math_float::Float;
 
 const FLOAT_SUM_ARG_ERROR_MESSAGE: &[u8] = b"FLOAT_SUM() requires exactly 1 argument\0";
 const FLOAT_SUM_CONTEXT_ERROR_MESSAGE: &[u8] = b"Failed to allocate aggregate context\0";
+const FLOAT_SUM_ZERO_HEX_ERROR_MESSAGE: &[u8] = b"Zero hex string contained interior NUL\0";
 
 pub struct FloatSumContext {
     total: Float,
@@ -105,16 +106,26 @@ pub(crate) unsafe extern "C" fn float_sum_final(context: *mut sqlite3_context) {
     if aggregate_context.is_null() {
         // No rows were processed; surface the canonical zero hex string derived from Float::default().
         let zero_hex = Float::default().as_hex();
-        let zero_result = CString::new(zero_hex).unwrap();
-        sqlite3_result_text(
-            context,
-            zero_result.as_ptr(),
-            zero_result.as_bytes().len() as c_int,
-            Some(std::mem::transmute::<
-                isize,
-                unsafe extern "C" fn(*mut std::ffi::c_void),
-            >(-1isize)),
-        );
+        match CString::new(zero_hex) {
+            Ok(zero_result) => {
+                sqlite3_result_text(
+                    context,
+                    zero_result.as_ptr(),
+                    zero_result.as_bytes().len() as c_int,
+                    Some(std::mem::transmute::<
+                        isize,
+                        unsafe extern "C" fn(*mut std::ffi::c_void),
+                    >(-1isize)),
+                );
+            }
+            Err(_) => {
+                sqlite3_result_error(
+                    context,
+                    FLOAT_SUM_ZERO_HEX_ERROR_MESSAGE.as_ptr() as *const c_char,
+                    -1,
+                );
+            }
+        }
         return;
     }
 
@@ -152,7 +163,7 @@ pub(crate) unsafe extern "C" fn float_sum_final(context: *mut sqlite3_context) {
     std::ptr::drop_in_place(sum_context);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use wasm_bindgen_test::*;

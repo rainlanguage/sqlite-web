@@ -188,7 +188,9 @@ export async function cleanupDatabase(db: SQLiteWasmDatabase): Promise<void> {
 			// Multi-SQL commands (UI) test tables
 			'multi_ui', 'semi_ui', 'gate_ui', 'trg_src_ui', 'trg_log_ui',
 			// Database function test tables
-			'bigint_test', 'categories', 'float_test', 'float_categories', 'float_zero_usage', 'float_zero_defaults', 'float_is_zero_test'
+			'bigint_test', 'categories', 'float_test', 'float_categories', 'float_zero_usage', 'float_zero_defaults', 'float_is_zero_test',
+			// Parameter binding test tables
+			'param_test', 'param_types', 'param_blob', 'params_leader_test'
 		];
 		for (const table of tables) {
 			try {

@@ -2,14 +2,125 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::throw_val;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
 use crate::coordination::WorkerState;
+use crate::messages::WorkerMessage;
+use crate::util::{js_value_to_string, set_js_property};
 
 // Global state
 thread_local! {
     static WORKER_STATE: RefCell<Option<Rc<WorkerState>>> = const { RefCell::new(None) };
+}
+
+fn send_worker_error_message(message: &str) -> Result<(), JsValue> {
+    let error_object = js_sys::Object::new();
+    set_js_property(
+        error_object.as_ref(),
+        "type",
+        &JsValue::from_str("worker-error"),
+    )?;
+    set_js_property(error_object.as_ref(), "error", &JsValue::from_str(message))?;
+    let global = js_sys::global();
+    let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
+    worker_scope.post_message(error_object.as_ref())
+}
+
+fn send_worker_error(err: JsValue) -> Result<(), JsValue> {
+    let message = js_value_to_string(&err);
+    send_worker_error_message(&message).map_err(|post_err| {
+        JsValue::from_str(&format!(
+            "Failed to deliver worker error '{message}': {}",
+            js_value_to_string(&post_err)
+        ))
+    })
+}
+
+fn post_message(obj: &js_sys::Object) -> Result<(), JsValue> {
+    let global = js_sys::global();
+    let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
+    worker_scope.post_message(obj.as_ref())
+}
+
+fn make_query_result_message(
+    request_id: u32,
+    result: Result<String, String>,
+) -> Result<js_sys::Object, JsValue> {
+    let response = js_sys::Object::new();
+    set_js_property(&response, "type", &JsValue::from_str("query-result"))?;
+    set_js_property(
+        &response,
+        "requestId",
+        &JsValue::from_f64(request_id as f64),
+    )?;
+    match result {
+        Ok(res) => {
+            set_js_property(&response, "result", &JsValue::from_str(&res))?;
+            set_js_property(&response, "error", &JsValue::NULL)?;
+        }
+        Err(err) => {
+            set_js_property(&response, "result", &JsValue::NULL)?;
+            set_js_property(&response, "error", &JsValue::from_str(&err))?;
+        }
+    }
+    Ok(response)
+}
+
+fn handle_incoming_value(data: JsValue) {
+    let make_error_response = || {
+        let o = js_sys::Object::new();
+        let _ = set_js_property(&o, "type", &JsValue::from_str("query-result"));
+        let _ = set_js_property(&o, "result", &JsValue::NULL);
+        let _ = set_js_property(&o, "error", &JsValue::from_str("Failed to build response"));
+        o
+    };
+
+    let send_response = |response: &js_sys::Object| {
+        post_message(response)
+            .or_else(|err| send_worker_error(err).map_err(throw_val))
+            .ok();
+    };
+    match serde_wasm_bindgen::from_value::<WorkerMessage>(data) {
+        Ok(WorkerMessage::ExecuteQuery {
+            request_id,
+            sql,
+            params,
+        }) => {
+            WORKER_STATE.with(|s| {
+                let Some(state) = s.borrow().as_ref().map(Rc::clone) else {
+                    return;
+                };
+                spawn_local(async move {
+                    let result = state.execute_query(sql, params).await;
+                    let response =
+                        make_query_result_message(request_id, result).unwrap_or_else(|err| {
+                            let _ = send_worker_error(err);
+                            make_error_response()
+                        });
+                    send_response(&response);
+                });
+            });
+        }
+        Err(err) => {
+            let error_text = format!("Invalid worker message: {err:?}");
+            // No requestId available here; send error without it
+            let response = (|| {
+                let o = js_sys::Object::new();
+                set_js_property(&o, "type", &JsValue::from_str("query-result"))?;
+                set_js_property(&o, "result", &JsValue::NULL)?;
+                set_js_property(&o, "error", &JsValue::from_str(&error_text))?;
+                Ok(o)
+            })()
+            .unwrap_or_else(|e| {
+                let _ = send_worker_error(e);
+                make_error_response()
+            });
+            send_response(&response);
+        }
+    }
 }
 
 /// Entry point for the worker - called from the blob
@@ -18,11 +129,15 @@ pub fn main() -> Result<(), JsValue> {
 
     let state = Rc::new(WorkerState::new()?);
 
-    state.setup_channel_listener();
+    state.setup_channel_listener()?;
 
     let state_clone = Rc::clone(&state);
     spawn_local(async move {
-        state_clone.attempt_leadership().await;
+        if let Err(err) = state_clone.attempt_leadership().await {
+            if let Err(send_err) = send_worker_error(err) {
+                throw_val(send_err);
+            }
+        }
     });
 
     WORKER_STATE.with(|s| {
@@ -35,71 +150,7 @@ pub fn main() -> Result<(), JsValue> {
 
     let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
         let data = event.data();
-
-        // Parse JavaScript message directly
-        if let Ok(msg_type) = js_sys::Reflect::get(&data, &JsValue::from_str("type")) {
-            if let Some(type_str) = msg_type.as_string() {
-                if type_str == "execute-query" {
-                    if let Ok(sql_val) = js_sys::Reflect::get(&data, &JsValue::from_str("sql")) {
-                        if let Some(sql) = sql_val.as_string() {
-                            WORKER_STATE.with(|s| {
-                                if let Some(state) = s.borrow().as_ref() {
-                                    let state = Rc::clone(state);
-                                    spawn_local(async move {
-                                        let result = state.execute_query(sql).await;
-
-                                        // Send response as plain JavaScript object
-                                        let response = js_sys::Object::new();
-                                        js_sys::Reflect::set(
-                                            &response,
-                                            &JsValue::from_str("type"),
-                                            &JsValue::from_str("query-result"),
-                                        )
-                                        .unwrap();
-
-                                        match result {
-                                            Ok(res) => {
-                                                js_sys::Reflect::set(
-                                                    &response,
-                                                    &JsValue::from_str("result"),
-                                                    &JsValue::from_str(&res),
-                                                )
-                                                .unwrap();
-                                                js_sys::Reflect::set(
-                                                    &response,
-                                                    &JsValue::from_str("error"),
-                                                    &JsValue::NULL,
-                                                )
-                                                .unwrap();
-                                            }
-                                            Err(err) => {
-                                                js_sys::Reflect::set(
-                                                    &response,
-                                                    &JsValue::from_str("result"),
-                                                    &JsValue::NULL,
-                                                )
-                                                .unwrap();
-                                                js_sys::Reflect::set(
-                                                    &response,
-                                                    &JsValue::from_str("error"),
-                                                    &JsValue::from_str(&err),
-                                                )
-                                                .unwrap();
-                                            }
-                                        };
-
-                                        let global = js_sys::global();
-                                        let worker_scope: DedicatedWorkerGlobalScope =
-                                            global.unchecked_into();
-                                        let _ = worker_scope.post_message(&response);
-                                    });
-                                }
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        handle_incoming_value(data);
     }) as Box<dyn FnMut(MessageEvent)>);
 
     worker_scope.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
@@ -108,7 +159,7 @@ pub fn main() -> Result<(), JsValue> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use js_sys::{Object, Reflect};
@@ -339,8 +390,8 @@ mod tests {
                 *leader_rc.is_leader.borrow_mut() = true;
                 assert!(!*follower_rc.is_leader.borrow());
 
-                leader_rc.setup_channel_listener();
-                follower_rc.setup_channel_listener();
+                assert!(leader_rc.setup_channel_listener().is_ok());
+                assert!(follower_rc.setup_channel_listener().is_ok());
 
                 assert_ne!(leader_rc.worker_id, follower_rc.worker_id);
             }

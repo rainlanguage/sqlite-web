@@ -94,7 +94,7 @@ pub unsafe extern "C" fn float_negate(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use wasm_bindgen_test::*;
