@@ -1,6 +1,6 @@
 use base64::Engine;
 use js_sys::Array;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -11,6 +11,7 @@ use wasm_bindgen_utils::prelude::*;
 use web_sys::{Blob, BlobPropertyBag, MessageEvent, Url, Worker};
 
 mod worker_template;
+use serde_wasm_bindgen::from_value;
 use worker_template::generate_self_contained_worker;
 
 fn create_worker_from_code(worker_code: &str) -> Result<Worker, JsValue> {
@@ -30,25 +31,13 @@ fn create_worker_from_code(worker_code: &str) -> Result<Worker, JsValue> {
 fn install_onmessage_handler(
     worker: &Worker,
     pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>,
-    ready_state: Rc<RefCell<InitializationState>>,
-    ready_resolve: Rc<RefCell<Option<js_sys::Function>>>,
-    ready_reject: Rc<RefCell<Option<js_sys::Function>>>,
-    ready_promise: Rc<RefCell<Option<js_sys::Promise>>>,
+    ready_signal: ReadySignal,
 ) {
     let pending_queries_clone = Rc::clone(&pending_queries);
-    let ready_state_clone = Rc::clone(&ready_state);
-    let ready_resolve_clone = Rc::clone(&ready_resolve);
-    let ready_reject_clone = Rc::clone(&ready_reject);
-    let ready_promise_clone = Rc::clone(&ready_promise);
+    let ready_signal_clone = ready_signal.clone();
     let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
         let data = event.data();
-        if handle_worker_control_message(
-            &data,
-            &ready_state_clone,
-            &ready_resolve_clone,
-            &ready_reject_clone,
-            &ready_promise_clone,
-        ) {
+        if handle_worker_control_message(&data, &ready_signal_clone) {
             return;
         }
         handle_query_result_message(&data, &pending_queries_clone);
@@ -58,51 +47,32 @@ fn install_onmessage_handler(
     onmessage.forget();
 }
 
-fn handle_worker_control_message(
-    data: &JsValue,
-    ready_state: &Rc<RefCell<InitializationState>>,
-    ready_resolve: &Rc<RefCell<Option<js_sys::Function>>>,
-    ready_reject: &Rc<RefCell<Option<js_sys::Function>>>,
-    ready_promise: &Rc<RefCell<Option<js_sys::Promise>>>,
-) -> bool {
-    if let Ok(obj) = js_sys::Reflect::get(data, &JsValue::from_str("type")) {
-        if let Some(msg_type) = obj.as_string() {
-            if msg_type == "worker-ready" {
-                {
-                    let mut state = ready_state.borrow_mut();
-                    if matches!(*state, InitializationState::Ready) {
-                        return true;
-                    }
-                    *state = InitializationState::Ready;
-                }
-                if let Some(resolve) = ready_resolve.borrow_mut().take() {
-                    let _ = resolve.call0(&JsValue::NULL);
-                }
-                ready_reject.borrow_mut().take();
-                ready_promise.borrow_mut().take();
-                return true;
-            } else if msg_type == "worker-error" {
-                let error_value = js_sys::Reflect::get(data, &JsValue::from_str("error"))
-                    .ok()
-                    .unwrap_or(JsValue::from_str("Unknown worker error"));
-                let error_text = describe_js_value(&error_value);
-                {
-                    let mut state = ready_state.borrow_mut();
-                    if !matches!(&*state, InitializationState::Failed(existing) if existing == &error_text)
-                    {
-                        *state = InitializationState::Failed(error_text.clone());
-                    }
-                }
-                ready_resolve.borrow_mut().take();
-                if let Some(reject) = ready_reject.borrow_mut().take() {
-                    let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&error_text));
-                }
-                ready_promise.borrow_mut().take();
-                return true;
-            }
+fn handle_worker_control_message(data: &JsValue, ready_signal: &ReadySignal) -> bool {
+    match from_value::<WorkerControlMessage>(data.clone()) {
+        Ok(WorkerControlMessage::Ready) => {
+            ready_signal.mark_ready();
+            true
         }
+        Ok(WorkerControlMessage::Error) => {
+            let reason = js_sys::Reflect::get(data, &JsValue::from_str("error"))
+                .ok()
+                .filter(|val| !val.is_null() && !val.is_undefined())
+                .map(|val| describe_js_value(&val))
+                .unwrap_or_else(|| "Unknown worker error".to_string());
+            ready_signal.mark_failed(reason);
+            true
+        }
+        Err(_) => false,
     }
-    false
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum WorkerControlMessage {
+    #[serde(rename = "worker-ready")]
+    Ready,
+    #[serde(rename = "worker-error")]
+    Error,
 }
 
 fn handle_query_result_message(
@@ -219,15 +189,80 @@ enum InitializationState {
     Failed(String),
 }
 
+#[derive(Clone)]
+struct ReadySignal {
+    state: Rc<RefCell<InitializationState>>,
+    resolve: Rc<RefCell<Option<js_sys::Function>>>,
+    reject: Rc<RefCell<Option<js_sys::Function>>>,
+    promise: Rc<RefCell<Option<js_sys::Promise>>>,
+}
+
+impl ReadySignal {
+    fn new() -> Self {
+        let state = Rc::new(RefCell::new(InitializationState::Pending));
+        let resolve = Rc::new(RefCell::new(None));
+        let reject = Rc::new(RefCell::new(None));
+        let promise = Rc::new(RefCell::new(None));
+        {
+            let ready_promise = create_ready_promise(&resolve, &reject);
+            promise.borrow_mut().replace(ready_promise);
+        }
+        Self {
+            state,
+            resolve,
+            reject,
+            promise,
+        }
+    }
+
+    fn current_state(&self) -> InitializationState {
+        self.state.borrow().clone()
+    }
+
+    fn wait_promise(&self) -> Result<js_sys::Promise, SQLiteWasmDatabaseError> {
+        self.promise.borrow().as_ref().cloned().ok_or_else(|| {
+            SQLiteWasmDatabaseError::InitializationFailed(
+                "Worker readiness promise missing".to_string(),
+            )
+        })
+    }
+
+    fn mark_ready(&self) {
+        {
+            let mut state = self.state.borrow_mut();
+            if matches!(*state, InitializationState::Ready) {
+                return;
+            }
+            *state = InitializationState::Ready;
+        }
+        if let Some(resolve) = self.resolve.borrow_mut().take() {
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+        self.reject.borrow_mut().take();
+        self.promise.borrow_mut().take();
+    }
+
+    fn mark_failed(&self, reason: String) {
+        {
+            let mut state = self.state.borrow_mut();
+            if !matches!(&*state, InitializationState::Failed(existing) if existing == &reason) {
+                *state = InitializationState::Failed(reason.clone());
+            }
+        }
+        self.resolve.borrow_mut().take();
+        if let Some(reject) = self.reject.borrow_mut().take() {
+            let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&reason));
+        }
+        self.promise.borrow_mut().take();
+    }
+}
+
 #[wasm_bindgen]
 pub struct SQLiteWasmDatabase {
     worker: Worker,
     pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>,
     next_request_id: Rc<RefCell<u32>>,
-    ready_state: Rc<RefCell<InitializationState>>,
-    ready_promise: Rc<RefCell<Option<js_sys::Promise>>>,
-    _ready_resolve: Rc<RefCell<Option<js_sys::Function>>>,
-    _ready_reject: Rc<RefCell<Option<js_sys::Function>>>,
+    ready_signal: ReadySignal,
 }
 
 impl Serialize for SQLiteWasmDatabase {
@@ -331,32 +366,15 @@ impl SQLiteWasmDatabase {
 
         let pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let ready_state = Rc::new(RefCell::new(InitializationState::Pending));
-        let ready_resolve_cell = Rc::new(RefCell::new(None));
-        let ready_reject_cell = Rc::new(RefCell::new(None));
-        let ready_promise = Rc::new(RefCell::new(None));
-        {
-            let promise = create_ready_promise(&ready_resolve_cell, &ready_reject_cell);
-            ready_promise.borrow_mut().replace(promise);
-        }
-        install_onmessage_handler(
-            &worker,
-            Rc::clone(&pending_queries),
-            Rc::clone(&ready_state),
-            Rc::clone(&ready_resolve_cell),
-            Rc::clone(&ready_reject_cell),
-            Rc::clone(&ready_promise),
-        );
+        let ready_signal = ReadySignal::new();
+        install_onmessage_handler(&worker, Rc::clone(&pending_queries), ready_signal.clone());
         let next_request_id = Rc::new(RefCell::new(1u32));
 
         Ok(SQLiteWasmDatabase {
             worker,
             pending_queries,
             next_request_id,
-            ready_state,
-            ready_promise,
-            _ready_resolve: ready_resolve_cell,
-            _ready_reject: ready_reject_cell,
+            ready_signal,
         })
     }
 
@@ -370,40 +388,29 @@ impl SQLiteWasmDatabase {
     }
 
     async fn wait_until_ready(&self) -> Result<(), SQLiteWasmDatabaseError> {
-        match &*self.ready_state.borrow() {
+        match self.ready_signal.current_state() {
             InitializationState::Ready => return Ok(()),
             InitializationState::Failed(reason) => {
-                return Err(SQLiteWasmDatabaseError::InitializationFailed(
-                    reason.clone(),
-                ));
+                return Err(SQLiteWasmDatabaseError::InitializationFailed(reason));
             }
             InitializationState::Pending => {}
         }
 
-        let promise = self
-            .ready_promise
-            .borrow()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| {
-                SQLiteWasmDatabaseError::InitializationFailed(
-                    "Worker readiness promise missing".to_string(),
-                )
-            })?;
+        let promise = self.ready_signal.wait_promise()?;
 
         match JsFuture::from(promise).await {
-            Ok(_) => match &*self.ready_state.borrow() {
+            Ok(_) => match self.ready_signal.current_state() {
                 InitializationState::Ready => Ok(()),
-                InitializationState::Failed(reason) => Err(
-                    SQLiteWasmDatabaseError::InitializationFailed(reason.clone()),
-                ),
+                InitializationState::Failed(reason) => {
+                    Err(SQLiteWasmDatabaseError::InitializationFailed(reason))
+                }
                 InitializationState::Pending => Err(SQLiteWasmDatabaseError::InitializationFailed(
                     "Worker failed to signal readiness".to_string(),
                 )),
             },
             Err(err) => {
                 let reason = describe_js_value(&err);
-                *self.ready_state.borrow_mut() = InitializationState::Failed(reason.clone());
+                self.ready_signal.mark_failed(reason.clone());
                 Err(SQLiteWasmDatabaseError::InitializationFailed(reason))
             }
         }
@@ -424,10 +431,8 @@ impl SQLiteWasmDatabase {
         let params_js = params.map(JsValue::from).unwrap_or(JsValue::UNDEFINED);
         let params_array = Self::normalize_params_js(&params_js)?;
 
-        if let InitializationState::Failed(reason) = &*self.ready_state.borrow() {
-            return Err(SQLiteWasmDatabaseError::InitializationFailed(
-                reason.clone(),
-            ));
+        if let InitializationState::Failed(reason) = self.ready_signal.current_state() {
+            return Err(SQLiteWasmDatabaseError::InitializationFailed(reason));
         }
 
         // Build the message object up-front and propagate errors

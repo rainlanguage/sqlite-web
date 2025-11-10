@@ -288,7 +288,7 @@ impl WorkerState {
                 Ok(val) => val
                     .as_string()
                     .ok_or_else(|| "Invalid response".to_string()),
-                Err(e) => Err(format!("{e:?}")),
+                Err(e) => Err(js_value_to_string(&e)),
             }
         }
     }
@@ -392,15 +392,39 @@ fn handle_query_response(
 
 async fn sleep_ms(ms: i32) {
     let promise = js_sys::Promise::new(&mut |resolve, _| {
-        let global = js_sys::global();
-        let scope: DedicatedWorkerGlobalScope = global.unchecked_into();
+        let resolve_for_timeout = resolve.clone();
         let closure = Closure::once(move || {
-            let _ = resolve.call0(&JsValue::NULL);
+            let _ = resolve_for_timeout.call0(&JsValue::NULL);
         });
-        let _ = scope.set_timeout_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
-            ms,
-        );
+
+        let timeout_result = js_sys::global()
+            .dyn_into::<DedicatedWorkerGlobalScope>()
+            .map_err(|_| ())
+            .and_then(|scope| {
+                scope
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(
+                        closure.as_ref().unchecked_ref(),
+                        ms,
+                    )
+                    .map(|_| ())
+                    .map_err(|_| ())
+            })
+            .or_else(|_| {
+                web_sys::window().ok_or(()).and_then(|win| {
+                    win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        closure.as_ref().unchecked_ref(),
+                        ms,
+                    )
+                    .map(|_| ())
+                    .map_err(|_| ())
+                })
+            });
+
+        if timeout_result.is_err() {
+            // As a best-effort fallback, resolve immediately.
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+
         closure.forget();
     });
     let _ = JsFuture::from(promise).await;
