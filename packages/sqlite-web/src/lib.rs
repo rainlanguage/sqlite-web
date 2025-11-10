@@ -30,11 +30,25 @@ fn create_worker_from_code(worker_code: &str) -> Result<Worker, JsValue> {
 fn install_onmessage_handler(
     worker: &Worker,
     pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>,
+    ready_state: Rc<RefCell<InitializationState>>,
+    ready_resolve: Rc<RefCell<Option<js_sys::Function>>>,
+    ready_reject: Rc<RefCell<Option<js_sys::Function>>>,
+    ready_promise: Rc<RefCell<Option<js_sys::Promise>>>,
 ) {
     let pending_queries_clone = Rc::clone(&pending_queries);
+    let ready_state_clone = Rc::clone(&ready_state);
+    let ready_resolve_clone = Rc::clone(&ready_resolve);
+    let ready_reject_clone = Rc::clone(&ready_reject);
+    let ready_promise_clone = Rc::clone(&ready_promise);
     let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
         let data = event.data();
-        if handle_worker_control_message(&data) {
+        if handle_worker_control_message(
+            &data,
+            &ready_state_clone,
+            &ready_resolve_clone,
+            &ready_reject_clone,
+            &ready_promise_clone,
+        ) {
             return;
         }
         handle_query_result_message(&data, &pending_queries_clone);
@@ -44,13 +58,46 @@ fn install_onmessage_handler(
     onmessage.forget();
 }
 
-fn handle_worker_control_message(data: &JsValue) -> bool {
+fn handle_worker_control_message(
+    data: &JsValue,
+    ready_state: &Rc<RefCell<InitializationState>>,
+    ready_resolve: &Rc<RefCell<Option<js_sys::Function>>>,
+    ready_reject: &Rc<RefCell<Option<js_sys::Function>>>,
+    ready_promise: &Rc<RefCell<Option<js_sys::Promise>>>,
+) -> bool {
     if let Ok(obj) = js_sys::Reflect::get(data, &JsValue::from_str("type")) {
         if let Some(msg_type) = obj.as_string() {
             if msg_type == "worker-ready" {
+                {
+                    let mut state = ready_state.borrow_mut();
+                    if matches!(*state, InitializationState::Ready) {
+                        return true;
+                    }
+                    *state = InitializationState::Ready;
+                }
+                if let Some(resolve) = ready_resolve.borrow_mut().take() {
+                    let _ = resolve.call0(&JsValue::NULL);
+                }
+                ready_reject.borrow_mut().take();
+                ready_promise.borrow_mut().take();
                 return true;
             } else if msg_type == "worker-error" {
-                let _ = js_sys::Reflect::get(data, &JsValue::from_str("error"));
+                let error_value = js_sys::Reflect::get(data, &JsValue::from_str("error"))
+                    .ok()
+                    .unwrap_or(JsValue::from_str("Unknown worker error"));
+                let error_text = describe_js_value(&error_value);
+                {
+                    let mut state = ready_state.borrow_mut();
+                    if !matches!(&*state, InitializationState::Failed(existing) if existing == &error_text)
+                    {
+                        *state = InitializationState::Failed(error_text.clone());
+                    }
+                }
+                ready_resolve.borrow_mut().take();
+                if let Some(reject) = ready_reject.borrow_mut().take() {
+                    let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&error_text));
+                }
+                ready_promise.borrow_mut().take();
                 return true;
             }
         }
@@ -165,11 +212,22 @@ fn normalize_one_param(v: &JsValue, index: u32) -> Result<JsValue, SQLiteWasmDat
     )))
 }
 
+#[derive(Debug, Clone)]
+enum InitializationState {
+    Pending,
+    Ready,
+    Failed(String),
+}
+
 #[wasm_bindgen]
 pub struct SQLiteWasmDatabase {
     worker: Worker,
     pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>,
     next_request_id: Rc<RefCell<u32>>,
+    ready_state: Rc<RefCell<InitializationState>>,
+    ready_promise: Rc<RefCell<Option<js_sys::Promise>>>,
+    _ready_resolve: Rc<RefCell<Option<js_sys::Function>>>,
+    _ready_reject: Rc<RefCell<Option<js_sys::Function>>>,
 }
 
 impl Serialize for SQLiteWasmDatabase {
@@ -181,6 +239,31 @@ impl Serialize for SQLiteWasmDatabase {
         let state = serializer.serialize_struct("SQLiteWasmDatabase", 0)?;
         state.end()
     }
+}
+
+fn describe_js_value(value: &JsValue) -> String {
+    if let Some(s) = value.as_string() {
+        return s;
+    }
+    if let Some(n) = value.as_f64() {
+        if n.fract() == 0.0 {
+            return format!("{n:.0}");
+        }
+        return format!("{n}");
+    }
+    format!("{value:?}")
+}
+
+fn create_ready_promise(
+    resolve_cell: &Rc<RefCell<Option<js_sys::Function>>>,
+    reject_cell: &Rc<RefCell<Option<js_sys::Function>>>,
+) -> js_sys::Promise {
+    let resolve_clone = Rc::clone(resolve_cell);
+    let reject_clone = Rc::clone(reject_cell);
+    js_sys::Promise::new(&mut move |resolve, reject| {
+        resolve_clone.borrow_mut().replace(resolve);
+        reject_clone.borrow_mut().replace(reject);
+    })
 }
 impl<'de> Deserialize<'de> for SQLiteWasmDatabase {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -200,7 +283,7 @@ impl<'de> Deserialize<'de> for SQLiteWasmDatabase {
                 "dbName must be a non-empty string",
             ));
         }
-        Self::new(trimmed).map_err(|e| {
+        Self::construct(trimmed).map_err(|e| {
             serde::de::Error::custom(format!("Failed to create SQLiteWasmDatabase: {e:?}"))
         })
     }
@@ -212,6 +295,10 @@ pub enum SQLiteWasmDatabaseError {
     SerdeError(#[from] serde_wasm_bindgen::Error),
     #[error("JavaScript error: {0:?}")]
     JsError(JsValue),
+    #[error("Initialization pending")]
+    InitializationPending,
+    #[error("Initialization failed: {0}")]
+    InitializationFailed(String),
 }
 
 impl From<JsValue> for SQLiteWasmDatabaseError {
@@ -257,18 +344,41 @@ impl SQLiteWasmDatabase {
                 "Database name is required",
             )));
         }
+        Self::construct(db_name)
+    }
+
+    fn construct(db_name: &str) -> Result<SQLiteWasmDatabase, SQLiteWasmDatabaseError> {
         let worker_code = generate_self_contained_worker(db_name);
         let worker = create_worker_from_code(&worker_code)?;
 
         let pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        install_onmessage_handler(&worker, Rc::clone(&pending_queries));
+        let ready_state = Rc::new(RefCell::new(InitializationState::Pending));
+        let ready_resolve_cell = Rc::new(RefCell::new(None));
+        let ready_reject_cell = Rc::new(RefCell::new(None));
+        let ready_promise = Rc::new(RefCell::new(None));
+        {
+            let promise = create_ready_promise(&ready_resolve_cell, &ready_reject_cell);
+            ready_promise.borrow_mut().replace(promise);
+        }
+        install_onmessage_handler(
+            &worker,
+            Rc::clone(&pending_queries),
+            Rc::clone(&ready_state),
+            Rc::clone(&ready_resolve_cell),
+            Rc::clone(&ready_reject_cell),
+            Rc::clone(&ready_promise),
+        );
         let next_request_id = Rc::new(RefCell::new(1u32));
 
         Ok(SQLiteWasmDatabase {
             worker,
             pending_queries,
             next_request_id,
+            ready_state,
+            ready_promise,
+            _ready_resolve: ready_resolve_cell,
+            _ready_reject: ready_reject_cell,
         })
     }
 
@@ -279,6 +389,47 @@ impl SQLiteWasmDatabase {
             normalized.push(&nv);
             Ok(normalized)
         })
+    }
+
+    #[wasm_export(js_name = "ready")]
+    pub async fn ready(&self) -> Result<(), SQLiteWasmDatabaseError> {
+        match &*self.ready_state.borrow() {
+            InitializationState::Ready => return Ok(()),
+            InitializationState::Failed(reason) => {
+                return Err(SQLiteWasmDatabaseError::InitializationFailed(
+                    reason.clone(),
+                ));
+            }
+            InitializationState::Pending => {}
+        }
+
+        let promise = self
+            .ready_promise
+            .borrow()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                SQLiteWasmDatabaseError::InitializationFailed(
+                    "Worker readiness promise missing".to_string(),
+                )
+            })?;
+
+        match JsFuture::from(promise).await {
+            Ok(_) => match &*self.ready_state.borrow() {
+                InitializationState::Ready => Ok(()),
+                InitializationState::Failed(reason) => Err(
+                    SQLiteWasmDatabaseError::InitializationFailed(reason.clone()),
+                ),
+                InitializationState::Pending => Err(SQLiteWasmDatabaseError::InitializationFailed(
+                    "Worker failed to signal readiness".to_string(),
+                )),
+            },
+            Err(err) => {
+                let reason = describe_js_value(&err);
+                *self.ready_state.borrow_mut() = InitializationState::Failed(reason.clone());
+                Err(SQLiteWasmDatabaseError::InitializationFailed(reason))
+            }
+        }
     }
 
     /// Execute a SQL query (optionally parameterized via JS Array)
@@ -295,6 +446,18 @@ impl SQLiteWasmDatabase {
         let sql = sql.to_string();
         let params_js = params.map(JsValue::from).unwrap_or(JsValue::UNDEFINED);
         let params_array = Self::normalize_params_js(&params_js)?;
+
+        match &*self.ready_state.borrow() {
+            InitializationState::Ready => {}
+            InitializationState::Pending => {
+                return Err(SQLiteWasmDatabaseError::InitializationPending);
+            }
+            InitializationState::Failed(reason) => {
+                return Err(SQLiteWasmDatabaseError::InitializationFailed(
+                    reason.clone(),
+                ));
+            }
+        }
 
         // Build the message object up-front and propagate errors
         let message = js_sys::Object::new();
@@ -344,7 +507,20 @@ impl SQLiteWasmDatabase {
                 }
             });
 
-        let result = JsFuture::from(promise).await?;
+        let result = match JsFuture::from(promise).await {
+            Ok(value) => value,
+            Err(err) => {
+                if err
+                    .as_string()
+                    .as_deref()
+                    .map(|s| s == "InitializationPending")
+                    .unwrap_or(false)
+                {
+                    return Err(SQLiteWasmDatabaseError::InitializationPending);
+                }
+                return Err(SQLiteWasmDatabaseError::JsError(err));
+            }
+        };
         Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
     }
 }
@@ -464,6 +640,10 @@ mod tests {
             worker_code.contains("importScripts")
                 || worker_code.contains("import")
                 || worker_code.len() > 100
+        );
+        assert!(
+            worker_code.contains("__SQLITE_FOLLOWER_TIMEOUT_MS"),
+            "Worker template should embed follower timeout configuration"
         );
     }
 

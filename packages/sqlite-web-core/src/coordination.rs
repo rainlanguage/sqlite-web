@@ -6,7 +6,7 @@ use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::BroadcastChannel;
+use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope};
 
 use crate::database::SQLiteDatabase;
 use crate::messages::{ChannelMessage, PendingQuery};
@@ -16,10 +16,12 @@ use crate::util::{js_value_to_string, sanitize_identifier, set_js_property};
 pub struct WorkerState {
     pub worker_id: String,
     pub is_leader: Rc<RefCell<bool>>,
+    pub has_leader: Rc<RefCell<bool>>,
     pub db: Rc<RefCell<Option<SQLiteDatabase>>>,
     pub channel: BroadcastChannel,
     pub db_name: String,
     pub pending_queries: Rc<RefCell<HashMap<String, PendingQuery>>>,
+    pub follower_timeout_ms: f64,
 }
 
 fn reflect_get(target: &JsValue, key: &str) -> Result<JsValue, JsValue> {
@@ -38,6 +40,32 @@ fn send_channel_message(
             js_value_to_string(&err)
         )
     })
+}
+
+fn post_worker_message(obj: &js_sys::Object) -> Result<(), String> {
+    let global = js_sys::global();
+    let scope: DedicatedWorkerGlobalScope = global
+        .dyn_into()
+        .map_err(|_| "Failed to access worker scope".to_string())?;
+    scope
+        .post_message(obj.as_ref())
+        .map_err(|err| js_value_to_string(&err))
+}
+
+fn send_worker_ready_message() -> Result<(), String> {
+    let message = js_sys::Object::new();
+    set_js_property(&message, "type", &JsValue::from_str("worker-ready"))
+        .map_err(|err| js_value_to_string(&err))?;
+    post_worker_message(&message)
+}
+
+fn send_worker_error_message(error: &str) -> Result<(), String> {
+    let message = js_sys::Object::new();
+    set_js_property(&message, "type", &JsValue::from_str("worker-error"))
+        .map_err(|err| js_value_to_string(&err))?;
+    set_js_property(&message, "error", &JsValue::from_str(error))
+        .map_err(|err| js_value_to_string(&err))?;
+    post_worker_message(&message)
 }
 
 impl WorkerState {
@@ -62,23 +90,39 @@ impl WorkerState {
             }
         }
 
+        fn get_follower_timeout_from_global() -> f64 {
+            let global = js_sys::global();
+            let val = Reflect::get(&global, &JsValue::from_str("__SQLITE_FOLLOWER_TIMEOUT_MS"))
+                .unwrap_or(JsValue::UNDEFINED);
+            if let Some(n) = val.as_f64() {
+                if n.is_finite() && n >= 0.0 {
+                    return n;
+                }
+            }
+            5000.0
+        }
+
         let worker_id = Uuid::new_v4().to_string();
         let db_name_raw = get_db_name_from_global()?;
         let channel_name = format!("sqlite-queries-{}", sanitize_identifier(&db_name_raw));
         let channel = BroadcastChannel::new(&channel_name)?;
+        let follower_timeout_ms = get_follower_timeout_from_global();
 
         Ok(WorkerState {
             worker_id,
             is_leader: Rc::new(RefCell::new(false)),
+            has_leader: Rc::new(RefCell::new(false)),
             db: Rc::new(RefCell::new(None)),
             channel,
             db_name: db_name_raw,
             pending_queries: Rc::new(RefCell::new(HashMap::new())),
+            follower_timeout_ms,
         })
     }
 
     pub fn setup_channel_listener(&self) -> Result<(), JsValue> {
         let is_leader = Rc::clone(&self.is_leader);
+        let has_leader = Rc::clone(&self.has_leader);
         let db = Rc::clone(&self.db);
         let pending_queries = Rc::clone(&self.pending_queries);
         let channel = self.channel.clone();
@@ -86,7 +130,14 @@ impl WorkerState {
         let onmessage = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
             let data = event.data();
             if let Ok(msg) = serde_wasm_bindgen::from_value::<ChannelMessage>(data) {
-                handle_channel_message(&is_leader, &db, &channel, &pending_queries, msg);
+                handle_channel_message(
+                    &is_leader,
+                    &has_leader,
+                    &db,
+                    &channel,
+                    &pending_queries,
+                    msg,
+                );
             }
         }) as Box<dyn FnMut(web_sys::MessageEvent)>);
 
@@ -99,6 +150,7 @@ impl WorkerState {
     pub async fn attempt_leadership(&self) -> Result<(), JsValue> {
         let worker_id = self.worker_id.clone();
         let is_leader = Rc::clone(&self.is_leader);
+        let has_leader = Rc::clone(&self.has_leader);
         let db = Rc::clone(&self.db);
         let channel = self.channel.clone();
         let db_name_for_handler = self.db_name.clone();
@@ -113,16 +165,19 @@ impl WorkerState {
 
         let handler = Closure::once(move |_lock: JsValue| -> Promise {
             *is_leader.borrow_mut() = true;
+            *has_leader.borrow_mut() = true;
 
             let db = Rc::clone(&db);
             let channel = channel.clone();
             let worker_id = worker_id.clone();
             let db_name = db_name_for_handler.clone();
+            let has_leader_inner = Rc::clone(&has_leader);
 
             spawn_local(async move {
                 match SQLiteDatabase::initialize_opfs(&db_name).await {
                     Ok(database) => {
                         *db.borrow_mut() = Some(database);
+                        *has_leader_inner.borrow_mut() = true;
 
                         let msg = ChannelMessage::NewLeader {
                             leader_id: worker_id.clone(),
@@ -135,8 +190,15 @@ impl WorkerState {
                             };
                             let _ = send_channel_message(&channel, &fallback);
                         }
+                        if let Err(err_msg) = send_worker_ready_message() {
+                            let _ = send_worker_error_message(&err_msg);
+                        }
                     }
-                    Err(_e) => {}
+                    Err(err) => {
+                        let msg = js_value_to_string(&err);
+                        *has_leader_inner.borrow_mut() = false;
+                        let _ = send_worker_error_message(&msg);
+                    }
                 }
             });
 
@@ -169,6 +231,9 @@ impl WorkerState {
         if *self.is_leader.borrow() {
             exec_on_db(Rc::clone(&self.db), sql, params).await
         } else {
+            if !*self.has_leader.borrow() {
+                return Err("InitializationPending".to_string());
+            }
             let query_id = Uuid::new_v4().to_string();
 
             let promise = Promise::new(&mut |resolve, reject| {
@@ -182,7 +247,7 @@ impl WorkerState {
             let timeout_promise = schedule_timeout_promise(
                 Rc::clone(&self.pending_queries),
                 query_id.clone(),
-                5000.0,
+                self.follower_timeout_ms,
             );
 
             let result = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::race(
@@ -202,6 +267,7 @@ impl WorkerState {
 
 fn handle_channel_message(
     is_leader: &Rc<RefCell<bool>>,
+    has_leader: &Rc<RefCell<bool>>,
     db: &Rc<RefCell<Option<SQLiteDatabase>>>,
     channel: &BroadcastChannel,
     pending_queries: &Rc<RefCell<HashMap<String, PendingQuery>>>,
@@ -235,7 +301,9 @@ fn handle_channel_message(
             result,
             error,
         } => handle_query_response(pending_queries, query_id, result, error),
-        ChannelMessage::NewLeader { leader_id: _ } => {}
+        ChannelMessage::NewLeader { leader_id: _ } => {
+            *has_leader.borrow_mut() = true;
+        }
     }
 }
 
