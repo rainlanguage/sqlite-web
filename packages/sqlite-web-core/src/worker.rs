@@ -127,9 +127,15 @@ fn handle_incoming_value(data: JsValue) {
 pub fn main() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
 
-    let state = Rc::new(WorkerState::new()?);
+    let state = Rc::new(WorkerState::new().map_err(|err| {
+        let _ = send_worker_error(err.clone());
+        err
+    })?);
 
-    state.setup_channel_listener()?;
+    state.setup_channel_listener().map_err(|err| {
+        let _ = send_worker_error(err.clone());
+        err
+    })?;
 
     let state_clone = Rc::clone(&state);
     spawn_local(async move {
@@ -143,6 +149,7 @@ pub fn main() -> Result<(), JsValue> {
     WORKER_STATE.with(|s| {
         *s.borrow_mut() = Some(Rc::clone(&state));
     });
+    state.start_leader_probe();
 
     // Setup message handler from main thread
     let global = js_sys::global();

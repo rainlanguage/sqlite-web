@@ -26,6 +26,11 @@ pub enum ChannelMessage {
         result: Option<String>,
         error: Option<String>,
     },
+    #[serde(rename = "leader-ping")]
+    LeaderPing {
+        #[serde(rename = "requesterId")]
+        requester_id: String,
+    },
 }
 
 // Messages from main thread
@@ -123,6 +128,13 @@ mod tests {
         assert_serialization_roundtrip(query_error, "query-response", |json| {
             assert!(json.contains("\"error\":\"SQL syntax error\""));
             assert!(json.contains("\"result\":null"));
+        });
+
+        let leader_ping = ChannelMessage::LeaderPing {
+            requester_id: "worker-123".to_string(),
+        };
+        assert_serialization_roundtrip(leader_ping, "leader-ping", |json| {
+            assert!(json.contains("\"requesterId\":\"worker-123\""));
         });
     }
 

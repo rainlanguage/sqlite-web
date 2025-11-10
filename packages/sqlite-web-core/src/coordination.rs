@@ -5,7 +5,7 @@ use std::rc::Rc;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope};
 
 use crate::database::SQLiteDatabase;
@@ -126,6 +126,7 @@ impl WorkerState {
         let db = Rc::clone(&self.db);
         let pending_queries = Rc::clone(&self.pending_queries);
         let channel = self.channel.clone();
+        let worker_id = self.worker_id.clone();
 
         let onmessage = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
             let data = event.data();
@@ -136,6 +137,7 @@ impl WorkerState {
                     &db,
                     &channel,
                     &pending_queries,
+                    &worker_id,
                     msg,
                 );
             }
@@ -145,6 +147,33 @@ impl WorkerState {
             .set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
         Ok(())
+    }
+
+    pub fn start_leader_probe(self: &Rc<Self>) {
+        if *self.is_leader.borrow() {
+            return;
+        }
+        let has_leader = Rc::clone(&self.has_leader);
+        let channel = self.channel.clone();
+        let worker_id = self.worker_id.clone();
+        spawn_local(async move {
+            const MAX_ATTEMPTS: u32 = 40;
+            let mut attempts = 0;
+            while attempts < MAX_ATTEMPTS {
+                attempts += 1;
+                if { *has_leader.borrow() } {
+                    break;
+                }
+                let ping = ChannelMessage::LeaderPing {
+                    requester_id: worker_id.clone(),
+                };
+                if let Err(err_msg) = send_channel_message(&channel, &ping) {
+                    let _ = send_worker_error_message(&err_msg);
+                    break;
+                }
+                sleep_ms(250).await;
+            }
+        });
     }
 
     pub async fn attempt_leadership(&self) -> Result<(), JsValue> {
@@ -271,6 +300,7 @@ fn handle_channel_message(
     db: &Rc<RefCell<Option<SQLiteDatabase>>>,
     channel: &BroadcastChannel,
     pending_queries: &Rc<RefCell<HashMap<String, PendingQuery>>>,
+    worker_id: &str,
     msg: ChannelMessage,
 ) {
     match msg {
@@ -302,7 +332,26 @@ fn handle_channel_message(
             error,
         } => handle_query_response(pending_queries, query_id, result, error),
         ChannelMessage::NewLeader { leader_id: _ } => {
-            *has_leader.borrow_mut() = true;
+            let mut has_leader_ref = has_leader.borrow_mut();
+            let already_had_leader = *has_leader_ref;
+            *has_leader_ref = true;
+            drop(has_leader_ref);
+
+            if !already_had_leader {
+                if let Err(err_msg) = send_worker_ready_message() {
+                    let _ = send_worker_error_message(&err_msg);
+                }
+            }
+        }
+        ChannelMessage::LeaderPing { requester_id: _ } => {
+            if *is_leader.borrow() {
+                let response = ChannelMessage::NewLeader {
+                    leader_id: worker_id.to_string(),
+                };
+                if let Err(err_msg) = send_channel_message(channel, &response) {
+                    let _ = send_worker_error_message(&err_msg);
+                }
+            }
         }
     }
 }
@@ -339,6 +388,22 @@ fn handle_query_response(
                 .call1(&JsValue::NULL, &JsValue::from_str(&res));
         }
     }
+}
+
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let global = js_sys::global();
+        let scope: DedicatedWorkerGlobalScope = global.unchecked_into();
+        let closure = Closure::once(move || {
+            let _ = resolve.call0(&JsValue::NULL);
+        });
+        let _ = scope.set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            ms,
+        );
+        closure.forget();
+    });
+    let _ = JsFuture::from(promise).await;
 }
 
 async fn exec_on_db(
