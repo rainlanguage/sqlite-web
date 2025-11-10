@@ -733,4 +733,9 @@ mod tests {
             );
         }
     }
+
+    #[wasm_bindgen_test(async)]
+    async fn test_sleep_ms_completes() {
+        sleep_ms(0).await;
+    }
 }

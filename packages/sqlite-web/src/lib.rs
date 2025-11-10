@@ -509,6 +509,20 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    fn make_control_message(msg_type: &str, error: Option<&str>) -> JsValue {
+        let msg = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &msg,
+            &JsValue::from_str("type"),
+            &JsValue::from_str(msg_type),
+        );
+        if let Some(err) = error {
+            let _ =
+                js_sys::Reflect::set(&msg, &JsValue::from_str("error"), &JsValue::from_str(err));
+        }
+        msg.into()
+    }
+
     #[wasm_bindgen_test]
     fn test_sqlite_wasm_database_error_from_js_value() {
         let js_error = JsValue::from_str("Test error message");
@@ -614,6 +628,57 @@ mod tests {
         assert!(
             worker_code.contains("__SQLITE_FOLLOWER_TIMEOUT_MS"),
             "Worker template should embed follower timeout configuration"
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn test_ready_signal_resolves_on_worker_ready_msg() {
+        let signal = ReadySignal::new();
+        let promise = signal
+            .wait_promise()
+            .expect("ready promise should exist before resolution");
+        let future = JsFuture::from(promise);
+
+        let message = make_control_message("worker-ready", None);
+        let handled = handle_worker_control_message(&message, &signal);
+
+        assert!(handled, "Ready message should be handled");
+        assert!(
+            matches!(signal.current_state(), InitializationState::Ready),
+            "Signal should transition to Ready state"
+        );
+        let result = future.await;
+        assert!(
+            result.is_ok(),
+            "Ready promise should resolve successfully, got {result:?}"
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn test_ready_signal_rejects_on_worker_error_msg() {
+        let signal = ReadySignal::new();
+        let promise = signal
+            .wait_promise()
+            .expect("ready promise should exist before resolution");
+        let future = JsFuture::from(promise);
+
+        let message = make_control_message("worker-error", Some("boom"));
+        let handled = handle_worker_control_message(&message, &signal);
+
+        assert!(handled, "Error message should be handled");
+        match signal.current_state() {
+            InitializationState::Failed(reason) => {
+                assert_eq!(reason, "boom", "Failure reason should match payload")
+            }
+            other => panic!("Expected Failed state, got {other:?}"),
+        }
+        let err = future
+            .await
+            .expect_err("Promise should reject on worker-error");
+        assert_eq!(
+            err.as_string().as_deref(),
+            Some("boom"),
+            "Rejected value should propagate worker error text"
         );
     }
 
