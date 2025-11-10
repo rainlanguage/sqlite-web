@@ -159,14 +159,24 @@ impl WorkerState {
         let follower_timeout_ms = self.follower_timeout_ms;
         spawn_local(async move {
             const POLL_INTERVAL_MS: f64 = 250.0;
-            let max_attempts = if follower_timeout_ms.is_finite() && follower_timeout_ms > 0.0 {
-                (follower_timeout_ms / POLL_INTERVAL_MS).ceil() as u32
+            let mut remaining_ms = if follower_timeout_ms.is_finite() {
+                follower_timeout_ms.max(0.0)
             } else {
-                1
+                f64::INFINITY
             };
-            let mut attempts = 0;
-            while attempts < max_attempts {
-                attempts += 1;
+
+            if remaining_ms <= 0.0 {
+                if !*has_leader.borrow() {
+                    let message = format!(
+                        "Leader election timed out after {:.0}ms",
+                        follower_timeout_ms.max(0.0)
+                    );
+                    let _ = send_worker_error_message(&message);
+                }
+                return;
+            }
+
+            while remaining_ms.is_infinite() || remaining_ms > 0.0 {
                 if *has_leader.borrow() {
                     break;
                 }
@@ -177,7 +187,22 @@ impl WorkerState {
                     let _ = send_worker_error_message(&err_msg);
                     break;
                 }
-                sleep_ms(POLL_INTERVAL_MS as i32).await;
+                if *has_leader.borrow() {
+                    break;
+                }
+
+                let sleep_duration = if remaining_ms.is_infinite() {
+                    POLL_INTERVAL_MS
+                } else {
+                    remaining_ms.min(POLL_INTERVAL_MS)
+                };
+                if sleep_duration <= 0.0 {
+                    break;
+                }
+                sleep_ms(sleep_duration.ceil() as i32).await;
+                if remaining_ms.is_finite() {
+                    remaining_ms -= sleep_duration;
+                }
             }
             if !*has_leader.borrow() {
                 let timeout = follower_timeout_ms.max(0.0);
