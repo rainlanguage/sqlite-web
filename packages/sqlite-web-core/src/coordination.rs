@@ -569,12 +569,11 @@ mod tests {
                 .execute_query("SELECT 1".to_string(), None)
                 .await;
             match result {
-                Err(msg) => assert!(
-                    msg.contains("timeout") || msg.contains("Query timeout"),
-                    "Follower should timeout, got: {}",
-                    msg
+                Err(msg) => assert_eq!(
+                    msg, "InitializationPending",
+                    "Follower should reject while leader is pending"
                 ),
-                Ok(_) => panic!("Expected timeout error for follower"),
+                Ok(_) => panic!("Expected initialization error for follower"),
             }
         }
     }

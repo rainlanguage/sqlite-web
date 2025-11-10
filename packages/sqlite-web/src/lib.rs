@@ -1,6 +1,6 @@
 use base64::Engine;
 use js_sys::Array;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -265,30 +265,6 @@ fn create_ready_promise(
         reject_clone.borrow_mut().replace(reject);
     })
 }
-impl<'de> Deserialize<'de> for SQLiteWasmDatabase {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct InitOpts {
-            #[serde(rename = "dbName")]
-            db_name: String,
-        }
-
-        let opts = InitOpts::deserialize(deserializer)?;
-        let trimmed = opts.db_name.trim();
-        if trimmed.is_empty() {
-            return Err(serde::de::Error::custom(
-                "dbName must be a non-empty string",
-            ));
-        }
-        Self::construct(trimmed).map_err(|e| {
-            serde::de::Error::custom(format!("Failed to create SQLiteWasmDatabase: {e:?}"))
-        })
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum SQLiteWasmDatabaseError {
     #[error(transparent)]
@@ -337,14 +313,16 @@ impl SQLiteWasmDatabase {
     }
     /// Create a new database connection with fully embedded worker
     #[wasm_export(js_name = "new", preserve_js_class)]
-    pub fn new(db_name: &str) -> Result<SQLiteWasmDatabase, SQLiteWasmDatabaseError> {
+    pub async fn new(db_name: &str) -> Result<SQLiteWasmDatabase, SQLiteWasmDatabaseError> {
         let db_name = db_name.trim();
         if db_name.is_empty() {
             return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
                 "Database name is required",
             )));
         }
-        Self::construct(db_name)
+        let db = Self::construct(db_name)?;
+        db.wait_until_ready().await?;
+        Ok(db)
     }
 
     fn construct(db_name: &str) -> Result<SQLiteWasmDatabase, SQLiteWasmDatabaseError> {
@@ -391,8 +369,7 @@ impl SQLiteWasmDatabase {
         })
     }
 
-    #[wasm_export(js_name = "ready")]
-    pub async fn ready(&self) -> Result<(), SQLiteWasmDatabaseError> {
+    async fn wait_until_ready(&self) -> Result<(), SQLiteWasmDatabaseError> {
         match &*self.ready_state.borrow() {
             InitializationState::Ready => return Ok(()),
             InitializationState::Failed(reason) => {
@@ -447,16 +424,10 @@ impl SQLiteWasmDatabase {
         let params_js = params.map(JsValue::from).unwrap_or(JsValue::UNDEFINED);
         let params_array = Self::normalize_params_js(&params_js)?;
 
-        match &*self.ready_state.borrow() {
-            InitializationState::Ready => {}
-            InitializationState::Pending => {
-                return Err(SQLiteWasmDatabaseError::InitializationPending);
-            }
-            InitializationState::Failed(reason) => {
-                return Err(SQLiteWasmDatabaseError::InitializationFailed(
-                    reason.clone(),
-                ));
-            }
+        if let InitializationState::Failed(reason) = &*self.ready_state.borrow() {
+            return Err(SQLiteWasmDatabaseError::InitializationFailed(
+                reason.clone(),
+            ));
         }
 
         // Build the message object up-front and propagate errors
@@ -572,8 +543,10 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_sqlite_wasm_database_serialization() {
-        let db = SQLiteWasmDatabase::new("testdb").expect("Should create database");
+    async fn test_sqlite_wasm_database_serialization() {
+        let db = SQLiteWasmDatabase::new("testdb")
+            .await
+            .expect("Should create database");
         let serialized = serde_json::to_string(&db);
 
         assert!(serialized.is_ok());
@@ -582,16 +555,8 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_sqlite_wasm_database_deserialization() {
-        let json_str = r#"{"dbName":"testdb"}"#;
-        let result: Result<SQLiteWasmDatabase, _> = serde_json::from_str(json_str);
-
-        assert!(result.is_ok(), "Should be able to deserialize empty object");
-    }
-
-    #[wasm_bindgen_test]
-    fn test_sqlite_wasm_database_creation() {
-        let result = SQLiteWasmDatabase::new("testdb");
+    async fn test_sqlite_wasm_database_creation() {
+        let result = SQLiteWasmDatabase::new("testdb").await;
 
         match result {
             Ok(_db) => {}
@@ -604,7 +569,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_query_message_format() {
-        if let Ok(db) = SQLiteWasmDatabase::new("testdb") {
+        if let Ok(db) = SQLiteWasmDatabase::new("testdb").await {
             let result = db.query("SELECT 1", None).await;
 
             match result {
@@ -700,7 +665,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_query_with_various_param_types_and_normalization() {
         install_post_message_spy();
-        let db = SQLiteWasmDatabase::new("testdb").expect("db created");
+        let db = SQLiteWasmDatabase::new("testdb").await.expect("db created");
 
         // Build a params array with all requested JS value types
         let arr = js_sys::Array::new();
@@ -802,7 +767,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_query_params_presence_empty_array_vs_none() {
         install_post_message_spy();
-        let db = SQLiteWasmDatabase::new("testdb").expect("db created");
+        let db = SQLiteWasmDatabase::new("testdb").await.expect("db created");
 
         // Case: None -> no params property on message
         let _ = db.query("SELECT 1", None).await;
@@ -836,7 +801,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_query_rejects_nan_infinity_params() {
-        let db = SQLiteWasmDatabase::new("testdb").expect("db created");
+        let db = SQLiteWasmDatabase::new("testdb").await.expect("db created");
 
         // NaN
         {
