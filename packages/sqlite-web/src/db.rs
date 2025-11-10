@@ -183,3 +183,92 @@ impl SQLiteWasmDatabase {
         Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
     }
 }
+
+#[cfg(all(test, target_family = "wasm"))]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use js_sys::{Array, ArrayBuffer, BigInt, Uint8Array};
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn normalize_params_handles_none_and_empty_arrays() {
+        let empty = SQLiteWasmDatabase::normalize_params(None).expect("None => empty array");
+        assert_eq!(empty.length(), 0);
+
+        let arr = Array::new();
+        let normalized =
+            SQLiteWasmDatabase::normalize_params(Some(arr)).expect("empty array stays empty");
+        assert_eq!(normalized.length(), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn normalize_params_normalizes_mixed_values() {
+        let params = Array::new();
+        params.push(&JsValue::from_f64(123.0));
+        params.push(&JsValue::from_str("hey"));
+        params.push(&JsValue::from_bool(true));
+        params.push(&JsValue::NULL);
+        let bi: JsValue = BigInt::from(77u32).into();
+        params.push(&bi);
+        let buf = ArrayBuffer::new(2);
+        Uint8Array::new(&buf).copy_from(&[9u8, 10]);
+        let buf_js: JsValue = buf.into();
+        params.push(&buf_js);
+
+        let normalized =
+            SQLiteWasmDatabase::normalize_params(Some(params)).expect("normalization works");
+        assert_eq!(normalized.length(), 6);
+        assert_eq!(normalized.get(0).as_f64(), Some(123.0));
+        assert_eq!(normalized.get(1).as_string().as_deref(), Some("hey"));
+        assert_eq!(normalized.get(2).as_bool(), Some(true));
+        assert!(normalized.get(3).is_null());
+
+        let bigint = normalized.get(4);
+        assert_eq!(
+            js_sys::Reflect::get(&bigint, &JsValue::from_str("__type"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("bigint")
+        );
+        assert_eq!(
+            js_sys::Reflect::get(&bigint, &JsValue::from_str("value"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("77")
+        );
+
+        let blob = normalized.get(5);
+        assert_eq!(
+            js_sys::Reflect::get(&blob, &JsValue::from_str("__type"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("blob")
+        );
+        let actual = js_sys::Reflect::get(&blob, &JsValue::from_str("base64"))
+            .unwrap()
+            .as_string()
+            .expect("base64 string present");
+        let expected = base64::engine::general_purpose::STANDARD.encode([9u8, 10]);
+        assert_eq!(actual, expected);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn new_rejects_blank_database_name() {
+        let err = match SQLiteWasmDatabase::new("   ").await {
+            Ok(_) => panic!("blank names should be rejected before constructing worker"),
+            Err(err) => err,
+        };
+        match err {
+            SQLiteWasmDatabaseError::JsError(js) => {
+                assert_eq!(js.as_string().as_deref(), Some("Database name is required"))
+            }
+            other => panic!("expected JsError, got {other:?}"),
+        }
+    }
+}

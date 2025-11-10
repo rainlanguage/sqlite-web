@@ -34,3 +34,55 @@ impl From<SQLiteWasmDatabaseError> for WasmEncodedError {
         }
     }
 }
+
+#[cfg(all(test, target_family = "wasm"))]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+    use wasm_bindgen_utils::prelude::serde_wasm_bindgen;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn js_value_into_error_variant() {
+        let js_val = JsValue::from_str("boom");
+        match SQLiteWasmDatabaseError::from(js_val) {
+            SQLiteWasmDatabaseError::JsError(inner) => {
+                assert_eq!(inner.as_string().as_deref(), Some("boom"))
+            }
+            other => panic!("expected JsError, got {other:?}"),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn error_round_trips_back_into_js_value() {
+        let err = SQLiteWasmDatabaseError::InitializationFailed("nope".into());
+        let js: JsValue = err.into();
+        assert!(js.is_object());
+        let error_obj = js_sys::Error::from(js);
+        let message = error_obj.message().as_string().unwrap_or_default();
+        assert!(
+            message.contains("Initialization failed"),
+            "message should propagate initialization failure cause"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_encoded_error_keeps_message_human_readable() {
+        let err = SQLiteWasmDatabaseError::InitializationPending;
+        let wasm_err = WasmEncodedError::from(err);
+        assert!(wasm_err.msg.contains("Initialization pending"));
+        assert!(wasm_err.readable_msg.contains("Initialization pending"));
+    }
+
+    #[wasm_bindgen_test]
+    fn serde_error_variant_is_detectable() {
+        let serde_err = serde_wasm_bindgen::Error::new("bad serde");
+        match SQLiteWasmDatabaseError::SerdeError(serde_err) {
+            SQLiteWasmDatabaseError::SerdeError(inner) => {
+                assert!(inner.to_string().contains("bad serde"));
+            }
+            _ => panic!("expected SerdeError variant"),
+        }
+    }
+}

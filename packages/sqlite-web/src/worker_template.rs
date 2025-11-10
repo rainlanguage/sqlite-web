@@ -12,3 +12,34 @@ pub fn generate_self_contained_worker(db_name: &str) -> String {
     let body = include_str!("embedded_worker.js");
     format!("{}{}", prefix, body)
 }
+
+#[cfg(all(test, target_family = "wasm"))]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn embeds_db_name_and_timeout_configuration() {
+        let output = generate_self_contained_worker("my_db");
+        assert!(
+            output.contains("self.__SQLITE_DB_NAME = \"my_db\";"),
+            "db name should be JSON encoded in prefix"
+        );
+        assert!(
+            output.contains("self.__SQLITE_FOLLOWER_TIMEOUT_MS = 5000.0;"),
+            "timeout constant should be injected"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn appends_embedded_worker_body() {
+        let output = generate_self_contained_worker("whatever");
+        let body = include_str!("embedded_worker.js");
+        assert!(
+            output.ends_with(body),
+            "template output should append embedded worker body verbatim"
+        );
+    }
+}
