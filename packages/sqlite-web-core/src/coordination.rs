@@ -161,7 +161,7 @@ impl WorkerState {
             let mut attempts = 0;
             while attempts < MAX_ATTEMPTS {
                 attempts += 1;
-                if { *has_leader.borrow() } {
+                if *has_leader.borrow() {
                     break;
                 }
                 let ping = ChannelMessage::LeaderPing {

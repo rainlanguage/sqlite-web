@@ -127,14 +127,12 @@ fn handle_incoming_value(data: JsValue) {
 pub fn main() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
 
-    let state = Rc::new(WorkerState::new().map_err(|err| {
+    let state = Rc::new(WorkerState::new().inspect_err(|err| {
         let _ = send_worker_error(err.clone());
-        err
     })?);
 
-    state.setup_channel_listener().map_err(|err| {
+    state.setup_channel_listener().inspect_err(|err| {
         let _ = send_worker_error(err.clone());
-        err
     })?;
 
     let state_clone = Rc::clone(&state);
