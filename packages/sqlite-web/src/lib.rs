@@ -1,5 +1,6 @@
 mod db;
 mod errors;
+mod messages;
 mod params;
 mod ready;
 mod utils;

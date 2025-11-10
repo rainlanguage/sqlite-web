@@ -52,12 +52,20 @@ impl ReadySignal {
     }
 
     pub(crate) fn mark_ready(&self) {
+        let mut transitioned = false;
         {
             let mut state = self.state.borrow_mut();
-            if matches!(*state, InitializationState::Ready) {
-                return;
+            match *state {
+                InitializationState::Failed(_) => return,
+                InitializationState::Ready => {}
+                _ => {
+                    *state = InitializationState::Ready;
+                    transitioned = true;
+                }
             }
-            *state = InitializationState::Ready;
+        }
+        if !transitioned {
+            return;
         }
         if let Some(resolve) = self.resolve.borrow_mut().take() {
             let _ = resolve.call0(&JsValue::NULL);

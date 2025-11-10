@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use js_sys::Array;
+use js_sys::{Array, Reflect};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -10,6 +10,7 @@ use wasm_bindgen_utils::prelude::*;
 use web_sys::Worker;
 
 use crate::errors::SQLiteWasmDatabaseError;
+use crate::messages::WORKER_ERROR_TYPE_INITIALIZATION_PENDING;
 use crate::params::normalize_params_js;
 use crate::ready::{InitializationState, ReadySignal};
 use crate::utils::describe_js_value;
@@ -97,7 +98,6 @@ impl SQLiteWasmDatabase {
             },
             Err(err) => {
                 let reason = describe_js_value(&err);
-                self.ready_signal.mark_failed(reason.clone());
                 Err(SQLiteWasmDatabaseError::InitializationFailed(reason))
             }
         }
@@ -169,12 +169,7 @@ impl SQLiteWasmDatabase {
         let result = match JsFuture::from(promise).await {
             Ok(value) => value,
             Err(err) => {
-                if err
-                    .as_string()
-                    .as_deref()
-                    .map(|s| s == "InitializationPending")
-                    .unwrap_or(false)
-                {
+                if is_initialization_pending_error(&err) {
                     return Err(SQLiteWasmDatabaseError::InitializationPending);
                 }
                 return Err(SQLiteWasmDatabaseError::JsError(err));
@@ -184,11 +179,21 @@ impl SQLiteWasmDatabase {
     }
 }
 
+fn is_initialization_pending_error(err: &JsValue) -> bool {
+    let error_type = Reflect::get(err, &JsValue::from_str("type"))
+        .ok()
+        .and_then(|value| value.as_string());
+    if error_type.as_deref() == Some(WORKER_ERROR_TYPE_INITIALIZATION_PENDING) {
+        return true;
+    }
+    err.as_string().as_deref() == Some(WORKER_ERROR_TYPE_INITIALIZATION_PENDING)
+}
+
 #[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use base64::Engine;
-    use js_sys::{Array, ArrayBuffer, BigInt, Uint8Array};
+    use js_sys::{Array, ArrayBuffer, BigInt, Object, Uint8Array};
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -270,5 +275,23 @@ mod tests {
             }
             other => panic!("expected JsError, got {other:?}"),
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn detects_structured_initialization_pending_errors() {
+        let err = Object::new();
+        let _ = js_sys::Reflect::set(
+            &err,
+            &JsValue::from_str("type"),
+            &JsValue::from_str(WORKER_ERROR_TYPE_INITIALIZATION_PENDING),
+        );
+        let js_val: JsValue = err.into();
+        assert!(is_initialization_pending_error(&js_val));
+    }
+
+    #[wasm_bindgen_test]
+    fn detects_string_initialization_pending_errors() {
+        let js_val = JsValue::from_str(WORKER_ERROR_TYPE_INITIALIZATION_PENDING);
+        assert!(is_initialization_pending_error(&js_val));
     }
 }

@@ -9,7 +9,7 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope};
 
 use crate::database::SQLiteDatabase;
-use crate::messages::{ChannelMessage, PendingQuery};
+use crate::messages::{ChannelMessage, PendingQuery, WORKER_ERROR_TYPE_INITIALIZATION_PENDING};
 use crate::util::{js_value_to_string, sanitize_identifier, set_js_property};
 
 // Worker state
@@ -156,10 +156,16 @@ impl WorkerState {
         let has_leader = Rc::clone(&self.has_leader);
         let channel = self.channel.clone();
         let worker_id = self.worker_id.clone();
+        let follower_timeout_ms = self.follower_timeout_ms;
         spawn_local(async move {
-            const MAX_ATTEMPTS: u32 = 40;
+            const POLL_INTERVAL_MS: f64 = 250.0;
+            let max_attempts = if follower_timeout_ms.is_finite() && follower_timeout_ms > 0.0 {
+                (follower_timeout_ms / POLL_INTERVAL_MS).ceil() as u32
+            } else {
+                1
+            };
             let mut attempts = 0;
-            while attempts < MAX_ATTEMPTS {
+            while attempts < max_attempts {
                 attempts += 1;
                 if *has_leader.borrow() {
                     break;
@@ -171,7 +177,12 @@ impl WorkerState {
                     let _ = send_worker_error_message(&err_msg);
                     break;
                 }
-                sleep_ms(250).await;
+                sleep_ms(POLL_INTERVAL_MS as i32).await;
+            }
+            if !*has_leader.borrow() {
+                let timeout = follower_timeout_ms.max(0.0);
+                let message = format!("Leader election timed out after {:.0}ms", timeout);
+                let _ = send_worker_error_message(&message);
             }
         });
     }
@@ -261,7 +272,7 @@ impl WorkerState {
             exec_on_db(Rc::clone(&self.db), sql, params).await
         } else {
             if !*self.has_leader.borrow() {
-                return Err("InitializationPending".to_string());
+                return Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string());
             }
             let query_id = Uuid::new_v4().to_string();
 
@@ -659,7 +670,7 @@ mod tests {
                 .await;
             match result {
                 Err(msg) => assert_eq!(
-                    msg, "InitializationPending",
+                    msg, WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
                     "Follower should reject while leader is pending"
                 ),
                 Ok(_) => panic!("Expected initialization error for follower"),

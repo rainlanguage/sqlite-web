@@ -1,11 +1,10 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use crate::ready::ReadySignal;
 use crate::utils::describe_js_value;
 use js_sys::{Array, Function, Reflect};
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -99,8 +98,7 @@ fn handle_query_result_message(
         .filter(|e| !e.is_null() && !e.is_undefined());
 
     if let Some(error) = error {
-        let error_str = error.as_string().unwrap_or_else(|| format!("{error:?}"));
-        let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&error_str));
+        let _ = reject.call1(&JsValue::NULL, &error);
         return;
     }
 
@@ -116,6 +114,7 @@ fn handle_query_result_message(
 #[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
+    use crate::messages::WORKER_ERROR_TYPE_GENERIC;
     use crate::ready::InitializationState;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -126,13 +125,11 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    fn recorder_function() -> (js_sys::Function, Rc<RefCell<Vec<String>>>) {
+    fn recorder_function() -> (js_sys::Function, Rc<RefCell<Vec<JsValue>>>) {
         let calls = Rc::new(RefCell::new(Vec::new()));
         let calls_clone = Rc::clone(&calls);
         let closure = Closure::wrap(Box::new(move |value: JsValue| {
-            calls_clone
-                .borrow_mut()
-                .push(value.as_string().unwrap_or_else(|| format!("{value:?}")));
+            calls_clone.borrow_mut().push(value);
         }) as Box<dyn FnMut(JsValue)>);
         let func: js_sys::Function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
         closure.forget();
@@ -205,7 +202,7 @@ mod tests {
         {
             let calls = resolve_calls.borrow();
             assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0], "ok");
+            assert_eq!(calls[0].as_string().as_deref(), Some("ok"));
         }
         assert!(reject_calls.borrow().is_empty());
         assert!(pending_queries.borrow().is_empty());
@@ -231,11 +228,18 @@ mod tests {
             &JsValue::from_str("requestId"),
             &JsValue::from_f64(3.0),
         );
+        let error_obj = js_sys::Object::new();
         let _ = js_sys::Reflect::set(
-            &msg,
-            &JsValue::from_str("error"),
+            &error_obj,
+            &JsValue::from_str("type"),
+            &JsValue::from_str(WORKER_ERROR_TYPE_GENERIC),
+        );
+        let _ = js_sys::Reflect::set(
+            &error_obj,
+            &JsValue::from_str("message"),
             &JsValue::from_str("nope"),
         );
+        let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("error"), error_obj.as_ref());
 
         let msg: JsValue = msg.into();
         handle_query_result_message(&msg, &pending_queries);
@@ -244,7 +248,16 @@ mod tests {
         {
             let calls = reject_calls.borrow();
             assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0], "nope");
+            let val = &calls[0];
+            assert!(val.is_object());
+            let error_type = js_sys::Reflect::get(val, &JsValue::from_str("type"))
+                .unwrap()
+                .as_string();
+            assert_eq!(error_type.as_deref(), Some(WORKER_ERROR_TYPE_GENERIC));
+            let message = js_sys::Reflect::get(val, &JsValue::from_str("message"))
+                .unwrap()
+                .as_string();
+            assert_eq!(message.as_deref(), Some("nope"));
         }
         assert!(pending_queries.borrow().is_empty());
     }

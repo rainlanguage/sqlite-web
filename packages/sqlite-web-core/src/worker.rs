@@ -8,7 +8,9 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
 use crate::coordination::WorkerState;
-use crate::messages::WorkerMessage;
+use crate::messages::{
+    WorkerMessage, WORKER_ERROR_TYPE_GENERIC, WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
+};
 use crate::util::{js_value_to_string, set_js_property};
 
 // Global state
@@ -45,6 +47,22 @@ fn post_message(obj: &js_sys::Object) -> Result<(), JsValue> {
     worker_scope.post_message(obj.as_ref())
 }
 
+fn make_structured_error(err: &str) -> Result<JsValue, JsValue> {
+    let error_object = js_sys::Object::new();
+    let error_type = if err == WORKER_ERROR_TYPE_INITIALIZATION_PENDING {
+        WORKER_ERROR_TYPE_INITIALIZATION_PENDING
+    } else {
+        WORKER_ERROR_TYPE_GENERIC
+    };
+    set_js_property(
+        error_object.as_ref(),
+        "type",
+        &JsValue::from_str(error_type),
+    )?;
+    set_js_property(error_object.as_ref(), "message", &JsValue::from_str(err))?;
+    Ok(error_object.into())
+}
+
 fn make_query_result_message(
     request_id: u32,
     result: Result<String, String>,
@@ -63,7 +81,8 @@ fn make_query_result_message(
         }
         Err(err) => {
             set_js_property(&response, "result", &JsValue::NULL)?;
-            set_js_property(&response, "error", &JsValue::from_str(&err))?;
+            let error_value = make_structured_error(&err)?;
+            set_js_property(&response, "error", &error_value)?;
         }
     }
     Ok(response)
