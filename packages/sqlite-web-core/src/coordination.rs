@@ -12,11 +12,23 @@ use crate::database::SQLiteDatabase;
 use crate::messages::{ChannelMessage, PendingQuery, WORKER_ERROR_TYPE_INITIALIZATION_PENDING};
 use crate::util::{js_value_to_string, sanitize_identifier, set_js_property};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeadershipRole {
+    Leader,
+    Follower,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaderPresence {
+    Known,
+    Unknown,
+}
+
 // Worker state
 pub struct WorkerState {
     pub worker_id: String,
-    pub is_leader: Rc<RefCell<bool>>,
-    pub has_leader: Rc<RefCell<bool>>,
+    pub is_leader: Rc<RefCell<LeadershipRole>>,
+    pub has_leader: Rc<RefCell<LeaderPresence>>,
     pub db: Rc<RefCell<Option<SQLiteDatabase>>>,
     pub channel: BroadcastChannel,
     pub db_name: String,
@@ -110,8 +122,8 @@ impl WorkerState {
 
         Ok(WorkerState {
             worker_id,
-            is_leader: Rc::new(RefCell::new(false)),
-            has_leader: Rc::new(RefCell::new(false)),
+            is_leader: Rc::new(RefCell::new(LeadershipRole::Follower)),
+            has_leader: Rc::new(RefCell::new(LeaderPresence::Unknown)),
             db: Rc::new(RefCell::new(None)),
             channel,
             db_name: db_name_raw,
@@ -150,7 +162,7 @@ impl WorkerState {
     }
 
     pub fn start_leader_probe(self: &Rc<Self>) {
-        if *self.is_leader.borrow() {
+        if matches!(*self.is_leader.borrow(), LeadershipRole::Leader) {
             return;
         }
         let has_leader = Rc::clone(&self.has_leader);
@@ -166,7 +178,7 @@ impl WorkerState {
             };
 
             if remaining_ms <= 0.0 {
-                if !*has_leader.borrow() {
+                if matches!(*has_leader.borrow(), LeaderPresence::Unknown) {
                     let message = format!(
                         "Leader election timed out after {:.0}ms",
                         follower_timeout_ms.max(0.0)
@@ -177,7 +189,7 @@ impl WorkerState {
             }
 
             while remaining_ms.is_infinite() || remaining_ms > 0.0 {
-                if *has_leader.borrow() {
+                if matches!(*has_leader.borrow(), LeaderPresence::Known) {
                     break;
                 }
                 let ping = ChannelMessage::LeaderPing {
@@ -187,7 +199,7 @@ impl WorkerState {
                     let _ = send_worker_error_message(&err_msg);
                     break;
                 }
-                if *has_leader.borrow() {
+                if matches!(*has_leader.borrow(), LeaderPresence::Known) {
                     break;
                 }
 
@@ -204,7 +216,7 @@ impl WorkerState {
                     remaining_ms -= sleep_duration;
                 }
             }
-            if !*has_leader.borrow() {
+            if matches!(*has_leader.borrow(), LeaderPresence::Unknown) {
                 let timeout = follower_timeout_ms.max(0.0);
                 let message = format!("Leader election timed out after {:.0}ms", timeout);
                 let _ = send_worker_error_message(&message);
@@ -229,8 +241,8 @@ impl WorkerState {
         set_js_property(&options, "mode", &JsValue::from_str("exclusive"))?;
 
         let handler = Closure::once(move |_lock: JsValue| -> Promise {
-            *is_leader.borrow_mut() = true;
-            *has_leader.borrow_mut() = true;
+            *is_leader.borrow_mut() = LeadershipRole::Leader;
+            *has_leader.borrow_mut() = LeaderPresence::Known;
 
             let db = Rc::clone(&db);
             let channel = channel.clone();
@@ -242,7 +254,7 @@ impl WorkerState {
                 match SQLiteDatabase::initialize_opfs(&db_name).await {
                     Ok(database) => {
                         *db.borrow_mut() = Some(database);
-                        *has_leader_inner.borrow_mut() = true;
+                        *has_leader_inner.borrow_mut() = LeaderPresence::Known;
 
                         let msg = ChannelMessage::NewLeader {
                             leader_id: worker_id.clone(),
@@ -261,7 +273,7 @@ impl WorkerState {
                     }
                     Err(err) => {
                         let msg = js_value_to_string(&err);
-                        *has_leader_inner.borrow_mut() = false;
+                        *has_leader_inner.borrow_mut() = LeaderPresence::Unknown;
                         let _ = send_worker_error_message(&msg);
                     }
                 }
@@ -293,10 +305,10 @@ impl WorkerState {
         sql: String,
         params: Option<Vec<serde_json::Value>>,
     ) -> Result<String, String> {
-        if *self.is_leader.borrow() {
+        if matches!(*self.is_leader.borrow(), LeadershipRole::Leader) {
             exec_on_db(Rc::clone(&self.db), sql, params).await
         } else {
-            if !*self.has_leader.borrow() {
+            if matches!(*self.has_leader.borrow(), LeaderPresence::Unknown) {
                 return Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string());
             }
             let query_id = Uuid::new_v4().to_string();
@@ -331,8 +343,8 @@ impl WorkerState {
 }
 
 fn handle_channel_message(
-    is_leader: &Rc<RefCell<bool>>,
-    has_leader: &Rc<RefCell<bool>>,
+    is_leader: &Rc<RefCell<LeadershipRole>>,
+    has_leader: &Rc<RefCell<LeaderPresence>>,
     db: &Rc<RefCell<Option<SQLiteDatabase>>>,
     channel: &BroadcastChannel,
     pending_queries: &Rc<RefCell<HashMap<String, PendingQuery>>>,
@@ -344,8 +356,8 @@ fn handle_channel_message(
             query_id,
             sql,
             params,
-        } => {
-            if *is_leader.borrow() {
+        } => match *is_leader.borrow() {
+            LeadershipRole::Leader => {
                 let db = Rc::clone(db);
                 let channel = channel.clone();
                 spawn_local(async move {
@@ -361,7 +373,8 @@ fn handle_channel_message(
                     }
                 });
             }
-        }
+            LeadershipRole::Follower => {}
+        },
         ChannelMessage::QueryResponse {
             query_id,
             result,
@@ -369,18 +382,21 @@ fn handle_channel_message(
         } => handle_query_response(pending_queries, query_id, result, error),
         ChannelMessage::NewLeader { leader_id: _ } => {
             let mut has_leader_ref = has_leader.borrow_mut();
-            let already_had_leader = *has_leader_ref;
-            *has_leader_ref = true;
+            let previous_presence = *has_leader_ref;
+            *has_leader_ref = LeaderPresence::Known;
             drop(has_leader_ref);
 
-            if !already_had_leader {
-                if let Err(err_msg) = send_worker_ready_message() {
-                    let _ = send_worker_error_message(&err_msg);
+            match previous_presence {
+                LeaderPresence::Unknown => {
+                    if let Err(err_msg) = send_worker_ready_message() {
+                        let _ = send_worker_error_message(&err_msg);
+                    }
                 }
+                LeaderPresence::Known => {}
             }
         }
-        ChannelMessage::LeaderPing { requester_id: _ } => {
-            if *is_leader.borrow() {
+        ChannelMessage::LeaderPing { requester_id: _ } => match *is_leader.borrow() {
+            LeadershipRole::Leader => {
                 let response = ChannelMessage::NewLeader {
                     leader_id: worker_id.to_string(),
                 };
@@ -388,7 +404,8 @@ fn handle_channel_message(
                     let _ = send_worker_error_message(&err_msg);
                 }
             }
-        }
+            LeadershipRole::Follower => {}
+        },
     }
 }
 
@@ -553,8 +570,9 @@ mod tests {
             state.worker_id.contains('-'),
             "Worker ID should be valid UUID format"
         );
-        assert!(
-            !*state.is_leader.borrow(),
+        assert_eq!(
+            *state.is_leader.borrow(),
+            LeadershipRole::Follower,
             "New workers should not start as leader"
         );
         assert!(
@@ -588,13 +606,25 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_leadership_state_management() {
         if let Ok(state) = WorkerState::new() {
-            assert!(!*state.is_leader.borrow(), "Should start as follower");
+            assert_eq!(
+                *state.is_leader.borrow(),
+                LeadershipRole::Follower,
+                "Should start as follower"
+            );
 
-            *state.is_leader.borrow_mut() = true;
-            assert!(*state.is_leader.borrow(), "Should become leader");
+            *state.is_leader.borrow_mut() = LeadershipRole::Leader;
+            assert_eq!(
+                *state.is_leader.borrow(),
+                LeadershipRole::Leader,
+                "Should become leader"
+            );
 
-            *state.is_leader.borrow_mut() = false;
-            assert!(!*state.is_leader.borrow(), "Should become follower again");
+            *state.is_leader.borrow_mut() = LeadershipRole::Follower;
+            assert_eq!(
+                *state.is_leader.borrow(),
+                LeadershipRole::Follower,
+                "Should become follower again"
+            );
         }
     }
 
@@ -658,7 +688,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_execute_query_leader_vs_follower_paths() {
         if let Ok(leader_state) = WorkerState::new() {
-            *leader_state.is_leader.borrow_mut() = true;
+            *leader_state.is_leader.borrow_mut() = LeadershipRole::Leader;
 
             let test_queries = vec![
                 "",
@@ -685,8 +715,9 @@ mod tests {
         }
 
         if let Ok(follower_state) = WorkerState::new() {
-            assert!(
-                !*follower_state.is_leader.borrow(),
+            assert_eq!(
+                *follower_state.is_leader.borrow(),
+                LeadershipRole::Follower,
                 "Should start as follower"
             );
 
@@ -716,7 +747,11 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_attempt_leadership_behavior() {
         if let Ok(state) = WorkerState::new() {
-            assert!(!*state.is_leader.borrow(), "Should start as follower");
+            assert_eq!(
+                *state.is_leader.borrow(),
+                LeadershipRole::Follower,
+                "Should start as follower"
+            );
             assert!(
                 state.db.borrow().is_none(),
                 "Database should be uninitialized"
@@ -728,7 +763,11 @@ mod tests {
         let workers: Vec<_> = (0..3).filter_map(|_| WorkerState::new().ok()).collect();
         if workers.len() >= 2 {
             for worker in &workers {
-                assert!(!*worker.is_leader.borrow(), "All should start as followers");
+                assert_eq!(
+                    *worker.is_leader.borrow(),
+                    LeadershipRole::Follower,
+                    "All should start as followers"
+                );
             }
 
             for worker in &workers {
@@ -749,9 +788,10 @@ mod tests {
                 pending_clone.borrow().len()
             );
 
-            *state.is_leader.borrow_mut() = true;
-            assert!(
+            *state.is_leader.borrow_mut() = LeadershipRole::Leader;
+            assert_eq!(
                 *is_leader_clone.borrow(),
+                LeadershipRole::Leader,
                 "Changes should be visible through cloned Rc"
             );
 

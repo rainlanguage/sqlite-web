@@ -186,6 +186,7 @@ pub fn main() -> Result<(), JsValue> {
 #[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
+    use crate::coordination::LeadershipRole;
     use js_sys::{Object, Reflect};
     use std::rc::Rc;
     use wasm_bindgen_test::*;
@@ -330,7 +331,7 @@ mod tests {
         if let Ok(state) = WorkerState::new() {
             let state_rc = Rc::new(state);
 
-            assert!(!*state_rc.is_leader.borrow());
+            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Follower);
             assert!(state_rc.db.borrow().is_none());
             assert!(state_rc.pending_queries.borrow().is_empty());
         }
@@ -341,10 +342,10 @@ mod tests {
         if let Ok(state) = WorkerState::new() {
             let state_rc = Rc::new(state);
 
-            assert!(!*state_rc.is_leader.borrow());
+            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Follower);
 
-            *state_rc.is_leader.borrow_mut() = true;
-            assert!(*state_rc.is_leader.borrow());
+            *state_rc.is_leader.borrow_mut() = LeadershipRole::Leader;
+            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Leader);
         }
     }
 
@@ -363,8 +364,8 @@ mod tests {
         if let Ok(state) = WorkerState::new() {
             let state_rc = Rc::new(state);
 
-            *state_rc.is_leader.borrow_mut() = true;
-            assert!(*state_rc.is_leader.borrow());
+            *state_rc.is_leader.borrow_mut() = LeadershipRole::Leader;
+            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Leader);
             assert!(state_rc.db.borrow().is_none());
         }
     }
@@ -411,8 +412,8 @@ mod tests {
                 let leader_rc = Rc::new(leader_state);
                 let follower_rc = Rc::new(follower_state);
 
-                *leader_rc.is_leader.borrow_mut() = true;
-                assert!(!*follower_rc.is_leader.borrow());
+                *leader_rc.is_leader.borrow_mut() = LeadershipRole::Leader;
+                assert_eq!(*follower_rc.is_leader.borrow(), LeadershipRole::Follower);
 
                 assert!(leader_rc.setup_channel_listener().is_ok());
                 assert!(follower_rc.setup_channel_listener().is_ok());
