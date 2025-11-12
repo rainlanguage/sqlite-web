@@ -168,10 +168,10 @@ impl SQLiteWasmDatabase {
 
         let result = match JsFuture::from(promise).await {
             Ok(value) => value,
+            Err(err) if is_initialization_pending_error(&err) => {
+                return Err(SQLiteWasmDatabaseError::InitializationPending);
+            }
             Err(err) => {
-                if is_initialization_pending_error(&err) {
-                    return Err(SQLiteWasmDatabaseError::InitializationPending);
-                }
                 return Err(SQLiteWasmDatabaseError::JsError(err));
             }
         };
