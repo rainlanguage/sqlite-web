@@ -1,6 +1,18 @@
 use js_sys::Function;
 use serde::{Deserialize, Serialize};
 
+pub const WORKER_ERROR_TYPE_GENERIC: &str = "WorkerError";
+pub const WORKER_ERROR_TYPE_INITIALIZATION_PENDING: &str = "InitializationPending";
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct WorkerErrorPayload {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 // Message types for BroadcastChannel communication
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
@@ -25,6 +37,11 @@ pub enum ChannelMessage {
         query_id: String,
         result: Option<String>,
         error: Option<String>,
+    },
+    #[serde(rename = "leader-ping")]
+    LeaderPing {
+        #[serde(rename = "requesterId")]
+        requester_id: String,
     },
 }
 
@@ -52,7 +69,7 @@ pub enum MainThreadMessage {
         #[serde(rename = "requestId")]
         request_id: u32,
         result: Option<String>,
-        error: Option<String>,
+        error: Option<WorkerErrorPayload>,
     },
     #[serde(rename = "worker-ready")]
     WorkerReady,
@@ -124,6 +141,13 @@ mod tests {
             assert!(json.contains("\"error\":\"SQL syntax error\""));
             assert!(json.contains("\"result\":null"));
         });
+
+        let leader_ping = ChannelMessage::LeaderPing {
+            requester_id: "worker-123".to_string(),
+        };
+        assert_serialization_roundtrip(leader_ping, "leader-ping", |json| {
+            assert!(json.contains("\"requesterId\":\"worker-123\""));
+        });
     }
 
     #[wasm_bindgen_test]
@@ -165,10 +189,14 @@ mod tests {
         let error_result = MainThreadMessage::QueryResult {
             request_id: 8,
             result: None,
-            error: Some("Database error".to_string()),
+            error: Some(WorkerErrorPayload {
+                error_type: WORKER_ERROR_TYPE_GENERIC.to_string(),
+                message: Some("Database error".to_string()),
+            }),
         };
         assert_serialization_roundtrip(error_result, "query-result", |json| {
-            assert!(json.contains("\"error\":\"Database error\""));
+            assert!(json.contains("\"type\":\"WorkerError\""));
+            assert!(json.contains("\"message\":\"Database error\""));
             assert!(json.contains("\"result\":null"));
             assert!(json.contains("\"requestId\":8"));
         });

@@ -5,21 +5,35 @@ use std::rc::Rc;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
-use web_sys::BroadcastChannel;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
+use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope};
 
 use crate::database::SQLiteDatabase;
-use crate::messages::{ChannelMessage, PendingQuery};
+use crate::messages::{ChannelMessage, PendingQuery, WORKER_ERROR_TYPE_INITIALIZATION_PENDING};
 use crate::util::{js_value_to_string, sanitize_identifier, set_js_property};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeadershipRole {
+    Leader,
+    Follower,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaderPresence {
+    Known,
+    Unknown,
+}
 
 // Worker state
 pub struct WorkerState {
     pub worker_id: String,
-    pub is_leader: Rc<RefCell<bool>>,
+    pub is_leader: Rc<RefCell<LeadershipRole>>,
+    pub has_leader: Rc<RefCell<LeaderPresence>>,
     pub db: Rc<RefCell<Option<SQLiteDatabase>>>,
     pub channel: BroadcastChannel,
     pub db_name: String,
     pub pending_queries: Rc<RefCell<HashMap<String, PendingQuery>>>,
+    pub follower_timeout_ms: f64,
 }
 
 fn reflect_get(target: &JsValue, key: &str) -> Result<JsValue, JsValue> {
@@ -38,6 +52,32 @@ fn send_channel_message(
             js_value_to_string(&err)
         )
     })
+}
+
+fn post_worker_message(obj: &js_sys::Object) -> Result<(), String> {
+    let global = js_sys::global();
+    let scope: DedicatedWorkerGlobalScope = global
+        .dyn_into()
+        .map_err(|_| "Failed to access worker scope".to_string())?;
+    scope
+        .post_message(obj.as_ref())
+        .map_err(|err| js_value_to_string(&err))
+}
+
+fn send_worker_ready_message() -> Result<(), String> {
+    let message = js_sys::Object::new();
+    set_js_property(&message, "type", &JsValue::from_str("worker-ready"))
+        .map_err(|err| js_value_to_string(&err))?;
+    post_worker_message(&message)
+}
+
+fn send_worker_error_message(error: &str) -> Result<(), String> {
+    let message = js_sys::Object::new();
+    set_js_property(&message, "type", &JsValue::from_str("worker-error"))
+        .map_err(|err| js_value_to_string(&err))?;
+    set_js_property(&message, "error", &JsValue::from_str(error))
+        .map_err(|err| js_value_to_string(&err))?;
+    post_worker_message(&message)
 }
 
 impl WorkerState {
@@ -62,31 +102,56 @@ impl WorkerState {
             }
         }
 
+        fn get_follower_timeout_from_global() -> f64 {
+            let global = js_sys::global();
+            let val = Reflect::get(&global, &JsValue::from_str("__SQLITE_FOLLOWER_TIMEOUT_MS"))
+                .unwrap_or(JsValue::UNDEFINED);
+            if let Some(n) = val.as_f64() {
+                if n.is_finite() && n >= 0.0 {
+                    return n;
+                }
+            }
+            5000.0
+        }
+
         let worker_id = Uuid::new_v4().to_string();
         let db_name_raw = get_db_name_from_global()?;
         let channel_name = format!("sqlite-queries-{}", sanitize_identifier(&db_name_raw));
         let channel = BroadcastChannel::new(&channel_name)?;
+        let follower_timeout_ms = get_follower_timeout_from_global();
 
         Ok(WorkerState {
             worker_id,
-            is_leader: Rc::new(RefCell::new(false)),
+            is_leader: Rc::new(RefCell::new(LeadershipRole::Follower)),
+            has_leader: Rc::new(RefCell::new(LeaderPresence::Unknown)),
             db: Rc::new(RefCell::new(None)),
             channel,
             db_name: db_name_raw,
             pending_queries: Rc::new(RefCell::new(HashMap::new())),
+            follower_timeout_ms,
         })
     }
 
     pub fn setup_channel_listener(&self) -> Result<(), JsValue> {
         let is_leader = Rc::clone(&self.is_leader);
+        let has_leader = Rc::clone(&self.has_leader);
         let db = Rc::clone(&self.db);
         let pending_queries = Rc::clone(&self.pending_queries);
         let channel = self.channel.clone();
+        let worker_id = self.worker_id.clone();
 
         let onmessage = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
             let data = event.data();
             if let Ok(msg) = serde_wasm_bindgen::from_value::<ChannelMessage>(data) {
-                handle_channel_message(&is_leader, &db, &channel, &pending_queries, msg);
+                handle_channel_message(
+                    &is_leader,
+                    &has_leader,
+                    &db,
+                    &channel,
+                    &pending_queries,
+                    &worker_id,
+                    msg,
+                );
             }
         }) as Box<dyn FnMut(web_sys::MessageEvent)>);
 
@@ -96,9 +161,73 @@ impl WorkerState {
         Ok(())
     }
 
+    pub fn start_leader_probe(self: &Rc<Self>) {
+        if matches!(*self.is_leader.borrow(), LeadershipRole::Leader) {
+            return;
+        }
+        let has_leader = Rc::clone(&self.has_leader);
+        let channel = self.channel.clone();
+        let worker_id = self.worker_id.clone();
+        let follower_timeout_ms = self.follower_timeout_ms;
+        spawn_local(async move {
+            const POLL_INTERVAL_MS: f64 = 250.0;
+            let mut remaining_ms = if follower_timeout_ms.is_finite() {
+                follower_timeout_ms.max(0.0)
+            } else {
+                f64::INFINITY
+            };
+
+            if remaining_ms <= 0.0 {
+                if matches!(*has_leader.borrow(), LeaderPresence::Unknown) {
+                    let message = format!(
+                        "Leader election timed out after {:.0}ms",
+                        follower_timeout_ms.max(0.0)
+                    );
+                    let _ = send_worker_error_message(&message);
+                }
+                return;
+            }
+
+            while remaining_ms.is_infinite() || remaining_ms > 0.0 {
+                if matches!(*has_leader.borrow(), LeaderPresence::Known) {
+                    break;
+                }
+                let ping = ChannelMessage::LeaderPing {
+                    requester_id: worker_id.clone(),
+                };
+                if let Err(err_msg) = send_channel_message(&channel, &ping) {
+                    let _ = send_worker_error_message(&err_msg);
+                    break;
+                }
+                if matches!(*has_leader.borrow(), LeaderPresence::Known) {
+                    break;
+                }
+
+                let sleep_duration = if remaining_ms.is_infinite() {
+                    POLL_INTERVAL_MS
+                } else {
+                    remaining_ms.min(POLL_INTERVAL_MS)
+                };
+                if sleep_duration <= 0.0 {
+                    break;
+                }
+                sleep_ms(sleep_duration.ceil() as i32).await;
+                if remaining_ms.is_finite() {
+                    remaining_ms -= sleep_duration;
+                }
+            }
+            if matches!(*has_leader.borrow(), LeaderPresence::Unknown) {
+                let timeout = follower_timeout_ms.max(0.0);
+                let message = format!("Leader election timed out after {:.0}ms", timeout);
+                let _ = send_worker_error_message(&message);
+            }
+        });
+    }
+
     pub async fn attempt_leadership(&self) -> Result<(), JsValue> {
         let worker_id = self.worker_id.clone();
         let is_leader = Rc::clone(&self.is_leader);
+        let has_leader = Rc::clone(&self.has_leader);
         let db = Rc::clone(&self.db);
         let channel = self.channel.clone();
         let db_name_for_handler = self.db_name.clone();
@@ -112,17 +241,20 @@ impl WorkerState {
         set_js_property(&options, "mode", &JsValue::from_str("exclusive"))?;
 
         let handler = Closure::once(move |_lock: JsValue| -> Promise {
-            *is_leader.borrow_mut() = true;
+            *is_leader.borrow_mut() = LeadershipRole::Leader;
+            *has_leader.borrow_mut() = LeaderPresence::Known;
 
             let db = Rc::clone(&db);
             let channel = channel.clone();
             let worker_id = worker_id.clone();
             let db_name = db_name_for_handler.clone();
+            let has_leader_inner = Rc::clone(&has_leader);
 
             spawn_local(async move {
                 match SQLiteDatabase::initialize_opfs(&db_name).await {
                     Ok(database) => {
                         *db.borrow_mut() = Some(database);
+                        *has_leader_inner.borrow_mut() = LeaderPresence::Known;
 
                         let msg = ChannelMessage::NewLeader {
                             leader_id: worker_id.clone(),
@@ -135,8 +267,15 @@ impl WorkerState {
                             };
                             let _ = send_channel_message(&channel, &fallback);
                         }
+                        if let Err(err_msg) = send_worker_ready_message() {
+                            let _ = send_worker_error_message(&err_msg);
+                        }
                     }
-                    Err(_e) => {}
+                    Err(err) => {
+                        let msg = js_value_to_string(&err);
+                        *has_leader_inner.borrow_mut() = LeaderPresence::Unknown;
+                        let _ = send_worker_error_message(&msg);
+                    }
                 }
             });
 
@@ -166,9 +305,12 @@ impl WorkerState {
         sql: String,
         params: Option<Vec<serde_json::Value>>,
     ) -> Result<String, String> {
-        if *self.is_leader.borrow() {
+        if matches!(*self.is_leader.borrow(), LeadershipRole::Leader) {
             exec_on_db(Rc::clone(&self.db), sql, params).await
         } else {
+            if matches!(*self.has_leader.borrow(), LeaderPresence::Unknown) {
+                return Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string());
+            }
             let query_id = Uuid::new_v4().to_string();
 
             let promise = Promise::new(&mut |resolve, reject| {
@@ -182,7 +324,7 @@ impl WorkerState {
             let timeout_promise = schedule_timeout_promise(
                 Rc::clone(&self.pending_queries),
                 query_id.clone(),
-                5000.0,
+                self.follower_timeout_ms,
             );
 
             let result = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::race(
@@ -194,17 +336,19 @@ impl WorkerState {
                 Ok(val) => val
                     .as_string()
                     .ok_or_else(|| "Invalid response".to_string()),
-                Err(e) => Err(format!("{e:?}")),
+                Err(e) => Err(js_value_to_string(&e)),
             }
         }
     }
 }
 
 fn handle_channel_message(
-    is_leader: &Rc<RefCell<bool>>,
+    is_leader: &Rc<RefCell<LeadershipRole>>,
+    has_leader: &Rc<RefCell<LeaderPresence>>,
     db: &Rc<RefCell<Option<SQLiteDatabase>>>,
     channel: &BroadcastChannel,
     pending_queries: &Rc<RefCell<HashMap<String, PendingQuery>>>,
+    worker_id: &str,
     msg: ChannelMessage,
 ) {
     match msg {
@@ -212,8 +356,8 @@ fn handle_channel_message(
             query_id,
             sql,
             params,
-        } => {
-            if *is_leader.borrow() {
+        } => match *is_leader.borrow() {
+            LeadershipRole::Leader => {
                 let db = Rc::clone(db);
                 let channel = channel.clone();
                 spawn_local(async move {
@@ -229,13 +373,39 @@ fn handle_channel_message(
                     }
                 });
             }
-        }
+            LeadershipRole::Follower => {}
+        },
         ChannelMessage::QueryResponse {
             query_id,
             result,
             error,
         } => handle_query_response(pending_queries, query_id, result, error),
-        ChannelMessage::NewLeader { leader_id: _ } => {}
+        ChannelMessage::NewLeader { leader_id: _ } => {
+            let mut has_leader_ref = has_leader.borrow_mut();
+            let previous_presence = *has_leader_ref;
+            *has_leader_ref = LeaderPresence::Known;
+            drop(has_leader_ref);
+
+            match previous_presence {
+                LeaderPresence::Unknown => {
+                    if let Err(err_msg) = send_worker_ready_message() {
+                        let _ = send_worker_error_message(&err_msg);
+                    }
+                }
+                LeaderPresence::Known => {}
+            }
+        }
+        ChannelMessage::LeaderPing { requester_id: _ } => match *is_leader.borrow() {
+            LeadershipRole::Leader => {
+                let response = ChannelMessage::NewLeader {
+                    leader_id: worker_id.to_string(),
+                };
+                if let Err(err_msg) = send_channel_message(channel, &response) {
+                    let _ = send_worker_error_message(&err_msg);
+                }
+            }
+            LeadershipRole::Follower => {}
+        },
     }
 }
 
@@ -271,6 +441,46 @@ fn handle_query_response(
                 .call1(&JsValue::NULL, &JsValue::from_str(&res));
         }
     }
+}
+
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let resolve_for_timeout = resolve.clone();
+        let closure = Closure::once(move || {
+            let _ = resolve_for_timeout.call0(&JsValue::NULL);
+        });
+
+        let timeout_result = js_sys::global()
+            .dyn_into::<DedicatedWorkerGlobalScope>()
+            .map_err(|_| ())
+            .and_then(|scope| {
+                scope
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(
+                        closure.as_ref().unchecked_ref(),
+                        ms,
+                    )
+                    .map(|_| ())
+                    .map_err(|_| ())
+            })
+            .or_else(|_| {
+                web_sys::window().ok_or(()).and_then(|win| {
+                    win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        closure.as_ref().unchecked_ref(),
+                        ms,
+                    )
+                    .map(|_| ())
+                    .map_err(|_| ())
+                })
+            });
+
+        if timeout_result.is_err() {
+            // As a best-effort fallback, resolve immediately.
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+
+        closure.forget();
+    });
+    let _ = JsFuture::from(promise).await;
 }
 
 async fn exec_on_db(
@@ -360,8 +570,9 @@ mod tests {
             state.worker_id.contains('-'),
             "Worker ID should be valid UUID format"
         );
-        assert!(
-            !*state.is_leader.borrow(),
+        assert_eq!(
+            *state.is_leader.borrow(),
+            LeadershipRole::Follower,
             "New workers should not start as leader"
         );
         assert!(
@@ -395,13 +606,25 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_leadership_state_management() {
         if let Ok(state) = WorkerState::new() {
-            assert!(!*state.is_leader.borrow(), "Should start as follower");
+            assert_eq!(
+                *state.is_leader.borrow(),
+                LeadershipRole::Follower,
+                "Should start as follower"
+            );
 
-            *state.is_leader.borrow_mut() = true;
-            assert!(*state.is_leader.borrow(), "Should become leader");
+            *state.is_leader.borrow_mut() = LeadershipRole::Leader;
+            assert_eq!(
+                *state.is_leader.borrow(),
+                LeadershipRole::Leader,
+                "Should become leader"
+            );
 
-            *state.is_leader.borrow_mut() = false;
-            assert!(!*state.is_leader.borrow(), "Should become follower again");
+            *state.is_leader.borrow_mut() = LeadershipRole::Follower;
+            assert_eq!(
+                *state.is_leader.borrow(),
+                LeadershipRole::Follower,
+                "Should become follower again"
+            );
         }
     }
 
@@ -465,7 +688,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_execute_query_leader_vs_follower_paths() {
         if let Ok(leader_state) = WorkerState::new() {
-            *leader_state.is_leader.borrow_mut() = true;
+            *leader_state.is_leader.borrow_mut() = LeadershipRole::Leader;
 
             let test_queries = vec![
                 "",
@@ -492,8 +715,9 @@ mod tests {
         }
 
         if let Ok(follower_state) = WorkerState::new() {
-            assert!(
-                !*follower_state.is_leader.borrow(),
+            assert_eq!(
+                *follower_state.is_leader.borrow(),
+                LeadershipRole::Follower,
                 "Should start as follower"
             );
 
@@ -501,12 +725,11 @@ mod tests {
                 .execute_query("SELECT 1".to_string(), None)
                 .await;
             match result {
-                Err(msg) => assert!(
-                    msg.contains("timeout") || msg.contains("Query timeout"),
-                    "Follower should timeout, got: {}",
-                    msg
+                Err(msg) => assert_eq!(
+                    msg, WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
+                    "Follower should reject while leader is pending"
                 ),
-                Ok(_) => panic!("Expected timeout error for follower"),
+                Ok(_) => panic!("Expected initialization error for follower"),
             }
         }
     }
@@ -524,7 +747,11 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_attempt_leadership_behavior() {
         if let Ok(state) = WorkerState::new() {
-            assert!(!*state.is_leader.borrow(), "Should start as follower");
+            assert_eq!(
+                *state.is_leader.borrow(),
+                LeadershipRole::Follower,
+                "Should start as follower"
+            );
             assert!(
                 state.db.borrow().is_none(),
                 "Database should be uninitialized"
@@ -536,7 +763,11 @@ mod tests {
         let workers: Vec<_> = (0..3).filter_map(|_| WorkerState::new().ok()).collect();
         if workers.len() >= 2 {
             for worker in &workers {
-                assert!(!*worker.is_leader.borrow(), "All should start as followers");
+                assert_eq!(
+                    *worker.is_leader.borrow(),
+                    LeadershipRole::Follower,
+                    "All should start as followers"
+                );
             }
 
             for worker in &workers {
@@ -557,9 +788,10 @@ mod tests {
                 pending_clone.borrow().len()
             );
 
-            *state.is_leader.borrow_mut() = true;
-            assert!(
+            *state.is_leader.borrow_mut() = LeadershipRole::Leader;
+            assert_eq!(
                 *is_leader_clone.borrow(),
+                LeadershipRole::Leader,
                 "Changes should be visible through cloned Rc"
             );
 
@@ -576,5 +808,10 @@ mod tests {
                 "Should see changes through original Rc"
             );
         }
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn test_sleep_ms_completes() {
+        sleep_ms(0).await;
     }
 }

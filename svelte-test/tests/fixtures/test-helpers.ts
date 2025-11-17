@@ -8,17 +8,12 @@ export async function createTestDatabase(name: string = 'ui-test-db'): Promise<S
 	await init();
 	
 	// Create database instance
-	const result = SQLiteWasmDatabase.new(name);
+	const result = await SQLiteWasmDatabase.new(name);
 	if (result.error) {
 		throw new Error(`Failed to create database: ${result.error.msg}`);
 	}
 	
-	const db = result.value!
-	
-	// Wait for worker to be ready
-	await new Promise(resolve => setTimeout(resolve, 1000));
-	
-	return db;
+	return result.value!;
 }
 
 /**

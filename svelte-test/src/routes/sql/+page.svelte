@@ -19,15 +19,12 @@
             await init();
 
             status = 'Creating database connection...';
-            let res = SQLiteWasmDatabase.new('ui-sql-db');
+            let res = await SQLiteWasmDatabase.new('ui-sql-db');
             if (res.error) {
                 status = `Failed to create database connection: ${res.error.msg}`;
                 return;
             }
             db = res.value;
-
-            status = 'Waiting for worker to be ready...';
-            await new Promise(resolve => setTimeout(resolve, 1000));
 
             status = 'Setting up database schema...';
             await db.query(`

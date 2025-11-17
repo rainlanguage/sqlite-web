@@ -72,7 +72,6 @@ JS_GLUE_PLACEHOLDER
     if (typeof wasm.worker_main === 'function') {
       wasm.worker_main();
       console.log('[Worker] SQLite worker initialized successfully');
-      self.postMessage({type: 'worker-ready'});
     } else {
       throw new Error('worker_main function not found');
     }

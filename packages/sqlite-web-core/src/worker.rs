@@ -8,7 +8,9 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
 use crate::coordination::WorkerState;
-use crate::messages::WorkerMessage;
+use crate::messages::{
+    WorkerMessage, WORKER_ERROR_TYPE_GENERIC, WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
+};
 use crate::util::{js_value_to_string, set_js_property};
 
 // Global state
@@ -45,6 +47,22 @@ fn post_message(obj: &js_sys::Object) -> Result<(), JsValue> {
     worker_scope.post_message(obj.as_ref())
 }
 
+fn make_structured_error(err: &str) -> Result<JsValue, JsValue> {
+    let error_object = js_sys::Object::new();
+    let error_type = if err == WORKER_ERROR_TYPE_INITIALIZATION_PENDING {
+        WORKER_ERROR_TYPE_INITIALIZATION_PENDING
+    } else {
+        WORKER_ERROR_TYPE_GENERIC
+    };
+    set_js_property(
+        error_object.as_ref(),
+        "type",
+        &JsValue::from_str(error_type),
+    )?;
+    set_js_property(error_object.as_ref(), "message", &JsValue::from_str(err))?;
+    Ok(error_object.into())
+}
+
 fn make_query_result_message(
     request_id: u32,
     result: Result<String, String>,
@@ -63,7 +81,8 @@ fn make_query_result_message(
         }
         Err(err) => {
             set_js_property(&response, "result", &JsValue::NULL)?;
-            set_js_property(&response, "error", &JsValue::from_str(&err))?;
+            let error_value = make_structured_error(&err)?;
+            set_js_property(&response, "error", &error_value)?;
         }
     }
     Ok(response)
@@ -127,9 +146,13 @@ fn handle_incoming_value(data: JsValue) {
 pub fn main() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
 
-    let state = Rc::new(WorkerState::new()?);
+    let state = Rc::new(WorkerState::new().inspect_err(|err| {
+        let _ = send_worker_error(err.clone());
+    })?);
 
-    state.setup_channel_listener()?;
+    state.setup_channel_listener().inspect_err(|err| {
+        let _ = send_worker_error(err.clone());
+    })?;
 
     let state_clone = Rc::clone(&state);
     spawn_local(async move {
@@ -143,6 +166,7 @@ pub fn main() -> Result<(), JsValue> {
     WORKER_STATE.with(|s| {
         *s.borrow_mut() = Some(Rc::clone(&state));
     });
+    state.start_leader_probe();
 
     // Setup message handler from main thread
     let global = js_sys::global();
@@ -162,6 +186,7 @@ pub fn main() -> Result<(), JsValue> {
 #[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
+    use crate::coordination::LeadershipRole;
     use js_sys::{Object, Reflect};
     use std::rc::Rc;
     use wasm_bindgen_test::*;
@@ -306,7 +331,7 @@ mod tests {
         if let Ok(state) = WorkerState::new() {
             let state_rc = Rc::new(state);
 
-            assert!(!*state_rc.is_leader.borrow());
+            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Follower);
             assert!(state_rc.db.borrow().is_none());
             assert!(state_rc.pending_queries.borrow().is_empty());
         }
@@ -317,10 +342,10 @@ mod tests {
         if let Ok(state) = WorkerState::new() {
             let state_rc = Rc::new(state);
 
-            assert!(!*state_rc.is_leader.borrow());
+            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Follower);
 
-            *state_rc.is_leader.borrow_mut() = true;
-            assert!(*state_rc.is_leader.borrow());
+            *state_rc.is_leader.borrow_mut() = LeadershipRole::Leader;
+            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Leader);
         }
     }
 
@@ -339,8 +364,8 @@ mod tests {
         if let Ok(state) = WorkerState::new() {
             let state_rc = Rc::new(state);
 
-            *state_rc.is_leader.borrow_mut() = true;
-            assert!(*state_rc.is_leader.borrow());
+            *state_rc.is_leader.borrow_mut() = LeadershipRole::Leader;
+            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Leader);
             assert!(state_rc.db.borrow().is_none());
         }
     }
@@ -387,8 +412,8 @@ mod tests {
                 let leader_rc = Rc::new(leader_state);
                 let follower_rc = Rc::new(follower_state);
 
-                *leader_rc.is_leader.borrow_mut() = true;
-                assert!(!*follower_rc.is_leader.borrow());
+                *leader_rc.is_leader.borrow_mut() = LeadershipRole::Leader;
+                assert_eq!(*follower_rc.is_leader.borrow(), LeadershipRole::Follower);
 
                 assert!(leader_rc.setup_channel_listener().is_ok());
                 assert!(follower_rc.setup_channel_listener().is_ok());
