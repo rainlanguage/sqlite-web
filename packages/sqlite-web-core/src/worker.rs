@@ -1,425 +1,117 @@
-// worker.rs - This module runs in the worker context
 use std::cell::RefCell;
 use std::rc::Rc;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::throw_val;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
-use crate::coordination::WorkerState;
-use crate::messages::{
-    WorkerMessage, WORKER_ERROR_TYPE_GENERIC, WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
+use crate::coordination::{
+    send_worker_error, worker_config_from_global, CoordinatorState, DbWorkerState, WorkerConfig,
 };
-use crate::util::{js_value_to_string, set_js_property};
+use crate::messages::WorkerMessage;
 
-// Global state
+enum WorkerRuntime {
+    Coordinator(Rc<CoordinatorState>),
+    DbOnly(Rc<DbWorkerState>),
+}
+
 thread_local! {
-    static WORKER_STATE: RefCell<Option<Rc<WorkerState>>> = const { RefCell::new(None) };
+    static RUNTIME: RefCell<Option<WorkerRuntime>> = const { RefCell::new(None) };
 }
 
-fn send_worker_error_message(message: &str) -> Result<(), JsValue> {
-    let error_object = js_sys::Object::new();
-    set_js_property(
-        error_object.as_ref(),
-        "type",
-        &JsValue::from_str("worker-error"),
-    )?;
-    set_js_property(error_object.as_ref(), "error", &JsValue::from_str(message))?;
+fn is_db_only_mode() -> bool {
+    let global = js_sys::global();
+    js_sys::Reflect::get(&global, &JsValue::from_str("__SQLITE_DB_ONLY"))
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn install_main_thread_handler() {
     let global = js_sys::global();
     let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
-    worker_scope.post_message(error_object.as_ref())
-}
-
-fn send_worker_error(err: JsValue) -> Result<(), JsValue> {
-    let message = js_value_to_string(&err);
-    send_worker_error_message(&message).map_err(|post_err| {
-        JsValue::from_str(&format!(
-            "Failed to deliver worker error '{message}': {}",
-            js_value_to_string(&post_err)
-        ))
-    })
-}
-
-fn post_message(obj: &js_sys::Object) -> Result<(), JsValue> {
-    let global = js_sys::global();
-    let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
-    worker_scope.post_message(obj.as_ref())
-}
-
-fn make_structured_error(err: &str) -> Result<JsValue, JsValue> {
-    let error_object = js_sys::Object::new();
-    let error_type = if err == WORKER_ERROR_TYPE_INITIALIZATION_PENDING {
-        WORKER_ERROR_TYPE_INITIALIZATION_PENDING
-    } else {
-        WORKER_ERROR_TYPE_GENERIC
-    };
-    set_js_property(
-        error_object.as_ref(),
-        "type",
-        &JsValue::from_str(error_type),
-    )?;
-    set_js_property(error_object.as_ref(), "message", &JsValue::from_str(err))?;
-    Ok(error_object.into())
-}
-
-fn make_query_result_message(
-    request_id: u32,
-    result: Result<String, String>,
-) -> Result<js_sys::Object, JsValue> {
-    let response = js_sys::Object::new();
-    set_js_property(&response, "type", &JsValue::from_str("query-result"))?;
-    set_js_property(
-        &response,
-        "requestId",
-        &JsValue::from_f64(request_id as f64),
-    )?;
-    match result {
-        Ok(res) => {
-            set_js_property(&response, "result", &JsValue::from_str(&res))?;
-            set_js_property(&response, "error", &JsValue::NULL)?;
-        }
-        Err(err) => {
-            set_js_property(&response, "result", &JsValue::NULL)?;
-            let error_value = make_structured_error(&err)?;
-            set_js_property(&response, "error", &error_value)?;
-        }
-    }
-    Ok(response)
-}
-
-fn handle_incoming_value(data: JsValue) {
-    let make_error_response = || {
-        let o = js_sys::Object::new();
-        let _ = set_js_property(&o, "type", &JsValue::from_str("query-result"));
-        let _ = set_js_property(&o, "result", &JsValue::NULL);
-        let _ = set_js_property(&o, "error", &JsValue::from_str("Failed to build response"));
-        o
-    };
-
-    let send_response = |response: &js_sys::Object| {
-        post_message(response)
-            .or_else(|err| send_worker_error(err).map_err(throw_val))
-            .ok();
-    };
-    match serde_wasm_bindgen::from_value::<WorkerMessage>(data) {
-        Ok(WorkerMessage::ExecuteQuery {
-            request_id,
-            sql,
-            params,
-        }) => {
-            WORKER_STATE.with(|s| {
-                let Some(state) = s.borrow().as_ref().map(Rc::clone) else {
-                    return;
-                };
-                spawn_local(async move {
-                    let result = state.execute_query(sql, params).await;
-                    let response =
-                        make_query_result_message(request_id, result).unwrap_or_else(|err| {
-                            let _ = send_worker_error(err);
-                            make_error_response()
-                        });
-                    send_response(&response);
+    let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
+        match serde_wasm_bindgen::from_value::<WorkerMessage>(event.data()) {
+            Ok(msg) => {
+                RUNTIME.with(|runtime| {
+                    if let Some(inner) = runtime.borrow().as_ref() {
+                        match inner {
+                            WorkerRuntime::Coordinator(state) => state.handle_main_message(msg),
+                            WorkerRuntime::DbOnly(db) => db.handle_message(msg),
+                        }
+                    }
                 });
-            });
+            }
+            Err(err) => {
+                let _ = send_worker_error(JsValue::from_str(&format!(
+                    "Invalid worker message: {err:?}"
+                )));
+            }
         }
-        Err(err) => {
-            let error_text = format!("Invalid worker message: {err:?}");
-            // No requestId available here; send error without it
-            let response = (|| {
-                let o = js_sys::Object::new();
-                set_js_property(&o, "type", &JsValue::from_str("query-result"))?;
-                set_js_property(&o, "result", &JsValue::NULL)?;
-                set_js_property(&o, "error", &JsValue::from_str(&error_text))?;
-                Ok(o)
-            })()
-            .unwrap_or_else(|e| {
-                let _ = send_worker_error(e);
-                make_error_response()
-            });
-            send_response(&response);
-        }
-    }
+    }) as Box<dyn FnMut(MessageEvent)>);
+
+    worker_scope.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+    onmessage.forget();
+}
+
+fn start_coordinator_runtime(config: WorkerConfig) -> Result<(), JsValue> {
+    let state = CoordinatorState::new(config)?;
+    state.setup_channel_listener()?;
+    state.start_leader_probe();
+    state.try_become_leader();
+
+    RUNTIME.with(|runtime| {
+        *runtime.borrow_mut() = Some(WorkerRuntime::Coordinator(Rc::clone(&state)));
+    });
+
+    install_main_thread_handler();
+    Ok(())
+}
+
+fn start_db_only_runtime(config: WorkerConfig) -> Result<(), JsValue> {
+    let state = DbWorkerState::new(config);
+    state.start();
+    RUNTIME.with(|runtime| {
+        *runtime.borrow_mut() = Some(WorkerRuntime::DbOnly(Rc::clone(&state)));
+    });
+    install_main_thread_handler();
+    Ok(())
 }
 
 /// Entry point for the worker - called from the blob
 pub fn main() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
+    let config = worker_config_from_global()?;
 
-    let state = Rc::new(WorkerState::new().inspect_err(|err| {
-        let _ = send_worker_error(err.clone());
-    })?);
-
-    state.setup_channel_listener().inspect_err(|err| {
-        let _ = send_worker_error(err.clone());
-    })?;
-
-    let state_clone = Rc::clone(&state);
-    spawn_local(async move {
-        if let Err(err) = state_clone.attempt_leadership().await {
-            if let Err(send_err) = send_worker_error(err) {
-                throw_val(send_err);
-            }
-        }
-    });
-
-    WORKER_STATE.with(|s| {
-        *s.borrow_mut() = Some(Rc::clone(&state));
-    });
-    state.start_leader_probe();
-
-    // Setup message handler from main thread
-    let global = js_sys::global();
-    let worker_scope: DedicatedWorkerGlobalScope = global.unchecked_into();
-
-    let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
-        let data = event.data();
-        handle_incoming_value(data);
-    }) as Box<dyn FnMut(MessageEvent)>);
-
-    worker_scope.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-    onmessage.forget();
-
-    Ok(())
+    if is_db_only_mode() {
+        start_db_only_runtime(config)
+    } else {
+        start_coordinator_runtime(config)
+    }
 }
 
 #[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
-    use crate::coordination::LeadershipRole;
-    use js_sys::{Object, Reflect};
-    use std::rc::Rc;
+    use js_sys::Reflect;
     use wasm_bindgen_test::*;
-    use web_sys::MessageEvent;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
-    fn test_worker_state_creation() {
-        let state = WorkerState::new();
-        assert!(state.is_ok());
-        let worker_state = state.unwrap();
-        assert!(!worker_state.worker_id.is_empty());
+    fn db_only_mode_defaults_to_false() {
+        let _ = Reflect::delete_property(&js_sys::global(), &JsValue::from_str("__SQLITE_DB_ONLY"));
+        assert!(!is_db_only_mode());
     }
 
     #[wasm_bindgen_test]
-    fn test_main_function_initialization() {
-        let result = main();
-        assert!(result.is_ok());
-    }
-
-    #[wasm_bindgen_test]
-    fn test_global_worker_scope_access() {
-        let global = js_sys::global();
-        assert!(!global.is_undefined());
-        assert!(!global.is_null());
-    }
-
-    #[wasm_bindgen_test]
-    fn test_message_structure_validation() {
-        let valid_msg = Object::new();
+    fn db_only_mode_reads_flag() {
         Reflect::set(
-            &valid_msg,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("execute-query"),
+            &js_sys::global(),
+            &JsValue::from_str("__SQLITE_DB_ONLY"),
+            &JsValue::TRUE,
         )
         .unwrap();
-        Reflect::set(
-            &valid_msg,
-            &JsValue::from_str("sql"),
-            &JsValue::from_str("SELECT 1"),
-        )
-        .unwrap();
-
-        let msg_type = Reflect::get(&valid_msg, &JsValue::from_str("type")).unwrap();
-        let sql = Reflect::get(&valid_msg, &JsValue::from_str("sql")).unwrap();
-
-        assert_eq!(msg_type.as_string().unwrap(), "execute-query");
-        assert_eq!(sql.as_string().unwrap(), "SELECT 1");
-
-        let invalid_msg = Object::new();
-        Reflect::set(
-            &invalid_msg,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("execute-query"),
-        )
-        .unwrap();
-
-        let sql_result = Reflect::get(&invalid_msg, &JsValue::from_str("sql"));
-        assert!(sql_result.is_ok());
-        assert!(sql_result.unwrap().is_undefined());
-
-        let empty_sql_msg = Object::new();
-        Reflect::set(
-            &empty_sql_msg,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("execute-query"),
-        )
-        .unwrap();
-        Reflect::set(
-            &empty_sql_msg,
-            &JsValue::from_str("sql"),
-            &JsValue::from_str(""),
-        )
-        .unwrap();
-
-        let empty_sql = Reflect::get(&empty_sql_msg, &JsValue::from_str("sql")).unwrap();
-        assert_eq!(empty_sql.as_string().unwrap(), "");
-    }
-
-    #[wasm_bindgen_test]
-    fn test_query_response_structure() {
-        let success_response = Object::new();
-        Reflect::set(
-            &success_response,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("query-result"),
-        )
-        .unwrap();
-        Reflect::set(
-            &success_response,
-            &JsValue::from_str("result"),
-            &JsValue::from_str("test_result"),
-        )
-        .unwrap();
-        Reflect::set(
-            &success_response,
-            &JsValue::from_str("error"),
-            &JsValue::NULL,
-        )
-        .unwrap();
-
-        let response_type = Reflect::get(&success_response, &JsValue::from_str("type")).unwrap();
-        let result = Reflect::get(&success_response, &JsValue::from_str("result")).unwrap();
-        let error = Reflect::get(&success_response, &JsValue::from_str("error")).unwrap();
-
-        assert_eq!(response_type.as_string().unwrap(), "query-result");
-        assert_eq!(result.as_string().unwrap(), "test_result");
-        assert!(error.is_null());
-
-        let error_response = Object::new();
-        Reflect::set(
-            &error_response,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("query-result"),
-        )
-        .unwrap();
-        Reflect::set(
-            &error_response,
-            &JsValue::from_str("result"),
-            &JsValue::NULL,
-        )
-        .unwrap();
-        Reflect::set(
-            &error_response,
-            &JsValue::from_str("error"),
-            &JsValue::from_str("test_error"),
-        )
-        .unwrap();
-
-        let error_type = Reflect::get(&error_response, &JsValue::from_str("type")).unwrap();
-        let error_result = Reflect::get(&error_response, &JsValue::from_str("result")).unwrap();
-        let error_msg = Reflect::get(&error_response, &JsValue::from_str("error")).unwrap();
-
-        assert_eq!(error_type.as_string().unwrap(), "query-result");
-        assert!(error_result.is_null());
-        assert_eq!(error_msg.as_string().unwrap(), "test_error");
-    }
-
-    #[wasm_bindgen_test]
-    fn test_worker_state_async_query_setup() {
-        if let Ok(state) = WorkerState::new() {
-            let state_rc = Rc::new(state);
-
-            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Follower);
-            assert!(state_rc.db.borrow().is_none());
-            assert!(state_rc.pending_queries.borrow().is_empty());
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn test_worker_leadership_state() {
-        if let Ok(state) = WorkerState::new() {
-            let state_rc = Rc::new(state);
-
-            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Follower);
-
-            *state_rc.is_leader.borrow_mut() = LeadershipRole::Leader;
-            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Leader);
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn test_worker_state_reference_counting() {
-        let state = WorkerState::new().unwrap();
-        let state_rc = Rc::new(state);
-        let cloned_state = Rc::clone(&state_rc);
-        assert_eq!(Rc::strong_count(&state_rc), 2);
-        drop(cloned_state);
-        assert_eq!(Rc::strong_count(&state_rc), 1);
-    }
-
-    #[wasm_bindgen_test]
-    fn test_error_state_validation() {
-        if let Ok(state) = WorkerState::new() {
-            let state_rc = Rc::new(state);
-
-            *state_rc.is_leader.borrow_mut() = LeadershipRole::Leader;
-            assert_eq!(*state_rc.is_leader.borrow(), LeadershipRole::Leader);
-            assert!(state_rc.db.borrow().is_none());
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn test_message_event_handling() {
-        WORKER_STATE.with(|s| {
-            if let Ok(state) = WorkerState::new() {
-                *s.borrow_mut() = Some(Rc::new(state));
-
-                let msg = Object::new();
-                Reflect::set(
-                    &msg,
-                    &JsValue::from_str("type"),
-                    &JsValue::from_str("execute-query"),
-                )
-                .unwrap();
-                Reflect::set(
-                    &msg,
-                    &JsValue::from_str("sql"),
-                    &JsValue::from_str("SELECT 1"),
-                )
-                .unwrap();
-
-                let _event = MessageEvent::new("message").unwrap();
-
-                let global = js_sys::global();
-                let _constructor =
-                    Reflect::get(&global, &JsValue::from_str("MessageEvent")).unwrap();
-                let event_init = Object::new();
-                Reflect::set(&event_init, &JsValue::from_str("data"), &msg).unwrap();
-
-                if let Some(worker_state) = s.borrow().as_ref() {
-                    assert!(!worker_state.worker_id.is_empty());
-                }
-            }
-        });
-    }
-
-    #[wasm_bindgen_test]
-    fn test_worker_coordination_state_setup() {
-        if let Ok(leader_state) = WorkerState::new() {
-            if let Ok(follower_state) = WorkerState::new() {
-                let leader_rc = Rc::new(leader_state);
-                let follower_rc = Rc::new(follower_state);
-
-                *leader_rc.is_leader.borrow_mut() = LeadershipRole::Leader;
-                assert_eq!(*follower_rc.is_leader.borrow(), LeadershipRole::Follower);
-
-                assert!(leader_rc.setup_channel_listener().is_ok());
-                assert!(follower_rc.setup_channel_listener().is_ok());
-
-                assert_ne!(leader_rc.worker_id, follower_rc.worker_id);
-            }
-        }
+        assert!(is_db_only_mode());
     }
 }

@@ -6,10 +6,15 @@ use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
-use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope};
+use web_sys::{
+    Blob, BlobPropertyBag, BroadcastChannel, DedicatedWorkerGlobalScope, MessageEvent, Url, Worker,
+};
 
 use crate::database::SQLiteDatabase;
-use crate::messages::{ChannelMessage, PendingQuery, WORKER_ERROR_TYPE_INITIALIZATION_PENDING};
+use crate::messages::{
+    ChannelMessage, MainThreadMessage, WorkerErrorPayload, WorkerMessage,
+    WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
+};
 use crate::util::{js_value_to_string, sanitize_identifier, set_js_property};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,143 +23,107 @@ pub enum LeadershipRole {
     Follower,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LeaderPresence {
-    Known,
-    Unknown,
-}
-
-// Worker state
-pub struct WorkerState {
-    pub worker_id: String,
-    pub is_leader: Rc<RefCell<LeadershipRole>>,
-    pub has_leader: Rc<RefCell<LeaderPresence>>,
-    pub db: Rc<RefCell<Option<SQLiteDatabase>>>,
-    pub channel: BroadcastChannel,
+pub struct WorkerConfig {
     pub db_name: String,
-    pub pending_queries: Rc<RefCell<HashMap<String, PendingQuery>>>,
     pub follower_timeout_ms: f64,
 }
 
-fn reflect_get(target: &JsValue, key: &str) -> Result<JsValue, JsValue> {
-    Reflect::get(target, &JsValue::from_str(key))
-}
+pub fn worker_config_from_global() -> Result<WorkerConfig, JsValue> {
+    fn get_db_name_from_global() -> Result<String, JsValue> {
+        let global = js_sys::global();
+        let val = Reflect::get(&global, &JsValue::from_str("__SQLITE_DB_NAME"))
+            .unwrap_or(JsValue::UNDEFINED);
+        if let Some(s) = val.as_string() {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(JsValue::from_str("Database name is required"));
+            }
+            Ok(trimmed)
+        } else {
+            #[cfg(test)]
+            {
+                return Ok("testdb".to_string());
+            }
+            #[allow(unreachable_code)]
+            Err(JsValue::from_str("Database name is required"))
+        }
+    }
 
-fn send_channel_message(
-    channel: &BroadcastChannel,
-    message: &ChannelMessage,
-) -> Result<(), String> {
-    let value = serde_wasm_bindgen::to_value(message)
-        .map_err(|err| format!("Failed to serialize channel message: {err:?}"))?;
-    channel.post_message(&value).map_err(|err| {
-        format!(
-            "Failed to post channel message: {}",
-            js_value_to_string(&err)
-        )
+    fn get_follower_timeout_from_global() -> f64 {
+        let global = js_sys::global();
+        let val = Reflect::get(&global, &JsValue::from_str("__SQLITE_FOLLOWER_TIMEOUT_MS"))
+            .unwrap_or(JsValue::UNDEFINED);
+        if let Some(n) = val.as_f64() {
+            if n.is_finite() && n >= 0.0 {
+                return n;
+            }
+        }
+        5000.0
+    }
+
+    Ok(WorkerConfig {
+        db_name: get_db_name_from_global()?,
+        follower_timeout_ms: get_follower_timeout_from_global(),
     })
 }
 
-fn post_worker_message(obj: &js_sys::Object) -> Result<(), String> {
-    let global = js_sys::global();
-    let scope: DedicatedWorkerGlobalScope = global
-        .dyn_into()
-        .map_err(|_| "Failed to access worker scope".to_string())?;
-    scope
-        .post_message(obj.as_ref())
-        .map_err(|err| js_value_to_string(&err))
+enum DbRequestOrigin {
+    Local { request_id: u32 },
+    Forwarded { query_id: String },
 }
 
-fn send_worker_ready_message() -> Result<(), String> {
-    let message = js_sys::Object::new();
-    set_js_property(&message, "type", &JsValue::from_str("worker-ready"))
-        .map_err(|err| js_value_to_string(&err))?;
-    post_worker_message(&message)
+pub struct CoordinatorState {
+    pub worker_id: String,
+    pub role: Rc<RefCell<LeadershipRole>>,
+    pub leader_id: Rc<RefCell<Option<String>>>,
+    pub leader_ready: Rc<RefCell<bool>>,
+    pub ready_signaled: Rc<RefCell<bool>>,
+    pub follower_timeout_ms: f64,
+    pub channel: BroadcastChannel,
+    pub db_worker_ready: Rc<RefCell<bool>>,
+    pub db_worker: Rc<RefCell<Option<Worker>>>,
+    pub db_name: String,
+    db_pending: Rc<RefCell<HashMap<u32, DbRequestOrigin>>>,
+    pub follower_pending: Rc<RefCell<HashMap<String, u32>>>,
+    pub next_db_request_id: Rc<RefCell<u32>>,
 }
 
-fn send_worker_error_message(error: &str) -> Result<(), String> {
-    let message = js_sys::Object::new();
-    set_js_property(&message, "type", &JsValue::from_str("worker-error"))
-        .map_err(|err| js_value_to_string(&err))?;
-    set_js_property(&message, "error", &JsValue::from_str(error))
-        .map_err(|err| js_value_to_string(&err))?;
-    post_worker_message(&message)
+pub struct DbWorkerState {
+    pub db: Rc<RefCell<Option<SQLiteDatabase>>>,
+    pub db_name: String,
 }
 
-impl WorkerState {
-    pub fn new() -> Result<Self, JsValue> {
-        fn get_db_name_from_global() -> Result<String, JsValue> {
-            let global = js_sys::global();
-            let val = Reflect::get(&global, &JsValue::from_str("__SQLITE_DB_NAME"))
-                .unwrap_or(JsValue::UNDEFINED);
-            if let Some(s) = val.as_string() {
-                let trimmed = s.trim().to_string();
-                if trimmed.is_empty() {
-                    return Err(JsValue::from_str("Database name is required"));
-                }
-                Ok(trimmed)
-            } else {
-                #[cfg(test)]
-                {
-                    return Ok("testdb".to_string());
-                }
-                #[allow(unreachable_code)]
-                Err(JsValue::from_str("Database name is required"))
-            }
-        }
+pub fn create_broadcast_channel(db_name: &str) -> Result<BroadcastChannel, JsValue> {
+    let channel_name = format!("sqlite-queries-{}", sanitize_identifier(db_name));
+    BroadcastChannel::new(&channel_name)
+}
 
-        fn get_follower_timeout_from_global() -> f64 {
-            let global = js_sys::global();
-            let val = Reflect::get(&global, &JsValue::from_str("__SQLITE_FOLLOWER_TIMEOUT_MS"))
-                .unwrap_or(JsValue::UNDEFINED);
-            if let Some(n) = val.as_f64() {
-                if n.is_finite() && n >= 0.0 {
-                    return n;
-                }
-            }
-            5000.0
-        }
-
-        let worker_id = Uuid::new_v4().to_string();
-        let db_name_raw = get_db_name_from_global()?;
-        let channel_name = format!("sqlite-queries-{}", sanitize_identifier(&db_name_raw));
-        let channel = BroadcastChannel::new(&channel_name)?;
-        let follower_timeout_ms = get_follower_timeout_from_global();
-
-        Ok(WorkerState {
-            worker_id,
-            is_leader: Rc::new(RefCell::new(LeadershipRole::Follower)),
-            has_leader: Rc::new(RefCell::new(LeaderPresence::Unknown)),
-            db: Rc::new(RefCell::new(None)),
-            channel,
-            db_name: db_name_raw,
-            pending_queries: Rc::new(RefCell::new(HashMap::new())),
-            follower_timeout_ms,
-        })
+impl CoordinatorState {
+    pub fn new(config: WorkerConfig) -> Result<Rc<Self>, JsValue> {
+        Ok(Rc::new(CoordinatorState {
+            worker_id: Uuid::new_v4().to_string(),
+            role: Rc::new(RefCell::new(LeadershipRole::Follower)),
+            leader_id: Rc::new(RefCell::new(None)),
+            leader_ready: Rc::new(RefCell::new(false)),
+            ready_signaled: Rc::new(RefCell::new(false)),
+            follower_timeout_ms: config.follower_timeout_ms,
+            channel: create_broadcast_channel(&config.db_name)?,
+            db_worker_ready: Rc::new(RefCell::new(false)),
+            db_worker: Rc::new(RefCell::new(None)),
+            db_name: config.db_name,
+            db_pending: Rc::new(RefCell::new(HashMap::new())),
+            follower_pending: Rc::new(RefCell::new(HashMap::new())),
+            next_db_request_id: Rc::new(RefCell::new(1)),
+        }))
     }
 
-    pub fn setup_channel_listener(&self) -> Result<(), JsValue> {
-        let is_leader = Rc::clone(&self.is_leader);
-        let has_leader = Rc::clone(&self.has_leader);
-        let db = Rc::clone(&self.db);
-        let pending_queries = Rc::clone(&self.pending_queries);
-        let channel = self.channel.clone();
-        let worker_id = self.worker_id.clone();
-
-        let onmessage = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
-            let data = event.data();
-            if let Ok(msg) = serde_wasm_bindgen::from_value::<ChannelMessage>(data) {
-                handle_channel_message(
-                    &is_leader,
-                    &has_leader,
-                    &db,
-                    &channel,
-                    &pending_queries,
-                    &worker_id,
-                    msg,
-                );
+    pub fn setup_channel_listener(self: &Rc<Self>) -> Result<(), JsValue> {
+        let state = Rc::clone(self);
+        let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
+            if let Ok(msg) = serde_wasm_bindgen::from_value::<ChannelMessage>(event.data()) {
+                state.handle_channel_message(msg);
             }
-        }) as Box<dyn FnMut(web_sys::MessageEvent)>);
-
+        }) as Box<dyn FnMut(MessageEvent)>);
         self.channel
             .set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
@@ -162,26 +131,26 @@ impl WorkerState {
     }
 
     pub fn start_leader_probe(self: &Rc<Self>) {
-        if matches!(*self.is_leader.borrow(), LeadershipRole::Leader) {
+        if matches!(*self.role.borrow(), LeadershipRole::Leader) {
             return;
         }
-        let has_leader = Rc::clone(&self.has_leader);
-        let channel = self.channel.clone();
+        let has_leader = Rc::clone(&self.leader_id);
+        let timeout_ms = self.follower_timeout_ms;
         let worker_id = self.worker_id.clone();
-        let follower_timeout_ms = self.follower_timeout_ms;
+        let channel = self.channel.clone();
         spawn_local(async move {
             const POLL_INTERVAL_MS: f64 = 250.0;
-            let mut remaining_ms = if follower_timeout_ms.is_finite() {
-                follower_timeout_ms.max(0.0)
+            let mut remaining_ms = if timeout_ms.is_finite() {
+                timeout_ms.max(0.0)
             } else {
                 f64::INFINITY
             };
 
             if remaining_ms <= 0.0 {
-                if matches!(*has_leader.borrow(), LeaderPresence::Unknown) {
+                if has_leader.borrow().is_none() {
                     let message = format!(
                         "Leader election timed out after {:.0}ms",
-                        follower_timeout_ms.max(0.0)
+                        timeout_ms.max(0.0)
                     );
                     let _ = send_worker_error_message(&message);
                 }
@@ -189,7 +158,7 @@ impl WorkerState {
             }
 
             while remaining_ms.is_infinite() || remaining_ms > 0.0 {
-                if matches!(*has_leader.borrow(), LeaderPresence::Known) {
+                if has_leader.borrow().is_some() {
                     break;
                 }
                 let ping = ChannelMessage::LeaderPing {
@@ -197,9 +166,6 @@ impl WorkerState {
                 };
                 if let Err(err_msg) = send_channel_message(&channel, &ping) {
                     let _ = send_worker_error_message(&err_msg);
-                    break;
-                }
-                if matches!(*has_leader.borrow(), LeaderPresence::Known) {
                     break;
                 }
 
@@ -216,234 +182,615 @@ impl WorkerState {
                     remaining_ms -= sleep_duration;
                 }
             }
-            if matches!(*has_leader.borrow(), LeaderPresence::Unknown) {
-                let timeout = follower_timeout_ms.max(0.0);
+            if has_leader.borrow().is_none() {
+                let timeout = timeout_ms.max(0.0);
                 let message = format!("Leader election timed out after {:.0}ms", timeout);
                 let _ = send_worker_error_message(&message);
             }
         });
     }
 
-    pub async fn attempt_leadership(&self) -> Result<(), JsValue> {
-        let worker_id = self.worker_id.clone();
-        let is_leader = Rc::clone(&self.is_leader);
-        let has_leader = Rc::clone(&self.has_leader);
-        let db = Rc::clone(&self.db);
-        let channel = self.channel.clone();
-        let db_name_for_handler = self.db_name.clone();
+    pub fn try_become_leader(self: &Rc<Self>) {
+        let state = Rc::clone(self);
+        spawn_local(async move {
+            if let Err(err) = state.acquire_lock_and_promote().await {
+                let _ = send_worker_error_message(&js_value_to_string(&err));
+                state.promote_without_lock();
+            }
+        });
+    }
 
-        // Get navigator.locks from WorkerGlobalScope
+    async fn acquire_lock_and_promote(self: &Rc<Self>) -> Result<(), JsValue> {
         let global = js_sys::global();
-        let navigator = reflect_get(&global, "navigator")?;
-        let locks = reflect_get(&navigator, "locks")?;
+        let navigator = Reflect::get(&global, &JsValue::from_str("navigator"))?;
+        let locks = Reflect::get(&navigator, &JsValue::from_str("locks"))?;
+        let request_value = Reflect::get(&locks, &JsValue::from_str("request"))?;
+        let Some(request_fn) = request_value.dyn_ref::<Function>() else {
+            self.promote_without_lock();
+            return Ok(());
+        };
 
         let options = Object::new();
         set_js_property(&options, "mode", &JsValue::from_str("exclusive"))?;
-
+        let lock_id = format!("sqlite-database-{}", sanitize_identifier(&self.db_name));
+        let state = Rc::clone(self);
         let handler = Closure::once(move |_lock: JsValue| -> Promise {
-            *is_leader.borrow_mut() = LeadershipRole::Leader;
-            *has_leader.borrow_mut() = LeaderPresence::Known;
-
-            let db = Rc::clone(&db);
-            let channel = channel.clone();
-            let worker_id = worker_id.clone();
-            let db_name = db_name_for_handler.clone();
-            let has_leader_inner = Rc::clone(&has_leader);
-
-            spawn_local(async move {
-                match SQLiteDatabase::initialize_opfs(&db_name).await {
-                    Ok(database) => {
-                        *db.borrow_mut() = Some(database);
-                        *has_leader_inner.borrow_mut() = LeaderPresence::Known;
-
-                        let msg = ChannelMessage::NewLeader {
-                            leader_id: worker_id.clone(),
-                        };
-                        if let Err(err_msg) = send_channel_message(&channel, &msg) {
-                            let fallback = ChannelMessage::QueryResponse {
-                                query_id: worker_id.clone(),
-                                result: None,
-                                error: Some(err_msg),
-                            };
-                            let _ = send_channel_message(&channel, &fallback);
-                        }
-                        if let Err(err_msg) = send_worker_ready_message() {
-                            let _ = send_worker_error_message(&err_msg);
-                        }
-                    }
-                    Err(err) => {
-                        let msg = js_value_to_string(&err);
-                        *has_leader_inner.borrow_mut() = LeaderPresence::Unknown;
-                        let _ = send_worker_error_message(&msg);
-                    }
-                }
-            });
-
-            // Never resolve = hold lock forever
+            state.on_lock_granted();
             Promise::new(&mut |_, _| {})
         });
 
-        let request_fn = reflect_get(&locks, "request")?;
-        let request_fn = request_fn
-            .dyn_ref::<Function>()
-            .ok_or_else(|| JsValue::from_str("navigator.locks.request is not a function"))?;
-
-        let lock_id: String = format!("sqlite-database-{}", sanitize_identifier(&self.db_name));
         request_fn.call3(
             &locks,
             &JsValue::from_str(&lock_id),
             &options,
             handler.as_ref().unchecked_ref(),
         )?;
-
         handler.forget();
         Ok(())
     }
 
-    pub async fn execute_query(
-        &self,
+    fn promote_without_lock(self: &Rc<Self>) {
+        self.on_lock_granted();
+    }
+
+    fn on_lock_granted(self: &Rc<Self>) {
+        *self.role.borrow_mut() = LeadershipRole::Leader;
+        self.mark_leader_known(self.worker_id.clone());
+
+        let new_leader = ChannelMessage::NewLeader {
+            leader_id: self.worker_id.clone(),
+        };
+        if let Err(err) = send_channel_message(&self.channel, &new_leader) {
+            let _ = send_worker_error_message(&err);
+        }
+        if let Err(err) = self.spawn_db_worker() {
+            let _ = send_worker_error_message(&js_value_to_string(&err));
+        }
+    }
+
+    fn spawn_db_worker(self: &Rc<Self>) -> Result<(), JsValue> {
+        let db_name_encoded =
+            serde_json::to_string(&self.db_name).unwrap_or_else(|_| "\"unknown\"".to_string());
+        let body_val = Reflect::get(
+            &js_sys::global(),
+            &JsValue::from_str("__SQLITE_EMBEDDED_WORKER"),
+        )
+        .map_err(|e| {
+            JsValue::from_str(&format!(
+                "Failed to read embedded worker source: {}",
+                js_value_to_string(&e)
+            ))
+        })?;
+        let body = body_val
+            .as_string()
+            .ok_or_else(|| JsValue::from_str("Embedded worker source is missing"))?;
+        let preamble = format!(
+            "self.__SQLITE_DB_ONLY = true;\nself.__SQLITE_DB_NAME = {};\nself.__SQLITE_FOLLOWER_TIMEOUT_MS = {};\n",
+            db_name_encoded,
+            self.follower_timeout_ms,
+        );
+
+        let parts = js_sys::Array::new();
+        parts.push(&JsValue::from_str(&preamble));
+        parts.push(&JsValue::from_str(&body));
+        let options = BlobPropertyBag::new();
+        options.set_type("application/javascript");
+        let blob = Blob::new_with_str_sequence_and_options(&parts, &options)?;
+        let url = Url::create_object_url_with_blob(&blob)?;
+
+        let worker = Worker::new(&url)?;
+        Url::revoke_object_url(&url)?;
+
+        let state = Rc::clone(self);
+        let handler = Closure::wrap(Box::new(move |event: MessageEvent| {
+            state.handle_db_worker_event(event);
+        }) as Box<dyn FnMut(MessageEvent)>);
+        worker.set_onmessage(Some(handler.as_ref().unchecked_ref()));
+        handler.forget();
+
+        self.db_worker.borrow_mut().replace(worker);
+        Ok(())
+    }
+
+    pub fn handle_db_worker_event(self: &Rc<Self>, event: MessageEvent) {
+        let data = event.data();
+        match serde_wasm_bindgen::from_value::<MainThreadMessage>(data.clone()) {
+            Ok(MainThreadMessage::WorkerReady) => {
+                *self.db_worker_ready.borrow_mut() = true;
+                *self.leader_ready.borrow_mut() = true;
+                let ready = ChannelMessage::LeaderReady {
+                    leader_id: self.worker_id.clone(),
+                };
+                if let Err(err) = send_channel_message(&self.channel, &ready) {
+                    let _ = send_worker_error_message(&err);
+                }
+                self.signal_ready_once();
+            }
+            Ok(MainThreadMessage::QueryResult {
+                request_id,
+                result,
+                error,
+            }) => {
+                self.handle_db_query_result(request_id, result, error);
+            }
+            Err(_) => {
+                if let Some(err) = parse_worker_error_payload(&data) {
+                    self.handle_db_worker_failure(err);
+                }
+            }
+        }
+    }
+
+    fn handle_db_worker_failure(&self, error: String) {
+        *self.db_worker_ready.borrow_mut() = false;
+        *self.leader_ready.borrow_mut() = false;
+        let _ = send_worker_error_message(&error);
+        let pending = self.db_pending.borrow_mut().drain().collect::<Vec<_>>();
+        for (_, origin) in pending {
+            self.fail_origin(origin, error.clone());
+        }
+    }
+
+    pub fn handle_main_message(self: &Rc<Self>, msg: WorkerMessage) {
+        match msg {
+            WorkerMessage::ExecuteQuery {
+                request_id,
+                sql,
+                params,
+            } => match *self.role.borrow() {
+                LeadershipRole::Leader => {
+                    if !*self.db_worker_ready.borrow() {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                        );
+                        return;
+                    }
+                    self.forward_query_to_db(DbRequestOrigin::Local { request_id }, sql, params);
+                }
+                LeadershipRole::Follower => {
+                    if !*self.leader_ready.borrow() {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                        );
+                        return;
+                    }
+                    let query_id = Uuid::new_v4().to_string();
+                    self.follower_pending
+                        .borrow_mut()
+                        .insert(query_id.clone(), request_id);
+                    let pending = Rc::clone(&self.follower_pending);
+                    let timeout = self.follower_timeout_ms;
+                    let timeout_query_id = query_id.clone();
+                    spawn_local(async move {
+                        sleep_ms(timeout.ceil() as i32).await;
+                        if let Some(original) = pending.borrow_mut().remove(&timeout_query_id) {
+                            let _ = send_query_result_to_main(
+                                original,
+                                Err("Query timeout".to_string()),
+                            );
+                        }
+                    });
+                    let request = ChannelMessage::QueryRequest {
+                        query_id,
+                        sql,
+                        params,
+                    };
+                    if let Err(err) = send_channel_message(&self.channel, &request) {
+                        let _ = send_worker_error_message(&err);
+                    }
+                }
+            },
+        }
+    }
+
+    fn handle_channel_message(self: &Rc<Self>, msg: ChannelMessage) {
+        match msg {
+            ChannelMessage::LeaderPing { requester_id: _ } => {
+                if matches!(*self.role.borrow(), LeadershipRole::Leader) {
+                    let response = if *self.db_worker_ready.borrow() {
+                        ChannelMessage::LeaderReady {
+                            leader_id: self.worker_id.clone(),
+                        }
+                    } else {
+                        ChannelMessage::NewLeader {
+                            leader_id: self.worker_id.clone(),
+                        }
+                    };
+                    if let Err(err) = send_channel_message(&self.channel, &response) {
+                        let _ = send_worker_error_message(&err);
+                    }
+                } else if *self.leader_ready.borrow() {
+                    let leader_id = self
+                        .leader_id
+                        .borrow()
+                        .clone()
+                        .unwrap_or_else(|| self.worker_id.clone());
+                    let response = ChannelMessage::LeaderReady { leader_id };
+                    let _ = send_channel_message(&self.channel, &response);
+                }
+            }
+            ChannelMessage::NewLeader { leader_id } => {
+                self.mark_leader_known(leader_id);
+            }
+            ChannelMessage::LeaderReady { leader_id } => {
+                self.mark_leader_known(leader_id);
+                *self.leader_ready.borrow_mut() = true;
+                self.signal_ready_once();
+            }
+            ChannelMessage::QueryRequest {
+                query_id,
+                sql,
+                params,
+            } => {
+                if matches!(*self.role.borrow(), LeadershipRole::Leader) {
+                    if !*self.db_worker_ready.borrow() {
+                        let _ = send_channel_message(
+                            &self.channel,
+                            &ChannelMessage::QueryResponse {
+                                query_id,
+                                result: None,
+                                error: Some(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                            },
+                        );
+                        return;
+                    }
+                    self.forward_query_to_db(DbRequestOrigin::Forwarded { query_id }, sql, params);
+                }
+            }
+            ChannelMessage::QueryResponse {
+                query_id,
+                result,
+                error,
+            } => {
+                if let Some(request_id) = self.follower_pending.borrow_mut().remove(&query_id) {
+                    let outcome = match (result, error) {
+                        (Some(res), _) => Ok(res),
+                        (_, Some(err)) => Err(err),
+                        _ => Err("Unknown query response".to_string()),
+                    };
+                    let _ = send_query_result_to_main(request_id, outcome);
+                }
+            }
+        }
+    }
+
+    fn forward_query_to_db(
+        self: &Rc<Self>,
+        origin: DbRequestOrigin,
         sql: String,
         params: Option<Vec<serde_json::Value>>,
-    ) -> Result<String, String> {
-        if matches!(*self.is_leader.borrow(), LeadershipRole::Leader) {
-            exec_on_db(Rc::clone(&self.db), sql, params).await
-        } else {
-            if matches!(*self.has_leader.borrow(), LeaderPresence::Unknown) {
-                return Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string());
+    ) {
+        let worker = {
+            let borrow = self.db_worker.borrow();
+            let Some(worker) = borrow.as_ref() else {
+                match origin {
+                    DbRequestOrigin::Local { request_id } => {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                        );
+                    }
+                    DbRequestOrigin::Forwarded { query_id } => {
+                        let _ = send_channel_message(
+                            &self.channel,
+                            &ChannelMessage::QueryResponse {
+                                query_id,
+                                result: None,
+                                error: Some(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                            },
+                        );
+                    }
+                }
+                return;
+            };
+            worker.clone()
+        };
+
+        let db_request_id = {
+            let mut next = self.next_db_request_id.borrow_mut();
+            let id = *next;
+            *next = next.wrapping_add(1).max(1);
+            id
+        };
+        self.db_pending.borrow_mut().insert(db_request_id, origin);
+
+        let msg = WorkerMessage::ExecuteQuery {
+            request_id: db_request_id,
+            sql,
+            params,
+        };
+        match serde_wasm_bindgen::to_value(&msg) {
+            Ok(val) => {
+                if let Err(err) = worker.post_message(&val) {
+                    let _ = send_worker_error_message(&js_value_to_string(&err));
+                    if let Some(origin) = self.db_pending.borrow_mut().remove(&db_request_id) {
+                        self.fail_origin(
+                            origin,
+                            "Failed to dispatch query to DB worker".to_string(),
+                        );
+                    }
+                }
             }
-            let query_id = Uuid::new_v4().to_string();
-
-            let promise = Promise::new(&mut |resolve, reject| {
-                self.pending_queries
-                    .borrow_mut()
-                    .insert(query_id.clone(), PendingQuery { resolve, reject });
-            });
-
-            post_query_request(&self.channel, &query_id, sql, params)?;
-
-            let timeout_promise = schedule_timeout_promise(
-                Rc::clone(&self.pending_queries),
-                query_id.clone(),
-                self.follower_timeout_ms,
-            );
-
-            let result = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::race(
-                &js_sys::Array::of2(&promise, &timeout_promise),
-            ))
-            .await;
-
-            match result {
-                Ok(val) => val
-                    .as_string()
-                    .ok_or_else(|| "Invalid response".to_string()),
-                Err(e) => Err(js_value_to_string(&e)),
+            Err(err) => {
+                let _ = send_worker_error_message(&format!("{err:?}"));
+                if let Some(origin) = self.db_pending.borrow_mut().remove(&db_request_id) {
+                    self.fail_origin(origin, "Failed to serialize query".to_string());
+                }
             }
+        }
+    }
+
+    fn fail_origin(&self, origin: DbRequestOrigin, error: String) {
+        match origin {
+            DbRequestOrigin::Local { request_id } => {
+                let _ = send_query_result_to_main(request_id, Err(error));
+            }
+            DbRequestOrigin::Forwarded { query_id } => {
+                let _ = send_channel_message(
+                    &self.channel,
+                    &ChannelMessage::QueryResponse {
+                        query_id,
+                        result: None,
+                        error: Some(error),
+                    },
+                );
+            }
+        }
+    }
+
+    fn handle_db_query_result(
+        self: &Rc<Self>,
+        db_request_id: u32,
+        result: Option<String>,
+        error: Option<WorkerErrorPayload>,
+    ) {
+        let Some(origin) = self.db_pending.borrow_mut().remove(&db_request_id) else {
+            return;
+        };
+        let outcome = match (result, error) {
+            (Some(res), _) => Ok(res),
+            (_, Some(err)) => Err(error_payload_to_string(&err)),
+            _ => Err("Invalid response from DB worker".to_string()),
+        };
+        match origin {
+            DbRequestOrigin::Local { request_id } => {
+                let _ = send_query_result_to_main(request_id, outcome);
+            }
+            DbRequestOrigin::Forwarded { query_id } => match outcome {
+                Ok(res) => {
+                    let _ = send_channel_message(
+                        &self.channel,
+                        &ChannelMessage::QueryResponse {
+                            query_id,
+                            result: Some(res),
+                            error: None,
+                        },
+                    );
+                }
+                Err(err) => {
+                    let _ = send_channel_message(
+                        &self.channel,
+                        &ChannelMessage::QueryResponse {
+                            query_id,
+                            result: None,
+                            error: Some(err),
+                        },
+                    );
+                }
+            },
+        }
+    }
+
+    fn mark_leader_known(&self, leader_id: String) {
+        *self.leader_id.borrow_mut() = Some(leader_id);
+    }
+
+    fn signal_ready_once(&self) {
+        if *self.ready_signaled.borrow() {
+            return;
+        }
+        *self.ready_signaled.borrow_mut() = true;
+        if let Err(err) = send_worker_ready_message() {
+            let _ = send_worker_error_message(&err);
         }
     }
 }
 
-fn handle_channel_message(
-    is_leader: &Rc<RefCell<LeadershipRole>>,
-    has_leader: &Rc<RefCell<LeaderPresence>>,
-    db: &Rc<RefCell<Option<SQLiteDatabase>>>,
-    channel: &BroadcastChannel,
-    pending_queries: &Rc<RefCell<HashMap<String, PendingQuery>>>,
-    worker_id: &str,
-    msg: ChannelMessage,
-) {
-    match msg {
-        ChannelMessage::QueryRequest {
-            query_id,
-            sql,
-            params,
-        } => match *is_leader.borrow() {
-            LeadershipRole::Leader => {
-                let db = Rc::clone(db);
-                let channel = channel.clone();
+impl DbWorkerState {
+    pub fn new(config: WorkerConfig) -> Rc<Self> {
+        Rc::new(DbWorkerState {
+            db: Rc::new(RefCell::new(None)),
+            db_name: config.db_name,
+        })
+    }
+
+    pub fn start(self: &Rc<Self>) {
+        let state = Rc::clone(self);
+        spawn_local(async move {
+            match SQLiteDatabase::initialize_opfs(&state.db_name).await {
+                Ok(db) => {
+                    *state.db.borrow_mut() = Some(db);
+                    let _ = send_worker_ready_message();
+                }
+                Err(err) => {
+                    let _ = send_worker_error_message(&js_value_to_string(&err));
+                }
+            }
+        });
+    }
+
+    pub fn handle_message(self: &Rc<Self>, msg: WorkerMessage) {
+        match msg {
+            WorkerMessage::ExecuteQuery {
+                request_id,
+                sql,
+                params,
+            } => {
+                let db = Rc::clone(&self.db);
                 spawn_local(async move {
                     let result = exec_on_db(db, sql, params).await;
-                    let response = build_query_response(query_id.clone(), result);
-                    if let Err(err_msg) = send_channel_message(&channel, &response) {
-                        let fallback = ChannelMessage::QueryResponse {
-                            query_id: query_id.clone(),
-                            result: None,
-                            error: Some(err_msg),
-                        };
-                        let _ = send_channel_message(&channel, &fallback);
+                    match make_query_result_message(request_id, result) {
+                        Ok(resp) => {
+                            let _ = post_worker_message(&resp);
+                        }
+                        Err(err) => {
+                            let _ = send_worker_error(err);
+                        }
                     }
                 });
             }
-            LeadershipRole::Follower => {}
-        },
-        ChannelMessage::QueryResponse {
-            query_id,
-            result,
-            error,
-        } => handle_query_response(pending_queries, query_id, result, error),
-        ChannelMessage::NewLeader { leader_id: _ } => {
-            let mut has_leader_ref = has_leader.borrow_mut();
-            let previous_presence = *has_leader_ref;
-            *has_leader_ref = LeaderPresence::Known;
-            drop(has_leader_ref);
-
-            match previous_presence {
-                LeaderPresence::Unknown => {
-                    if let Err(err_msg) = send_worker_ready_message() {
-                        let _ = send_worker_error_message(&err_msg);
-                    }
-                }
-                LeaderPresence::Known => {}
-            }
         }
-        ChannelMessage::LeaderPing { requester_id: _ } => match *is_leader.borrow() {
-            LeadershipRole::Leader => {
-                let response = ChannelMessage::NewLeader {
-                    leader_id: worker_id.to_string(),
-                };
-                if let Err(err_msg) = send_channel_message(channel, &response) {
-                    let _ = send_worker_error_message(&err_msg);
-                }
-            }
-            LeadershipRole::Follower => {}
-        },
     }
 }
 
-fn build_query_response(query_id: String, result: Result<String, String>) -> ChannelMessage {
+fn send_channel_message(
+    channel: &BroadcastChannel,
+    message: &ChannelMessage,
+) -> Result<(), String> {
+    let value = serde_wasm_bindgen::to_value(message)
+        .map_err(|err| format!("Failed to serialize channel message: {err:?}"))?;
+    channel.post_message(&value).map_err(|err| {
+        format!(
+            "Failed to post channel message: {}",
+            js_value_to_string(&err)
+        )
+    })
+}
+
+fn error_payload_to_string(payload: &WorkerErrorPayload) -> String {
+    payload
+        .message
+        .clone()
+        .unwrap_or_else(|| payload.error_type.clone())
+}
+
+pub fn send_worker_ready_message() -> Result<(), String> {
+    let message = js_sys::Object::new();
+    set_js_property(&message, "type", &JsValue::from_str("worker-ready"))
+        .map_err(|err| js_value_to_string(&err))?;
+    post_worker_message(&message)
+}
+
+pub fn send_worker_error_message(error: &str) -> Result<(), String> {
+    let message = js_sys::Object::new();
+    set_js_property(&message, "type", &JsValue::from_str("worker-error"))
+        .map_err(|err| js_value_to_string(&err))?;
+    set_js_property(&message, "error", &JsValue::from_str(error))
+        .map_err(|err| js_value_to_string(&err))?;
+    post_worker_message(&message)
+}
+
+pub fn post_worker_message(obj: &js_sys::Object) -> Result<(), String> {
+    let global = js_sys::global();
+    let scope: DedicatedWorkerGlobalScope = global
+        .dyn_into()
+        .map_err(|_| "Failed to access worker scope".to_string())?;
+    scope
+        .post_message(obj.as_ref())
+        .map_err(|err| js_value_to_string(&err))
+}
+
+pub fn send_worker_error(err: JsValue) -> Result<(), JsValue> {
+    let message = js_value_to_string(&err);
+    send_worker_error_message(&message).map_err(|post_err| {
+        JsValue::from_str(&format!(
+            "Failed to deliver worker error '{message}': {}",
+            post_err
+        ))
+    })
+}
+
+fn parse_worker_error_payload(data: &JsValue) -> Option<String> {
+    let msg_type = Reflect::get(data, &JsValue::from_str("type"))
+        .ok()
+        .and_then(|val| val.as_string())?;
+    if msg_type != "worker-error" {
+        return None;
+    }
+    Reflect::get(data, &JsValue::from_str("error"))
+        .ok()
+        .and_then(|val| {
+            if val.is_undefined() || val.is_null() {
+                None
+            } else {
+                Some(js_value_to_string(&val))
+            }
+        })
+        .or_else(|| Some("Unknown worker error".to_string()))
+}
+
+fn make_structured_error(err: &str) -> Result<JsValue, JsValue> {
+    let error_object = js_sys::Object::new();
+    let error_type = if err == WORKER_ERROR_TYPE_INITIALIZATION_PENDING {
+        WORKER_ERROR_TYPE_INITIALIZATION_PENDING
+    } else {
+        crate::messages::WORKER_ERROR_TYPE_GENERIC
+    };
+    set_js_property(
+        error_object.as_ref(),
+        "type",
+        &JsValue::from_str(error_type),
+    )?;
+    set_js_property(error_object.as_ref(), "message", &JsValue::from_str(err))?;
+    Ok(error_object.into())
+}
+
+pub fn make_query_result_message(
+    request_id: u32,
+    result: Result<String, String>,
+) -> Result<js_sys::Object, JsValue> {
+    let response = js_sys::Object::new();
+    set_js_property(&response, "type", &JsValue::from_str("query-result"))?;
+    set_js_property(
+        &response,
+        "requestId",
+        &JsValue::from_f64(request_id as f64),
+    )?;
     match result {
-        Ok(res) => ChannelMessage::QueryResponse {
-            query_id,
-            result: Some(res),
-            error: None,
-        },
-        Err(err) => ChannelMessage::QueryResponse {
-            query_id,
-            result: None,
-            error: Some(err),
-        },
-    }
-}
-
-fn handle_query_response(
-    pending_queries: &Rc<RefCell<HashMap<String, PendingQuery>>>,
-    query_id: String,
-    result: Option<String>,
-    error: Option<String>,
-) {
-    if let Some(pending) = pending_queries.borrow_mut().remove(&query_id) {
-        if let Some(err) = error {
-            let _ = pending
-                .reject
-                .call1(&JsValue::NULL, &JsValue::from_str(&err));
-        } else if let Some(res) = result {
-            let _ = pending
-                .resolve
-                .call1(&JsValue::NULL, &JsValue::from_str(&res));
+        Ok(res) => {
+            set_js_property(&response, "result", &JsValue::from_str(&res))?;
+            set_js_property(&response, "error", &JsValue::NULL)?;
+        }
+        Err(err) => {
+            set_js_property(&response, "result", &JsValue::NULL)?;
+            let error_value = make_structured_error(&err)?;
+            set_js_property(&response, "error", &error_value)?;
         }
     }
+    Ok(response)
 }
 
-async fn sleep_ms(ms: i32) {
+pub fn send_query_result_to_main(
+    request_id: u32,
+    result: Result<String, String>,
+) -> Result<(), JsValue> {
+    let message = make_query_result_message(request_id, result)?;
+    post_worker_message(&message).map_err(|err| JsValue::from_str(&err))
+}
+
+async fn exec_on_db(
+    db: Rc<RefCell<Option<SQLiteDatabase>>>,
+    sql: String,
+    params: Option<Vec<serde_json::Value>>,
+) -> Result<String, String> {
+    let db_opt = db.borrow_mut().take();
+    let result = match db_opt {
+        Some(mut database) => {
+            let result = match params {
+                Some(p) => database.exec_with_params(&sql, p).await,
+                None => database.exec(&sql).await,
+            };
+            *db.borrow_mut() = Some(database);
+            result
+        }
+        None => Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+    };
+    result
+}
+
+pub async fn sleep_ms(ms: i32) {
     let promise = js_sys::Promise::new(&mut |resolve, _| {
         let resolve_for_timeout = resolve.clone();
         let closure = Closure::once(move || {
@@ -474,344 +821,10 @@ async fn sleep_ms(ms: i32) {
             });
 
         if timeout_result.is_err() {
-            // As a best-effort fallback, resolve immediately.
             let _ = resolve.call0(&JsValue::NULL);
         }
 
         closure.forget();
     });
     let _ = JsFuture::from(promise).await;
-}
-
-async fn exec_on_db(
-    db: Rc<RefCell<Option<SQLiteDatabase>>>,
-    sql: String,
-    params: Option<Vec<serde_json::Value>>,
-) -> Result<String, String> {
-    let db_opt = db.borrow_mut().take();
-    let result = match db_opt {
-        Some(mut database) => {
-            let result = match params {
-                Some(p) => database.exec_with_params(&sql, p).await,
-                None => database.exec(&sql).await,
-            };
-            *db.borrow_mut() = Some(database);
-            result
-        }
-        None => Err("Database not initialized".to_string()),
-    };
-    result
-}
-
-fn post_query_request(
-    channel: &BroadcastChannel,
-    query_id: &str,
-    sql: String,
-    params: Option<Vec<serde_json::Value>>,
-) -> Result<(), String> {
-    let msg = ChannelMessage::QueryRequest {
-        query_id: query_id.to_string(),
-        sql,
-        params,
-    };
-    let msg_js = serde_wasm_bindgen::to_value(&msg)
-        .map_err(|e| format!("Failed to serialize query request: {e:?}"))?;
-    channel
-        .post_message(&msg_js)
-        .map_err(|e| format!("Failed to post query request: {e:?}"))
-}
-
-fn schedule_timeout_promise(
-    pending_queries: Rc<RefCell<HashMap<String, PendingQuery>>>,
-    query_id: String,
-    ms: f64,
-) -> Promise {
-    Promise::new(&mut move |_, reject| {
-        let query_id = query_id.clone();
-        let pending_queries = Rc::clone(&pending_queries);
-        let callback = Closure::once(move || {
-            if pending_queries.borrow_mut().remove(&query_id).is_some() {
-                let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("Query timeout"));
-            }
-        });
-
-        let global = js_sys::global();
-        if let Ok(set_timeout_value) = reflect_get(&global, "setTimeout") {
-            if let Some(set_timeout_fn) = set_timeout_value.dyn_ref::<Function>() {
-                let _ = set_timeout_fn.call2(
-                    &JsValue::NULL,
-                    callback.as_ref().unchecked_ref(),
-                    &JsValue::from_f64(ms),
-                );
-            }
-        }
-        callback.forget();
-    })
-}
-
-#[cfg(all(test, target_family = "wasm"))]
-mod tests {
-    use super::*;
-    use js_sys::Function;
-    use wasm_bindgen_test::*;
-
-    wasm_bindgen_test_configure!(run_in_browser);
-
-    #[wasm_bindgen_test]
-    fn test_worker_state_creation_and_uniqueness() {
-        let results: Vec<_> = (0..5).map(|_| WorkerState::new()).collect();
-        let workers: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
-
-        assert!(!workers.is_empty(), "Should create at least one worker");
-
-        let state = &workers[0];
-        assert!(!state.worker_id.is_empty(), "Worker ID should not be empty");
-        assert!(
-            state.worker_id.contains('-'),
-            "Worker ID should be valid UUID format"
-        );
-        assert_eq!(
-            *state.is_leader.borrow(),
-            LeadershipRole::Follower,
-            "New workers should not start as leader"
-        );
-        assert!(
-            state.db.borrow().is_none(),
-            "Database should be uninitialized"
-        );
-        assert!(
-            state.pending_queries.borrow().is_empty(),
-            "Should have no pending queries"
-        );
-
-        if workers.len() >= 2 {
-            let mut ids = std::collections::HashSet::new();
-            for worker in &workers {
-                assert!(
-                    ids.insert(worker.worker_id.clone()),
-                    "Worker ID {} should be unique",
-                    worker.worker_id
-                );
-                assert_eq!(worker.worker_id.len(), 36, "UUID should be 36 characters");
-                assert_eq!(
-                    worker.worker_id.chars().filter(|&c| c == '-').count(),
-                    4,
-                    "UUID should have 4 dashes"
-                );
-            }
-            assert_eq!(ids.len(), workers.len(), "All worker IDs should be unique");
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn test_leadership_state_management() {
-        if let Ok(state) = WorkerState::new() {
-            assert_eq!(
-                *state.is_leader.borrow(),
-                LeadershipRole::Follower,
-                "Should start as follower"
-            );
-
-            *state.is_leader.borrow_mut() = LeadershipRole::Leader;
-            assert_eq!(
-                *state.is_leader.borrow(),
-                LeadershipRole::Leader,
-                "Should become leader"
-            );
-
-            *state.is_leader.borrow_mut() = LeadershipRole::Follower;
-            assert_eq!(
-                *state.is_leader.borrow(),
-                LeadershipRole::Follower,
-                "Should become follower again"
-            );
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn test_pending_queries_management() {
-        if let Ok(state) = WorkerState::new() {
-            let pending_queries = Rc::clone(&state.pending_queries);
-
-            assert_eq!(pending_queries.borrow().len(), 0);
-
-            let test_queries = vec!["query-a", "query-b", "query-c", "query-d", "query-e"];
-            {
-                let mut queries = pending_queries.borrow_mut();
-                for query_id in &test_queries {
-                    let resolve =
-                        Function::new_no_args(&format!("return 'resolved-{}';", query_id));
-                    let reject = Function::new_no_args(&format!("return 'rejected-{}';", query_id));
-                    queries.insert(query_id.to_string(), PendingQuery { resolve, reject });
-                }
-            }
-
-            assert_eq!(pending_queries.borrow().len(), test_queries.len());
-            for query_id in &test_queries {
-                assert!(pending_queries.borrow().contains_key(*query_id));
-            }
-
-            for (i, query_id) in test_queries.iter().enumerate() {
-                if i % 2 == 0 {
-                    let removed = pending_queries.borrow_mut().remove(*query_id);
-                    assert!(removed.is_some(), "Should remove query {}", query_id);
-                }
-            }
-
-            let remaining_count = test_queries.len() - test_queries.len().div_ceil(2);
-            assert_eq!(pending_queries.borrow().len(), remaining_count);
-
-            pending_queries.borrow_mut().clear();
-            assert_eq!(pending_queries.borrow().len(), 0);
-
-            {
-                let mut queries = pending_queries.borrow_mut();
-                let resolve = Function::new_no_args("return 'post-cleanup';");
-                let reject = Function::new_no_args("return 'rejected';");
-                queries.insert(
-                    "post-cleanup-test".to_string(),
-                    PendingQuery { resolve, reject },
-                );
-            }
-            assert_eq!(pending_queries.borrow().len(), 1);
-            assert!(pending_queries.borrow().contains_key("post-cleanup-test"));
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn test_message_deserialization_error_handling() {
-        let invalid_json = JsValue::from_str("invalid json");
-        let result = serde_wasm_bindgen::from_value::<ChannelMessage>(invalid_json);
-        assert!(result.is_err(), "Should fail to deserialize invalid JSON");
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_execute_query_leader_vs_follower_paths() {
-        if let Ok(leader_state) = WorkerState::new() {
-            *leader_state.is_leader.borrow_mut() = LeadershipRole::Leader;
-
-            let test_queries = vec![
-                "",
-                "SELECT 1",
-                "INSERT INTO test VALUES (1, 'hello')",
-                "SELECT 'test with spaces and symbols: !@#$%^&*()'",
-                "SELECT 'Hello 世界 🌍'",
-            ];
-
-            for query in test_queries {
-                let result = leader_state.execute_query(query.to_string(), None).await;
-                match result {
-                    Err(msg) => assert_eq!(
-                        msg, "Database not initialized",
-                        "Leader should get DB init error for query: {}",
-                        query
-                    ),
-                    Ok(_) => panic!(
-                        "Expected database not initialized error for query: {}",
-                        query
-                    ),
-                }
-            }
-        }
-
-        if let Ok(follower_state) = WorkerState::new() {
-            assert_eq!(
-                *follower_state.is_leader.borrow(),
-                LeadershipRole::Follower,
-                "Should start as follower"
-            );
-
-            let result = follower_state
-                .execute_query("SELECT 1".to_string(), None)
-                .await;
-            match result {
-                Err(msg) => assert_eq!(
-                    msg, WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
-                    "Follower should reject while leader is pending"
-                ),
-                Ok(_) => panic!("Expected initialization error for follower"),
-            }
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn test_setup_channel_listener() {
-        if let Ok(state) = WorkerState::new() {
-            assert!(
-                state.setup_channel_listener().is_ok(),
-                "setup_channel_listener should succeed"
-            );
-        }
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_attempt_leadership_behavior() {
-        if let Ok(state) = WorkerState::new() {
-            assert_eq!(
-                *state.is_leader.borrow(),
-                LeadershipRole::Follower,
-                "Should start as follower"
-            );
-            assert!(
-                state.db.borrow().is_none(),
-                "Database should be uninitialized"
-            );
-
-            let _ = state.attempt_leadership().await;
-        }
-
-        let workers: Vec<_> = (0..3).filter_map(|_| WorkerState::new().ok()).collect();
-        if workers.len() >= 2 {
-            for worker in &workers {
-                assert_eq!(
-                    *worker.is_leader.borrow(),
-                    LeadershipRole::Follower,
-                    "All should start as followers"
-                );
-            }
-
-            for worker in &workers {
-                let _ = worker.attempt_leadership().await;
-            }
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn test_worker_state_rc_shared_references() {
-        if let Ok(state) = WorkerState::new() {
-            let is_leader_clone = Rc::clone(&state.is_leader);
-            let pending_clone = Rc::clone(&state.pending_queries);
-
-            assert_eq!(*state.is_leader.borrow(), *is_leader_clone.borrow());
-            assert_eq!(
-                state.pending_queries.borrow().len(),
-                pending_clone.borrow().len()
-            );
-
-            *state.is_leader.borrow_mut() = LeadershipRole::Leader;
-            assert_eq!(
-                *is_leader_clone.borrow(),
-                LeadershipRole::Leader,
-                "Changes should be visible through cloned Rc"
-            );
-
-            {
-                let resolve = Function::new_no_args("return 'resolved';");
-                let reject = Function::new_no_args("return 'rejected';");
-                pending_clone
-                    .borrow_mut()
-                    .insert("test-ref".to_string(), PendingQuery { resolve, reject });
-            }
-            assert_eq!(
-                state.pending_queries.borrow().len(),
-                1,
-                "Should see changes through original Rc"
-            );
-        }
-    }
-
-    #[wasm_bindgen_test(async)]
-    async fn test_sleep_ms_completes() {
-        sleep_ms(0).await;
-    }
 }
