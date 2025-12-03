@@ -26,16 +26,6 @@
             }
             db = res.value;
 
-            status = 'Setting up database schema...';
-            await db.query(`
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    email TEXT UNIQUE,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            `);
-
             status = 'Ready ✅';
         } catch (error) {
             status = `Failed: ${error instanceof Error ? error.message : 'Unknown error'}`;
@@ -83,10 +73,10 @@
     <p class="status">Status: <span class="status-text">{status}</span></p>
 
     {#if status.includes('Ready')}
-        <div class="query-section">
-            <div class="query-header">
-                <h3>SQL Query</h3>
-                <div class="query-buttons">
+            <div class="query-section">
+                <div class="query-header">
+                    <h3>SQL Query</h3>
+                    <div class="query-buttons">
                     <button class="sample-btn" onclick={insertSampleData}>Insert Sample Data</button>
                     <button class="clear-btn" onclick={clearQuery}>Clear</button>
                 </div>
