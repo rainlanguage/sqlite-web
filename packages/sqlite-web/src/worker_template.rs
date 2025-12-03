@@ -6,6 +6,7 @@ pub fn generate_self_contained_worker(db_name: &str) -> String {
     let encoded = serde_json::to_string(db_name).unwrap_or_else(|_| "\"unknown\"".to_string());
     let embedded_body = serde_json::to_string(include_str!("embedded_worker.js"))
         .unwrap_or_else(|_| "\"\"".to_string());
+    // __SQLITE_EMBEDDED_WORKER stores the JSON-encoded embedded worker body (embedded_body) so the coordinator can spawn a separate DB worker (see coordination.rs:301-313); set when embedded-worker mode is used and consumers must JSON-decode before instantiating the worker.
     let prefix = format!(
         "self.__SQLITE_DB_NAME = {};\nself.__SQLITE_FOLLOWER_TIMEOUT_MS = 5000.0;\nself.__SQLITE_QUERY_TIMEOUT_MS = 30000.0;\nself.__SQLITE_EMBEDDED_WORKER = {};\n",
         encoded, embedded_body

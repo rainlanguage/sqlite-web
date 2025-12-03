@@ -27,6 +27,8 @@ pub enum LeadershipRole {
     Follower,
 }
 
+const MAX_DB_WORKER_RESPAWNS: u32 = 3;
+
 pub struct WorkerConfig {
     pub db_name: String,
     pub follower_timeout_ms: f64,
@@ -135,6 +137,7 @@ pub struct CoordinatorState {
     db_pending: Rc<RefCell<HashMap<u32, DbRequestOrigin>>>,
     pub follower_pending: Rc<RefCell<HashMap<String, u32>>>,
     pub next_db_request_id: Rc<RefCell<u32>>,
+    db_worker_restart_attempts: Rc<Cell<u32>>,
 }
 
 pub struct DbWorkerState {
@@ -167,6 +170,7 @@ impl CoordinatorState {
             db_pending: Rc::new(RefCell::new(HashMap::new())),
             follower_pending: Rc::new(RefCell::new(HashMap::new())),
             next_db_request_id: Rc::new(RefCell::new(1)),
+            db_worker_restart_attempts: Rc::new(Cell::new(0)),
         }))
     }
 
@@ -296,8 +300,6 @@ impl CoordinatorState {
     }
 
     fn spawn_db_worker(self: &Rc<Self>) -> Result<(), JsValue> {
-        let db_name_encoded =
-            serde_json::to_string(&self.db_name).unwrap_or_else(|_| "\"unknown\"".to_string());
         let body_val = Reflect::get(
             &js_sys::global(),
             &JsValue::from_str("__SQLITE_EMBEDDED_WORKER"),
@@ -311,23 +313,8 @@ impl CoordinatorState {
         let body = body_val
             .as_string()
             .ok_or_else(|| JsValue::from_str("Embedded worker source is missing"))?;
-        let preamble = format!(
-            "self.__SQLITE_DB_ONLY = true;\nself.__SQLITE_DB_NAME = {};\nself.__SQLITE_FOLLOWER_TIMEOUT_MS = {};\nself.__SQLITE_QUERY_TIMEOUT_MS = {};\n",
-            db_name_encoded,
-            self.follower_timeout_ms,
-            self.query_timeout_ms,
-        );
-
-        let parts = js_sys::Array::new();
-        parts.push(&JsValue::from_str(&preamble));
-        parts.push(&JsValue::from_str(&body));
-        let options = BlobPropertyBag::new();
-        options.set_type("application/javascript");
-        let blob = Blob::new_with_str_sequence_and_options(&parts, &options)?;
-        let url = Url::create_object_url_with_blob(&blob)?;
-
-        let worker = Worker::new(&url)?;
-        Url::revoke_object_url(&url)?;
+        let preamble = self.build_worker_preamble();
+        let worker = Self::create_worker_from_script(&preamble, &body)?;
 
         let state = Rc::clone(self);
         let handler = Closure::wrap(Box::new(move |event: MessageEvent| {
@@ -340,6 +327,32 @@ impl CoordinatorState {
         Ok(())
     }
 
+    fn build_worker_preamble(&self) -> String {
+        let db_name_encoded =
+            serde_json::to_string(&self.db_name).unwrap_or_else(|_| "\"unknown\"".to_string());
+        // __SQLITE_DB_ONLY=true runs the embedded worker in DB-only mode, separating coordinator work from DB tasks.
+        format!(
+            "self.__SQLITE_DB_ONLY = true;\nself.__SQLITE_DB_NAME = {};\nself.__SQLITE_FOLLOWER_TIMEOUT_MS = {};\nself.__SQLITE_QUERY_TIMEOUT_MS = {};\n",
+            db_name_encoded,
+            self.follower_timeout_ms,
+            self.query_timeout_ms,
+        )
+    }
+
+    fn create_worker_from_script(preamble: &str, body: &str) -> Result<Worker, JsValue> {
+        let parts = js_sys::Array::new();
+        parts.push(&JsValue::from_str(preamble));
+        parts.push(&JsValue::from_str(body));
+        let options = BlobPropertyBag::new();
+        options.set_type("application/javascript");
+        let blob = Blob::new_with_str_sequence_and_options(&parts, &options)?;
+        let url = Url::create_object_url_with_blob(&blob)?;
+
+        let worker = Worker::new(&url)?;
+        Url::revoke_object_url(&url)?;
+        Ok(worker)
+    }
+
     pub fn handle_db_worker_event(self: &Rc<Self>, event: MessageEvent) {
         let data = event.data();
         self.handle_db_worker_value(data);
@@ -350,6 +363,7 @@ impl CoordinatorState {
             Ok(MainThreadMessage::WorkerReady) => {
                 *self.db_worker_ready.borrow_mut() = true;
                 *self.leader_ready.borrow_mut() = true;
+                self.db_worker_restart_attempts.set(0);
                 let ready = ChannelMessage::LeaderReady {
                     leader_id: self.worker_id.clone(),
                 };
@@ -377,6 +391,8 @@ impl CoordinatorState {
         *self.db_worker_ready.borrow_mut() = false;
         *self.leader_ready.borrow_mut() = false;
         *self.ready_signaled.borrow_mut() = false;
+        let attempts = self.db_worker_restart_attempts.get().saturating_add(1);
+        self.db_worker_restart_attempts.set(attempts);
         if let Some(worker) = self.db_worker.borrow_mut().take() {
             worker.terminate();
         }
@@ -384,6 +400,13 @@ impl CoordinatorState {
         let pending = self.db_pending.borrow_mut().drain().collect::<Vec<_>>();
         for (_, origin) in pending {
             self.fail_origin(origin, error.clone());
+        }
+        if attempts > MAX_DB_WORKER_RESPAWNS {
+            let message = format!(
+                "DB worker restart limit reached (max {MAX_DB_WORKER_RESPAWNS}); leaving worker failed"
+            );
+            let _ = send_worker_error_message(&message);
+            return;
         }
         if let Err(err) = self.spawn_db_worker() {
             let _ = send_worker_error_message(&js_value_to_string(&err));
@@ -1187,6 +1210,31 @@ mod tests {
             has_error_response,
             "forwarded pending query should be errored"
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn db_worker_failure_stops_after_max_retries() {
+        set_global_str("__SQLITE_DB_NAME", "testdb-db-failure-limit");
+        set_global_num("__SQLITE_FOLLOWER_TIMEOUT_MS", 50.0);
+        set_global_num("__SQLITE_QUERY_TIMEOUT_MS", 50.0);
+        set_global_str("__SQLITE_EMBEDDED_WORKER", "");
+
+        let cfg = worker_config_from_global().expect("config");
+        let state = CoordinatorState::new(cfg).expect("state");
+        *state.db_worker_ready.borrow_mut() = true;
+        *state.leader_ready.borrow_mut() = true;
+        *state.ready_signaled.borrow_mut() = true;
+
+        state.db_worker_restart_attempts.set(MAX_DB_WORKER_RESPAWNS);
+        state.handle_db_worker_failure("still broken".to_string());
+
+        assert!(!*state.db_worker_ready.borrow());
+        assert!(!*state.ready_signaled.borrow());
+        assert_eq!(
+            state.db_worker_restart_attempts.get(),
+            MAX_DB_WORKER_RESPAWNS + 1
+        );
+        assert!(state.db_worker.borrow().is_none());
     }
 
     #[wasm_bindgen_test(async)]
