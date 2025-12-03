@@ -7,7 +7,7 @@ pub fn generate_self_contained_worker(db_name: &str) -> String {
     let embedded_body = serde_json::to_string(include_str!("embedded_worker.js"))
         .unwrap_or_else(|_| "\"\"".to_string());
     let prefix = format!(
-        "self.__SQLITE_DB_NAME = {};\nself.__SQLITE_FOLLOWER_TIMEOUT_MS = 5000.0;\nself.__SQLITE_EMBEDDED_WORKER = {};\n",
+        "self.__SQLITE_DB_NAME = {};\nself.__SQLITE_FOLLOWER_TIMEOUT_MS = 5000.0;\nself.__SQLITE_QUERY_TIMEOUT_MS = 30000.0;\nself.__SQLITE_EMBEDDED_WORKER = {};\n",
         encoded, embedded_body
     );
     // Use the bundled worker template with embedded WASM
@@ -32,6 +32,10 @@ mod tests {
         assert!(
             output.contains("self.__SQLITE_FOLLOWER_TIMEOUT_MS = 5000.0;"),
             "timeout constant should be injected"
+        );
+        assert!(
+            output.contains("self.__SQLITE_QUERY_TIMEOUT_MS = 30000.0;"),
+            "query timeout constant should be injected"
         );
         assert!(
             output.contains("self.__SQLITE_EMBEDDED_WORKER = "),

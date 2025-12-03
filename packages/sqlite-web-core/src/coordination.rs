@@ -30,6 +30,7 @@ pub enum LeadershipRole {
 pub struct WorkerConfig {
     pub db_name: String,
     pub follower_timeout_ms: f64,
+    pub query_timeout_ms: f64,
 }
 
 pub fn worker_config_from_global() -> Result<WorkerConfig, JsValue> {
@@ -60,9 +61,22 @@ pub fn worker_config_from_global() -> Result<WorkerConfig, JsValue> {
         5000.0
     }
 
+    fn get_query_timeout_from_global() -> f64 {
+        let global = js_sys::global();
+        let val = Reflect::get(&global, &JsValue::from_str("__SQLITE_QUERY_TIMEOUT_MS"))
+            .unwrap_or(JsValue::UNDEFINED);
+        if let Some(n) = val.as_f64() {
+            if n.is_finite() && n >= 0.0 {
+                return n;
+            }
+        }
+        30000.0
+    }
+
     Ok(WorkerConfig {
         db_name: get_db_name_from_global()?,
         follower_timeout_ms: get_follower_timeout_from_global(),
+        query_timeout_ms: get_query_timeout_from_global(),
     })
 }
 
@@ -113,6 +127,7 @@ pub struct CoordinatorState {
     pub leader_ready: Rc<RefCell<bool>>,
     pub ready_signaled: Rc<RefCell<bool>>,
     pub follower_timeout_ms: f64,
+    pub query_timeout_ms: f64,
     pub channel: BroadcastChannel,
     pub db_worker_ready: Rc<RefCell<bool>>,
     pub db_worker: Rc<RefCell<Option<Worker>>>,
@@ -144,6 +159,7 @@ impl CoordinatorState {
             leader_ready: Rc::new(RefCell::new(false)),
             ready_signaled: Rc::new(RefCell::new(false)),
             follower_timeout_ms: config.follower_timeout_ms,
+            query_timeout_ms: config.query_timeout_ms,
             channel: create_broadcast_channel(&config.db_name)?,
             db_worker_ready: Rc::new(RefCell::new(false)),
             db_worker: Rc::new(RefCell::new(None)),
@@ -296,9 +312,10 @@ impl CoordinatorState {
             .as_string()
             .ok_or_else(|| JsValue::from_str("Embedded worker source is missing"))?;
         let preamble = format!(
-            "self.__SQLITE_DB_ONLY = true;\nself.__SQLITE_DB_NAME = {};\nself.__SQLITE_FOLLOWER_TIMEOUT_MS = {};\n",
+            "self.__SQLITE_DB_ONLY = true;\nself.__SQLITE_DB_NAME = {};\nself.__SQLITE_FOLLOWER_TIMEOUT_MS = {};\nself.__SQLITE_QUERY_TIMEOUT_MS = {};\n",
             db_name_encoded,
             self.follower_timeout_ms,
+            self.query_timeout_ms,
         );
 
         let parts = js_sys::Array::new();
@@ -403,7 +420,7 @@ impl CoordinatorState {
                         .borrow_mut()
                         .insert(query_id.clone(), request_id);
                     let pending = Rc::clone(&self.follower_pending);
-                    let timeout = self.follower_timeout_ms;
+                    let timeout = self.query_timeout_ms;
                     let timeout_query_id = query_id.clone();
                     spawn_local(async move {
                         sleep_ms(timeout.ceil() as i32).await;
@@ -943,10 +960,34 @@ mod tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    fn worker_config_reads_custom_timeouts() {
+        set_global_str("__SQLITE_DB_NAME", "testdb-timeouts");
+        set_global_num("__SQLITE_FOLLOWER_TIMEOUT_MS", 1234.0);
+        set_global_num("__SQLITE_QUERY_TIMEOUT_MS", 4321.0);
+
+        let cfg = worker_config_from_global().expect("config");
+        assert_eq!(cfg.follower_timeout_ms, 1234.0);
+        assert_eq!(cfg.query_timeout_ms, 4321.0);
+    }
+
+    #[wasm_bindgen_test]
+    fn worker_config_defaults_query_timeout() {
+        set_global_str("__SQLITE_DB_NAME", "testdb-timeouts-default");
+        let _ = Reflect::delete_property(
+            &js_sys::global(),
+            &JsValue::from_str("__SQLITE_QUERY_TIMEOUT_MS"),
+        );
+
+        let cfg = worker_config_from_global().expect("config");
+        assert_eq!(cfg.query_timeout_ms, 30000.0);
+    }
+
     #[wasm_bindgen_test(async)]
     async fn coordinator_broadcasts_leader_and_ready() {
         set_global_str("__SQLITE_DB_NAME", "testdb-coordinator");
         set_global_num("__SQLITE_FOLLOWER_TIMEOUT_MS", 100.0);
+        set_global_num("__SQLITE_QUERY_TIMEOUT_MS", 100.0);
         set_global_str(
             "__SQLITE_EMBEDDED_WORKER",
             "self.postMessage({type:'worker-ready'}); self.onmessage = ev => { const d = ev.data || {}; if (d.type === 'execute-query') { self.postMessage({type:'query-result', requestId:d.requestId, result:'{\"ok\":true}', error:null}); } };",
@@ -988,6 +1029,7 @@ mod tests {
     async fn leader_ping_responds_based_on_db_readiness() {
         set_global_str("__SQLITE_DB_NAME", "testdb-ping");
         set_global_num("__SQLITE_FOLLOWER_TIMEOUT_MS", 50.0);
+        set_global_num("__SQLITE_QUERY_TIMEOUT_MS", 50.0);
         set_global_str("__SQLITE_EMBEDDED_WORKER", "");
 
         let cfg = worker_config_from_global().expect("config");
@@ -1039,6 +1081,7 @@ mod tests {
     async fn lock_request_failure_keeps_follower_role() {
         set_global_str("__SQLITE_DB_NAME", "testdb-lock-failure");
         set_global_num("__SQLITE_FOLLOWER_TIMEOUT_MS", 50.0);
+        set_global_num("__SQLITE_QUERY_TIMEOUT_MS", 50.0);
         set_global_str("__SQLITE_EMBEDDED_WORKER", "");
 
         // Stub navigator.locks.request to throw so acquisition fails.
@@ -1081,6 +1124,7 @@ mod tests {
     async fn db_worker_failure_resets_and_reports() {
         set_global_str("__SQLITE_DB_NAME", "testdb-db-failure");
         set_global_num("__SQLITE_FOLLOWER_TIMEOUT_MS", 50.0);
+        set_global_num("__SQLITE_QUERY_TIMEOUT_MS", 50.0);
         set_global_str("__SQLITE_EMBEDDED_WORKER", "");
 
         let cfg = worker_config_from_global().expect("config");
@@ -1176,6 +1220,7 @@ mod tests {
             WorkerConfig {
                 db_name: "testdb-fake".to_string(),
                 follower_timeout_ms: 10.0,
+                query_timeout_ms: 10.0,
             },
             hooks,
         );
