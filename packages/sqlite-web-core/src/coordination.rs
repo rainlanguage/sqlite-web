@@ -1,6 +1,8 @@
 use js_sys::{Function, Object, Promise, Reflect};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
@@ -75,6 +77,35 @@ struct DbJob {
     params: Option<Vec<serde_json::Value>>,
 }
 
+type DbExecFuture = Pin<Box<dyn Future<Output = Result<String, String>> + 'static>>;
+type DbExecFn = dyn Fn(
+    Rc<RefCell<Option<SQLiteDatabase>>>,
+    String,
+    Option<Vec<serde_json::Value>>,
+) -> DbExecFuture;
+type DbDeliverFn = dyn Fn(&js_sys::Object);
+
+#[derive(Clone)]
+pub struct DbWorkerHooks {
+    exec: Rc<DbExecFn>,
+    deliver: Rc<DbDeliverFn>,
+}
+
+impl DbWorkerHooks {
+    pub fn new(exec: Rc<DbExecFn>, deliver: Rc<DbDeliverFn>) -> Self {
+        Self { exec, deliver }
+    }
+}
+
+impl Default for DbWorkerHooks {
+    fn default() -> Self {
+        Self {
+            exec: Rc::new(|db, sql, params| Box::pin(exec_on_db(db, sql, params))),
+            deliver: Rc::new(deliver_db_result),
+        }
+    }
+}
+
 pub struct CoordinatorState {
     pub worker_id: String,
     pub role: Rc<RefCell<LeadershipRole>>,
@@ -96,6 +127,7 @@ pub struct DbWorkerState {
     pub db_name: String,
     db_queue: Rc<RefCell<VecDeque<DbJob>>>,
     db_processing: Rc<Cell<bool>>,
+    hooks: DbWorkerHooks,
 }
 
 pub fn create_broadcast_channel(db_name: &str) -> Result<BroadcastChannel, JsValue> {
@@ -610,11 +642,16 @@ impl CoordinatorState {
 
 impl DbWorkerState {
     pub fn new(config: WorkerConfig) -> Rc<Self> {
+        Self::new_with_hooks(config, DbWorkerHooks::default())
+    }
+
+    pub fn new_with_hooks(config: WorkerConfig, hooks: DbWorkerHooks) -> Rc<Self> {
         Rc::new(DbWorkerState {
             db: Rc::new(RefCell::new(None)),
             db_name: config.db_name,
             db_queue: Rc::new(RefCell::new(VecDeque::new())),
             db_processing: Rc::new(Cell::new(false)),
+            hooks,
         })
     }
 
@@ -664,6 +701,7 @@ impl DbWorkerState {
             return;
         }
         let state = Rc::clone(self);
+        let hooks = state.hooks.clone();
         spawn_local(async move {
             loop {
                 let job = {
@@ -672,9 +710,11 @@ impl DbWorkerState {
                 };
                 let Some(job) = job else { break };
                 let db = Rc::clone(&state.db);
-                let result = exec_on_db(db, job.sql, job.params).await;
+                let exec = Rc::clone(&hooks.exec);
+                let deliver = Rc::clone(&hooks.deliver);
+                let result = exec.as_ref()(db, job.sql, job.params).await;
                 match make_query_result_message(job.request_id, result) {
-                    Ok(resp) => deliver_db_result(&resp),
+                    Ok(resp) => deliver.as_ref()(&resp),
                     Err(err) => {
                         let _ = send_worker_error(err);
                     }
@@ -813,29 +853,11 @@ pub fn send_query_result_to_main(
     post_worker_message(&message).map_err(|err| JsValue::from_str(&err))
 }
 
-#[cfg(not(all(test, target_family = "wasm")))]
 fn deliver_db_result(obj: &js_sys::Object) {
     if let Err(err) = post_worker_message(obj) {
         let _ = send_worker_error(JsValue::from_str(&err));
     }
 }
-
-#[cfg(all(test, target_family = "wasm"))]
-fn deliver_db_result(obj: &js_sys::Object) {
-    let global = js_sys::global();
-    let key = JsValue::from_str("__SQLITE_TEST_DB_RESULTS");
-    let current = Reflect::get(&global, &key).unwrap_or(JsValue::UNDEFINED);
-    let array = if current.is_object() && js_sys::Array::is_array(&current) {
-        current.unchecked_into::<js_sys::Array>()
-    } else {
-        let a = js_sys::Array::new();
-        let _ = Reflect::set(&global, &key, a.as_ref());
-        a
-    };
-    array.push(obj);
-}
-
-#[cfg(not(all(test, target_family = "wasm")))]
 async fn exec_on_db(
     db: Rc<RefCell<Option<SQLiteDatabase>>>,
     sql: String,
@@ -854,28 +876,6 @@ async fn exec_on_db(
         None => Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
     };
     result
-}
-
-#[cfg(all(test, target_family = "wasm"))]
-async fn exec_on_db(
-    _db: Rc<RefCell<Option<SQLiteDatabase>>>,
-    _sql: String,
-    _params: Option<Vec<serde_json::Value>>,
-) -> Result<String, String> {
-    // Test double: mark busy to detect concurrent access
-    let global = js_sys::global();
-    let busy_key = JsValue::from_str("__SQLITE_TEST_FAKE_DB_BUSY");
-    let busy = Reflect::get(&global, &busy_key)
-        .ok()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if busy {
-        return Err("concurrent".to_string());
-    }
-    let _ = Reflect::set(&global, &busy_key, &JsValue::TRUE);
-    sleep_ms(5).await;
-    let _ = Reflect::set(&global, &busy_key, &JsValue::FALSE);
-    Ok("fake-db-ok".to_string())
 }
 
 pub async fn sleep_ms(ms: i32) {
@@ -923,7 +923,7 @@ mod tests {
     use crate::messages::ChannelMessage;
     use crate::util::sanitize_identifier;
     use js_sys::Array;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     wasm_bindgen_test_configure!(run_in_browser);
 
@@ -941,11 +941,6 @@ mod tests {
             &JsValue::from_str(key),
             &JsValue::from_f64(value),
         );
-    }
-
-    fn set_global_bool(key: &str, value: bool) {
-        let val = if value { JsValue::TRUE } else { JsValue::FALSE };
-        let _ = Reflect::set(&js_sys::global(), &JsValue::from_str(key), &val);
     }
 
     #[wasm_bindgen_test(async)]
@@ -1152,18 +1147,38 @@ mod tests {
 
     #[wasm_bindgen_test(async)]
     async fn db_worker_queue_serializes_requests() {
-        set_global_bool("__SQLITE_TEST_FAKE_DB", true);
-        set_global_bool("__SQLITE_TEST_FAKE_DB_BUSY", false);
-        let _ = Reflect::set(
-            &js_sys::global(),
-            &JsValue::from_str("__SQLITE_TEST_DB_RESULTS"),
-            Array::new().as_ref(),
+        let results = Rc::new(Array::new());
+        let busy_flag = Rc::new(Cell::new(false));
+        let hooks = DbWorkerHooks::new(
+            {
+                let busy_flag = Rc::clone(&busy_flag);
+                Rc::new(move |_db, _sql, _params| {
+                    let busy_flag = Rc::clone(&busy_flag);
+                    Box::pin(async move {
+                        if busy_flag.replace(true) {
+                            return Err("concurrent".to_string());
+                        }
+                        sleep_ms(5).await;
+                        busy_flag.set(false);
+                        Ok("fake-db-ok".to_string())
+                    })
+                })
+            },
+            {
+                let results = Rc::clone(&results);
+                Rc::new(move |obj: &js_sys::Object| {
+                    results.push(obj.as_ref());
+                })
+            },
         );
 
-        let state = DbWorkerState::new(WorkerConfig {
-            db_name: "testdb-fake".to_string(),
-            follower_timeout_ms: 10.0,
-        });
+        let state = DbWorkerState::new_with_hooks(
+            WorkerConfig {
+                db_name: "testdb-fake".to_string(),
+                follower_timeout_ms: 10.0,
+            },
+            hooks,
+        );
 
         state.handle_message(WorkerMessage::ExecuteQuery {
             request_id: 1,
@@ -1178,12 +1193,6 @@ mod tests {
 
         sleep_ms(30).await;
 
-        let results_val = Reflect::get(
-            &js_sys::global(),
-            &JsValue::from_str("__SQLITE_TEST_DB_RESULTS"),
-        )
-        .unwrap_or(JsValue::UNDEFINED);
-        let results = results_val.unchecked_into::<Array>();
         assert_eq!(results.length(), 2, "both queued queries should complete");
         for entry in results.iter() {
             let result = Reflect::get(&entry, &JsValue::from_str("result"))
