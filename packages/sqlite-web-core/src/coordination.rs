@@ -6,6 +6,8 @@ use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
+#[cfg(all(test, target_family = "wasm"))]
+use wasm_bindgen_test::*;
 use web_sys::{
     Blob, BlobPropertyBag, BroadcastChannel, DedicatedWorkerGlobalScope, MessageEvent, Url, Worker,
 };
@@ -827,4 +829,122 @@ pub async fn sleep_ms(ms: i32) {
         closure.forget();
     });
     let _ = JsFuture::from(promise).await;
+}
+
+#[cfg(all(test, target_family = "wasm"))]
+mod tests {
+    use super::*;
+    use crate::messages::ChannelMessage;
+    use crate::util::sanitize_identifier;
+    use std::cell::RefCell;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn set_global_str(key: &str, value: &str) {
+        let _ = Reflect::set(
+            &js_sys::global(),
+            &JsValue::from_str(key),
+            &JsValue::from_str(value),
+        );
+    }
+
+    fn set_global_num(key: &str, value: f64) {
+        let _ = Reflect::set(
+            &js_sys::global(),
+            &JsValue::from_str(key),
+            &JsValue::from_f64(value),
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn coordinator_broadcasts_leader_and_ready() {
+        set_global_str("__SQLITE_DB_NAME", "testdb-coordinator");
+        set_global_num("__SQLITE_FOLLOWER_TIMEOUT_MS", 100.0);
+        set_global_str(
+            "__SQLITE_EMBEDDED_WORKER",
+            "self.postMessage({type:'worker-ready'}); self.onmessage = ev => { const d = ev.data || {}; if (d.type === 'execute-query') { self.postMessage({type:'query-result', requestId:d.requestId, result:'{\"ok\":true}', error:null}); } };",
+        );
+
+        let cfg = worker_config_from_global().expect("config");
+        let state = CoordinatorState::new(cfg).expect("state");
+
+        let channel_name = format!("sqlite-queries-{}", sanitize_identifier(&state.db_name));
+        let observer = BroadcastChannel::new(&channel_name).expect("observer channel");
+
+        let received: Rc<RefCell<Vec<ChannelMessage>>> = Rc::new(RefCell::new(Vec::new()));
+        let recv_clone = Rc::clone(&received);
+        let listener = Closure::wrap(Box::new(move |event: MessageEvent| {
+            if let Ok(msg) = serde_wasm_bindgen::from_value::<ChannelMessage>(event.data()) {
+                recv_clone.borrow_mut().push(msg);
+            }
+        }) as Box<dyn FnMut(MessageEvent)>);
+        observer.set_onmessage(Some(listener.as_ref().unchecked_ref()));
+        listener.forget();
+
+        state.on_lock_granted();
+        sleep_ms(50).await;
+
+        let msgs = received.borrow();
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, ChannelMessage::NewLeader { .. })),
+            "should announce new-leader"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, ChannelMessage::LeaderReady { .. })),
+            "should announce leader-ready"
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn leader_ping_responds_based_on_db_readiness() {
+        set_global_str("__SQLITE_DB_NAME", "testdb-ping");
+        set_global_num("__SQLITE_FOLLOWER_TIMEOUT_MS", 50.0);
+        set_global_str("__SQLITE_EMBEDDED_WORKER", "");
+
+        let cfg = worker_config_from_global().expect("config");
+        let state = CoordinatorState::new(cfg).expect("state");
+        *state.role.borrow_mut() = LeadershipRole::Leader;
+
+        let channel_name = format!("sqlite-queries-{}", sanitize_identifier(&state.db_name));
+        let observer = BroadcastChannel::new(&channel_name).expect("observer channel");
+
+        let received: Rc<RefCell<Vec<ChannelMessage>>> = Rc::new(RefCell::new(Vec::new()));
+        let recv_clone = Rc::clone(&received);
+        let listener = Closure::wrap(Box::new(move |event: MessageEvent| {
+            if let Ok(msg) = serde_wasm_bindgen::from_value::<ChannelMessage>(event.data()) {
+                recv_clone.borrow_mut().push(msg);
+            }
+        }) as Box<dyn FnMut(MessageEvent)>);
+        observer.set_onmessage(Some(listener.as_ref().unchecked_ref()));
+        listener.forget();
+
+        *state.db_worker_ready.borrow_mut() = false;
+        state.handle_channel_message(ChannelMessage::LeaderPing {
+            requester_id: "follower".to_string(),
+        });
+        sleep_ms(10).await;
+        assert!(
+            received
+                .borrow()
+                .iter()
+                .any(|m| matches!(m, ChannelMessage::NewLeader { .. })),
+            "should answer with new-leader when DB not ready"
+        );
+
+        received.borrow_mut().clear();
+        *state.db_worker_ready.borrow_mut() = true;
+        state.handle_channel_message(ChannelMessage::LeaderPing {
+            requester_id: "follower".to_string(),
+        });
+        sleep_ms(10).await;
+        assert!(
+            received
+                .borrow()
+                .iter()
+                .any(|m| matches!(m, ChannelMessage::LeaderReady { .. })),
+            "should answer with leader-ready once DB is ready"
+        );
+    }
 }
