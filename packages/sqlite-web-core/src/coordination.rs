@@ -215,8 +215,7 @@ impl CoordinatorState {
         let locks = Reflect::get(&navigator, &JsValue::from_str("locks"))?;
         let request_value = Reflect::get(&locks, &JsValue::from_str("request"))?;
         let Some(request_fn) = request_value.dyn_ref::<Function>() else {
-            self.promote_without_lock();
-            return Ok(());
+            return Err(JsValue::from_str("navigator.locks.request unavailable"));
         };
 
         let options = Object::new();
@@ -236,10 +235,6 @@ impl CoordinatorState {
         )?;
         handler.forget();
         Ok(())
-    }
-
-    fn promote_without_lock(self: &Rc<Self>) {
-        self.on_lock_granted();
     }
 
     fn on_lock_granted(self: &Rc<Self>) {
@@ -303,6 +298,10 @@ impl CoordinatorState {
 
     pub fn handle_db_worker_event(self: &Rc<Self>, event: MessageEvent) {
         let data = event.data();
+        self.handle_db_worker_value(data);
+    }
+
+    pub fn handle_db_worker_value(self: &Rc<Self>, data: JsValue) {
         match serde_wasm_bindgen::from_value::<MainThreadMessage>(data.clone()) {
             Ok(MainThreadMessage::WorkerReady) => {
                 *self.db_worker_ready.borrow_mut() = true;
@@ -680,9 +679,7 @@ impl DbWorkerState {
                 let db = Rc::clone(&state.db);
                 let result = exec_on_db(db, job.sql, job.params).await;
                 match make_query_result_message(job.request_id, result) {
-                    Ok(resp) => {
-                        let _ = post_worker_message(&resp);
-                    }
+                    Ok(resp) => deliver_db_result(&resp),
                     Err(err) => {
                         let _ = send_worker_error(err);
                     }
@@ -821,6 +818,29 @@ pub fn send_query_result_to_main(
     post_worker_message(&message).map_err(|err| JsValue::from_str(&err))
 }
 
+#[cfg(not(all(test, target_family = "wasm")))]
+fn deliver_db_result(obj: &js_sys::Object) {
+    if let Err(err) = post_worker_message(obj) {
+        let _ = send_worker_error(JsValue::from_str(&err));
+    }
+}
+
+#[cfg(all(test, target_family = "wasm"))]
+fn deliver_db_result(obj: &js_sys::Object) {
+    let global = js_sys::global();
+    let key = JsValue::from_str("__SQLITE_TEST_DB_RESULTS");
+    let current = Reflect::get(&global, &key).unwrap_or(JsValue::UNDEFINED);
+    let array = if current.is_object() && js_sys::Array::is_array(&current) {
+        current.unchecked_into::<js_sys::Array>()
+    } else {
+        let a = js_sys::Array::new();
+        let _ = Reflect::set(&global, &key, a.as_ref());
+        a
+    };
+    array.push(obj);
+}
+
+#[cfg(not(all(test, target_family = "wasm")))]
 async fn exec_on_db(
     db: Rc<RefCell<Option<SQLiteDatabase>>>,
     sql: String,
@@ -839,6 +859,28 @@ async fn exec_on_db(
         None => Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
     };
     result
+}
+
+#[cfg(all(test, target_family = "wasm"))]
+async fn exec_on_db(
+    _db: Rc<RefCell<Option<SQLiteDatabase>>>,
+    _sql: String,
+    _params: Option<Vec<serde_json::Value>>,
+) -> Result<String, String> {
+    // Test double: mark busy to detect concurrent access
+    let global = js_sys::global();
+    let busy_key = JsValue::from_str("__SQLITE_TEST_FAKE_DB_BUSY");
+    let busy = Reflect::get(&global, &busy_key)
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if busy {
+        return Err("concurrent".to_string());
+    }
+    let _ = Reflect::set(&global, &busy_key, &JsValue::TRUE);
+    sleep_ms(5).await;
+    let _ = Reflect::set(&global, &busy_key, &JsValue::FALSE);
+    Ok("fake-db-ok".to_string())
 }
 
 pub async fn sleep_ms(ms: i32) {
@@ -885,6 +927,7 @@ mod tests {
     use super::*;
     use crate::messages::ChannelMessage;
     use crate::util::sanitize_identifier;
+    use js_sys::Array;
     use std::cell::RefCell;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -903,6 +946,11 @@ mod tests {
             &JsValue::from_str(key),
             &JsValue::from_f64(value),
         );
+    }
+
+    fn set_global_bool(key: &str, value: bool) {
+        let val = if value { JsValue::TRUE } else { JsValue::FALSE };
+        let _ = Reflect::set(&js_sys::global(), &JsValue::from_str(key), &val);
     }
 
     #[wasm_bindgen_test(async)]
@@ -995,5 +1043,164 @@ mod tests {
                 .any(|m| matches!(m, ChannelMessage::LeaderReady { .. })),
             "should answer with leader-ready once DB is ready"
         );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn lock_request_failure_keeps_follower_role() {
+        set_global_str("__SQLITE_DB_NAME", "testdb-lock-failure");
+        set_global_num("__SQLITE_FOLLOWER_TIMEOUT_MS", 50.0);
+        set_global_str("__SQLITE_EMBEDDED_WORKER", "");
+
+        // Stub navigator.locks.request to throw so acquisition fails.
+        let global = js_sys::global();
+        let navigator = Reflect::get(&global, &JsValue::from_str("navigator"))
+            .unwrap_or_else(|_| JsValue::UNDEFINED);
+        let navigator_obj = if navigator.is_object() {
+            navigator.unchecked_into::<js_sys::Object>()
+        } else {
+            let obj = js_sys::Object::new();
+            let _ = Reflect::set(&global, &JsValue::from_str("navigator"), obj.as_ref());
+            obj
+        };
+
+        let locks = Reflect::get(&navigator_obj, &JsValue::from_str("locks"))
+            .unwrap_or_else(|_| JsValue::UNDEFINED);
+        let locks_obj = if locks.is_object() {
+            locks.unchecked_into::<js_sys::Object>()
+        } else {
+            let obj = js_sys::Object::new();
+            let _ = Reflect::set(&navigator_obj, &JsValue::from_str("locks"), obj.as_ref());
+            obj
+        };
+
+        let request = js_sys::Function::new_no_args("throw new Error('no-lock');");
+        let _ = Reflect::set(&locks_obj, &JsValue::from_str("request"), request.as_ref());
+
+        let cfg = worker_config_from_global().expect("config");
+        let state = CoordinatorState::new(cfg).expect("state");
+        let result = state.acquire_lock_and_promote().await;
+
+        assert!(result.is_err(), "lock acquisition should fail");
+        assert_eq!(*state.role.borrow(), LeadershipRole::Follower);
+        assert!(state.leader_id.borrow().is_none());
+        assert!(!*state.leader_ready.borrow());
+        assert!(!*state.ready_signaled.borrow());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn db_worker_failure_resets_and_reports() {
+        set_global_str("__SQLITE_DB_NAME", "testdb-db-failure");
+        set_global_num("__SQLITE_FOLLOWER_TIMEOUT_MS", 50.0);
+        set_global_str("__SQLITE_EMBEDDED_WORKER", "");
+
+        let cfg = worker_config_from_global().expect("config");
+        let state = CoordinatorState::new(cfg).expect("state");
+        *state.role.borrow_mut() = LeadershipRole::Leader;
+        *state.db_worker_ready.borrow_mut() = true;
+        *state.leader_ready.borrow_mut() = true;
+        *state.ready_signaled.borrow_mut() = true;
+
+        // Track pending forwarded response
+        let query_id = "q1".to_string();
+        state.db_pending.borrow_mut().insert(
+            7,
+            DbRequestOrigin::Forwarded {
+                query_id: query_id.clone(),
+            },
+        );
+
+        let channel_name = format!("sqlite-queries-{}", sanitize_identifier(&state.db_name));
+        let observer = BroadcastChannel::new(&channel_name).expect("observer channel");
+        let received: Rc<RefCell<Vec<ChannelMessage>>> = Rc::new(RefCell::new(Vec::new()));
+        let recv_clone = Rc::clone(&received);
+        let listener = Closure::wrap(Box::new(move |event: MessageEvent| {
+            if let Ok(msg) = serde_wasm_bindgen::from_value::<ChannelMessage>(event.data()) {
+                recv_clone.borrow_mut().push(msg);
+            }
+        }) as Box<dyn FnMut(MessageEvent)>);
+        observer.set_onmessage(Some(listener.as_ref().unchecked_ref()));
+        listener.forget();
+
+        let data = js_sys::Object::new();
+        let _ = Reflect::set(
+            &data,
+            &JsValue::from_str("type"),
+            &JsValue::from_str("worker-error"),
+        );
+        let _ = Reflect::set(
+            &data,
+            &JsValue::from_str("error"),
+            &JsValue::from_str("boom"),
+        );
+        state.handle_db_worker_value(data.into());
+        sleep_ms(20).await;
+
+        assert!(!*state.db_worker_ready.borrow());
+        assert!(!*state.leader_ready.borrow());
+        assert!(!*state.ready_signaled.borrow());
+
+        let has_error_response = received.borrow().iter().any(|msg| {
+            matches!(
+                msg,
+                ChannelMessage::QueryResponse {
+                    query_id: qid,
+                    result: _,
+                    error: Some(err),
+                } if qid == &query_id && err == "boom"
+            )
+        });
+        assert!(
+            has_error_response,
+            "forwarded pending query should be errored"
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn db_worker_queue_serializes_requests() {
+        set_global_bool("__SQLITE_TEST_FAKE_DB", true);
+        set_global_bool("__SQLITE_TEST_FAKE_DB_BUSY", false);
+        let _ = Reflect::set(
+            &js_sys::global(),
+            &JsValue::from_str("__SQLITE_TEST_DB_RESULTS"),
+            Array::new().as_ref(),
+        );
+
+        let state = DbWorkerState::new(WorkerConfig {
+            db_name: "testdb-fake".to_string(),
+            follower_timeout_ms: 10.0,
+        });
+
+        state.handle_message(WorkerMessage::ExecuteQuery {
+            request_id: 1,
+            sql: "SELECT 1".to_string(),
+            params: None,
+        });
+        state.handle_message(WorkerMessage::ExecuteQuery {
+            request_id: 2,
+            sql: "SELECT 2".to_string(),
+            params: None,
+        });
+
+        sleep_ms(30).await;
+
+        let results_val = Reflect::get(
+            &js_sys::global(),
+            &JsValue::from_str("__SQLITE_TEST_DB_RESULTS"),
+        )
+        .unwrap_or(JsValue::UNDEFINED);
+        let results = results_val.unchecked_into::<Array>();
+        assert_eq!(results.length(), 2, "both queued queries should complete");
+        for entry in results.iter() {
+            let result = Reflect::get(&entry, &JsValue::from_str("result"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            assert_eq!(result, "fake-db-ok");
+            let error = Reflect::get(&entry, &JsValue::from_str("error"))
+                .ok()
+                .filter(|v| !v.is_null() && !v.is_undefined())
+                .map(|v| js_value_to_string(&v));
+            assert!(error.is_none(), "no error expected");
+        }
     }
 }
