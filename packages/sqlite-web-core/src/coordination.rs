@@ -42,11 +42,6 @@ pub fn worker_config_from_global() -> Result<WorkerConfig, JsValue> {
             }
             Ok(trimmed)
         } else {
-            #[cfg(test)]
-            {
-                return Ok("testdb".to_string());
-            }
-            #[allow(unreachable_code)]
             Err(JsValue::from_str("Database name is required"))
         }
     }
