@@ -133,6 +133,10 @@ fn test_worker_template_generation() {
         worker_code.contains("__SQLITE_FOLLOWER_TIMEOUT_MS"),
         "Worker template should embed follower timeout configuration"
     );
+    assert!(
+        worker_code.contains("__SQLITE_QUERY_TIMEOUT_MS"),
+        "Worker template should embed query timeout configuration"
+    );
 }
 
 #[wasm_bindgen_test(async)]
