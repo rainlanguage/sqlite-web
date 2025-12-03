@@ -1,6 +1,6 @@
 use js_sys::{Function, Object, Promise, Reflect};
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
@@ -74,6 +74,12 @@ enum DbRequestOrigin {
     Forwarded { query_id: String },
 }
 
+struct DbJob {
+    request_id: u32,
+    sql: String,
+    params: Option<Vec<serde_json::Value>>,
+}
+
 pub struct CoordinatorState {
     pub worker_id: String,
     pub role: Rc<RefCell<LeadershipRole>>,
@@ -93,6 +99,8 @@ pub struct CoordinatorState {
 pub struct DbWorkerState {
     pub db: Rc<RefCell<Option<SQLiteDatabase>>>,
     pub db_name: String,
+    db_queue: Rc<RefCell<VecDeque<DbJob>>>,
+    db_processing: Rc<Cell<bool>>,
 }
 
 pub fn create_broadcast_channel(db_name: &str) -> Result<BroadcastChannel, JsValue> {
@@ -197,7 +205,6 @@ impl CoordinatorState {
         spawn_local(async move {
             if let Err(err) = state.acquire_lock_and_promote().await {
                 let _ = send_worker_error_message(&js_value_to_string(&err));
-                state.promote_without_lock();
             }
         });
     }
@@ -323,13 +330,20 @@ impl CoordinatorState {
         }
     }
 
-    fn handle_db_worker_failure(&self, error: String) {
+    fn handle_db_worker_failure(self: &Rc<Self>, error: String) {
         *self.db_worker_ready.borrow_mut() = false;
         *self.leader_ready.borrow_mut() = false;
+        *self.ready_signaled.borrow_mut() = false;
+        if let Some(worker) = self.db_worker.borrow_mut().take() {
+            worker.terminate();
+        }
         let _ = send_worker_error_message(&error);
         let pending = self.db_pending.borrow_mut().drain().collect::<Vec<_>>();
         for (_, origin) in pending {
             self.fail_origin(origin, error.clone());
+        }
+        if let Err(err) = self.spawn_db_worker() {
+            let _ = send_worker_error_message(&js_value_to_string(&err));
         }
     }
 
@@ -605,6 +619,8 @@ impl DbWorkerState {
         Rc::new(DbWorkerState {
             db: Rc::new(RefCell::new(None)),
             db_name: config.db_name,
+            db_queue: Rc::new(RefCell::new(VecDeque::new())),
+            db_processing: Rc::new(Cell::new(false)),
         })
     }
 
@@ -630,20 +646,53 @@ impl DbWorkerState {
                 sql,
                 params,
             } => {
-                let db = Rc::clone(&self.db);
-                spawn_local(async move {
-                    let result = exec_on_db(db, sql, params).await;
-                    match make_query_result_message(request_id, result) {
-                        Ok(resp) => {
-                            let _ = post_worker_message(&resp);
-                        }
-                        Err(err) => {
-                            let _ = send_worker_error(err);
-                        }
-                    }
-                });
+                self.enqueue_query(request_id, sql, params);
             }
         }
+    }
+
+    fn enqueue_query(
+        self: &Rc<Self>,
+        request_id: u32,
+        sql: String,
+        params: Option<Vec<serde_json::Value>>,
+    ) {
+        self.db_queue.borrow_mut().push_back(DbJob {
+            request_id,
+            sql,
+            params,
+        });
+        self.start_queue_processor();
+    }
+
+    fn start_queue_processor(self: &Rc<Self>) {
+        if self.db_processing.replace(true) {
+            return;
+        }
+        let state = Rc::clone(self);
+        spawn_local(async move {
+            loop {
+                let job = {
+                    let mut queue = state.db_queue.borrow_mut();
+                    queue.pop_front()
+                };
+                let Some(job) = job else { break };
+                let db = Rc::clone(&state.db);
+                let result = exec_on_db(db, job.sql, job.params).await;
+                match make_query_result_message(job.request_id, result) {
+                    Ok(resp) => {
+                        let _ = post_worker_message(&resp);
+                    }
+                    Err(err) => {
+                        let _ = send_worker_error(err);
+                    }
+                }
+            }
+            state.db_processing.set(false);
+            if !state.db_queue.borrow().is_empty() {
+                state.start_queue_processor();
+            }
+        });
     }
 }
 
