@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "packages/sqlite-web-core",
-    "packages/sqlite-web"
+    "crates/sqlite-web-core",
+    "crates/sqlite-web"
 ]
 exclude = [
     "lib/rain.math.float"

@@ -15,10 +15,10 @@
             name = "test-wasm";
             body = ''
               set -euxo pipefail
-              cd packages/sqlite-web-core
+              cd crates/sqlite-web-core
               wasm-pack test --headless --chrome
               cd ../..
-              cd packages/sqlite-web
+              cd crates/sqlite-web
               wasm-pack test --headless --chrome
               cd ../..
             '';
@@ -28,10 +28,10 @@
             name = "build-wasm";
             body = ''
               set -euxo pipefail
-              cd packages/sqlite-web-core
+              cd crates/sqlite-web-core
               wasm-pack build --target web --out-dir ../../pkg
               cd ../..
-              cd packages/sqlite-web
+              cd crates/sqlite-web
               wasm-pack build --target web --out-dir ../../pkg
               cd ../..
             '';
@@ -50,9 +50,9 @@
             body = ''
               set -euxo pipefail
               ./scripts/local-bundle.sh
-              cd svelte-test
+              cd packages/ui
               npm run test
-              cd ..
+              cd ../..
             '';
           };
 
