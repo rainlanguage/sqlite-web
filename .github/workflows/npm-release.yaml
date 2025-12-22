@@ -36,7 +36,7 @@ jobs:
 
       - name: Install Playwright browsers with dependencies
         run: |
-          cd svelte-test
+          cd packages/ui
           npx playwright install --with-deps
 
       - name: Test full integration
@@ -72,7 +72,7 @@ jobs:
           NEW_NPM_VERSION=$(npm --prefix pkg version prerelease --preid alpha --no-git-tag-version)
           NEW_VERSION=${NEW_NPM_VERSION#v}
           echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
-          for manifest in packages/sqlite-web/Cargo.toml packages/sqlite-web-core/Cargo.toml; do
+          for manifest in crates/sqlite-web/Cargo.toml crates/sqlite-web-core/Cargo.toml; do
             sed -i.bak "s/^version = \".*\"/version = \"$NEW_VERSION\"/" "$manifest"
             rm "$manifest".bak
           done
@@ -81,7 +81,7 @@ jobs:
       - name: Commit And Tag
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
-          git add pkg/package.json packages/sqlite-web/Cargo.toml packages/sqlite-web-core/Cargo.toml
+          git add pkg/package.json crates/sqlite-web/Cargo.toml crates/sqlite-web-core/Cargo.toml
           git commit -m "NPM Package Release v${{ env.NEW_VERSION }}"
           git tag npm-v${{ env.NEW_VERSION }}
 
