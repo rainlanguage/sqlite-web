@@ -22,6 +22,11 @@ pub enum ChannelMessage {
         #[serde(rename = "leaderId")]
         leader_id: String,
     },
+    #[serde(rename = "leader-ready")]
+    LeaderReady {
+        #[serde(rename = "leaderId")]
+        leader_id: String,
+    },
     #[serde(rename = "query-request")]
     QueryRequest {
         #[serde(rename = "queryId")]
@@ -212,6 +217,13 @@ mod tests {
         };
         assert_serialization_roundtrip(empty_leader, "new-leader", |json| {
             assert!(json.contains("\"leaderId\":\"\""));
+        });
+
+        let leader_ready = ChannelMessage::LeaderReady {
+            leader_id: "leader-1".to_string(),
+        };
+        assert_serialization_roundtrip(leader_ready, "leader-ready", |json| {
+            assert!(json.contains("\"leaderId\":\"leader-1\""));
         });
 
         let empty_sql = ChannelMessage::QueryRequest {
