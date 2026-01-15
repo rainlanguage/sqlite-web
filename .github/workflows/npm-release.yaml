@@ -29,6 +29,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Update npm to latest
+        run: npm install -g npm@latest
 
       - run: nix develop -c build-submodules
 
@@ -108,11 +112,7 @@ jobs:
       # publish sqlite-web pkg to npm
       - name: Publish sqlite-web pkg To NPM
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
-        uses: JS-DevTools/npm-publish@v3
-        with:
-          token: ${{ secrets.NPM_TOKEN }}
-          access: public
-          package: sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz
+        run: npm publish sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz --access public
 
       # Create gitHub release with tarballs
       - name: Create GitHub Release with sqlite-web pkg
