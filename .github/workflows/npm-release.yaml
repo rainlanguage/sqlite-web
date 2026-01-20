@@ -25,11 +25,11 @@ jobs:
           determinate: true
       - uses: DeterminateSystems/flakehub-cache-action@main
 
-      - name: Install NodeJS v22
+      - name: Install NodeJS v24
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: 'https://registry.npmjs.org'
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
 
       - name: Update npm to latest
         run: npm install -g npm@latest
@@ -112,7 +112,7 @@ jobs:
       # publish sqlite-web pkg to npm
       - name: Publish sqlite-web pkg To NPM
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
-        run: npm publish sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz --access public --tag alpha --provenance
+        run: npm publish sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz --access public --tag alpha
 
       # Create gitHub release with tarballs
       - name: Create GitHub Release with sqlite-web pkg
