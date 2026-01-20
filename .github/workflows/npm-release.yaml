@@ -25,14 +25,14 @@ jobs:
           determinate: true
       - uses: DeterminateSystems/flakehub-cache-action@main
 
-      - name: Install NodeJS v24
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: "24.x"
           registry-url: "https://registry.npmjs.org"
 
       - name: Update npm to latest
-        run: npm install -g npm@latest
+        run: npm install -g npm@latest && npm --version
 
       - run: nix develop -c build-submodules
 
