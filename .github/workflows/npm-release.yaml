@@ -100,6 +100,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ssh-key: ${{ secrets.PUBLISH_PRIVATE_KEY }}
+          submodules: recursive
           fetch-depth: 0
 
       - uses: DeterminateSystems/nix-installer-action@main
@@ -116,6 +118,7 @@ jobs:
       - name: Update npm to latest
         run: npm install -g npm@latest && npm --version
 
+      - run: nix develop -c build-submodules
       - run: nix develop -c local-bundle
 
       - name: Create sqlite-web NPM Package Tarball
