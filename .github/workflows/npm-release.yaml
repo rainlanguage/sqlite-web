@@ -31,6 +31,9 @@ jobs:
           node-version: "24.x"
           registry-url: "https://registry.npmjs.org"
 
+      - name: Clear auth token for OIDC
+        run: echo "NODE_AUTH_TOKEN=" >> $GITHUB_ENV
+
       - name: Update npm to latest
         run: npm install -g npm@latest && npm --version
 
@@ -96,7 +99,7 @@ jobs:
       - name: Publish sqlite-web pkg To NPM
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
-          npm publish sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz \
+          NODE_AUTH_TOKEN="" npm publish sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz \
             --access public \
             --tag alpha \
             --provenance
