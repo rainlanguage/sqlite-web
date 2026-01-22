@@ -31,8 +31,19 @@ jobs:
           node-version: "24.x"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Update npm to latest
-        run: npm install -g npm@latest && npm --version
+      - name: Upgrade npm for OIDC
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Verify OIDC availability
+        run: |
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL}" ]; then
+            echo "OIDC token available"
+          else
+            echo "OIDC token NOT available"
+            exit 1
+          fi
 
       - run: nix develop -c build-submodules
 
