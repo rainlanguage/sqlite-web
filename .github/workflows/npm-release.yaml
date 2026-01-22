@@ -96,7 +96,7 @@ jobs:
       - name: Publish sqlite-web pkg To NPM
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
-          NODE_AUTH_TOKEN="" npm publish sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz \
+          npm publish sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz \
             --access public \
             --tag alpha \
             --provenance
