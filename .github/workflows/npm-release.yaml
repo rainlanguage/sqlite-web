@@ -38,12 +38,28 @@ jobs:
 
       - name: Verify OIDC availability
         run: |
-          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL}" ]; then
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" ]; then
             echo "OIDC token available"
+            echo "Endpoint: ${ACTIONS_ID_TOKEN_REQUEST_URL}"
           else
             echo "OIDC token NOT available"
+            echo "Check workflow permissions include 'id-token: write'"
             exit 1
           fi
+
+      - name: Verify repository configuration
+        run: |
+          echo "Checking repository consistency..."
+          GIT_REPO=$(git remote get-url origin | sed 's/.*github.com[/:]//; s/.git$//')
+          PKG_REPO=$(node -e "console.log(require('./pkg/package.json').repository?.url || '')" | sed 's|https://github.com/||; s|git+||; s|.git$||')
+          echo "Git remote:   $GIT_REPO"
+          echo "package.json: $PKG_REPO"
+          if [ "$GIT_REPO" != "$PKG_REPO" ]; then
+            echo "Repository mismatch!"
+            echo "This will cause 422 error during publish"
+            exit 1
+          fi
+          echo "Repositories match"
 
       - run: nix develop -c build-submodules
 
@@ -65,7 +81,7 @@ jobs:
       # get hash of latest published pkgs from npm and concat them
       - name: Get Old Hash
         run: |
-          OLD_HASH=$(npm view @rainlanguage/sqlite-web@latest dist.shasum 2>/dev/null || echo "none")
+          OLD_HASH=$(npm view @rainlanguage/sqlite-web@alpha dist.shasum 2>/dev/null || echo "none")
           echo "OLD_HASH=$OLD_HASH" >> $GITHUB_ENV
           echo "old hash: $OLD_HASH"
 
@@ -110,7 +126,7 @@ jobs:
           npm publish sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz \
             --access public \
             --tag alpha \
-            --provenance
+            --verbose
 
       # Commit changes and tag
       - name: Commit And Tag
