@@ -194,7 +194,7 @@ impl SQLiteWasmDatabase {
 
         self.ready_signal.reset();
 
-        delete_opfs_sahpool_directory().await?;
+        let deletion_result = delete_opfs_sahpool_directory().await;
 
         let worker_code = generate_self_contained_worker(&self.db_name);
         let new_worker =
@@ -210,7 +210,7 @@ impl SQLiteWasmDatabase {
 
         self.wait_until_ready().await?;
 
-        Ok(())
+        deletion_result
     }
 }
 
