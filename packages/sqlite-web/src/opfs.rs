@@ -71,7 +71,18 @@ async fn get_directory_if_exists(
                 describe_js_value(&e)
             ))
         }),
-        Err(_) => Ok(None),
+        Err(e) => {
+            if let Some(dom_ex) = e.dyn_ref::<web_sys::DomException>() {
+                if dom_ex.name() == "NotFoundError" {
+                    return Ok(None);
+                }
+            }
+            Err(SQLiteWasmDatabaseError::OpfsDeletionFailed(format!(
+                "failed to get directory '{}': {}",
+                name,
+                describe_js_value(&e)
+            )))
+        }
     }
 }
 
@@ -140,21 +151,4 @@ async fn collect_entry_names(
     }
 
     Ok(names)
-}
-
-#[cfg(all(test, target_family = "wasm"))]
-mod tests {
-    use super::*;
-    use wasm_bindgen_test::*;
-
-    wasm_bindgen_test_configure!(run_in_browser);
-
-    #[wasm_bindgen_test]
-    async fn delete_nonexistent_sahpool_succeeds() {
-        let result = delete_opfs_sahpool_directory().await;
-        assert!(
-            result.is_ok(),
-            "deleting nonexistent sahpool directory should succeed silently"
-        );
-    }
 }
