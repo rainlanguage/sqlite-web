@@ -12,6 +12,8 @@ pub enum SQLiteWasmDatabaseError {
     InitializationPending,
     #[error("Initialization failed: {0}")]
     InitializationFailed(String),
+    #[error("OPFS deletion failed: {0}")]
+    OpfsDeletionFailed(String),
 }
 
 impl From<JsValue> for SQLiteWasmDatabaseError {
