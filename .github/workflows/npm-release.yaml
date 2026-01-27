@@ -100,7 +100,7 @@ jobs:
       - name: Set Version
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
-          NEW_NPM_VERSION=$(npm --prefix pkg version prerelease --preid alpha --no-git-tag-version)
+          NEW_NPM_VERSION=$(npm --prefix pkg version patch --no-git-tag-version)
           NEW_VERSION=${NEW_NPM_VERSION#v}
           echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
           for manifest in packages/sqlite-web/Cargo.toml packages/sqlite-web-core/Cargo.toml; do
