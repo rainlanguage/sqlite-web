@@ -157,16 +157,17 @@ impl SQLiteWasmDatabase {
         }
 
         let rid_for_insert = request_id;
-        let promise = js_sys::Promise::new(&mut |resolve, reject| {
-            match worker.borrow().post_message(&message) {
-                Ok(()) => {
-                    pending_queries
-                        .borrow_mut()
-                        .insert(rid_for_insert, (resolve, reject));
-                }
-                Err(err) => {
-                    let _ = reject.call1(&JsValue::NULL, &err);
-                }
+        let promise = js_sys::Promise::new(&mut |resolve, reject| match worker
+            .borrow()
+            .post_message(&message)
+        {
+            Ok(()) => {
+                pending_queries
+                    .borrow_mut()
+                    .insert(rid_for_insert, (resolve, reject));
+            }
+            Err(err) => {
+                let _ = reject.call1(&JsValue::NULL, &err);
             }
         });
 
@@ -206,7 +207,6 @@ impl SQLiteWasmDatabase {
         );
 
         *self.worker.borrow_mut() = new_worker;
-        *self.next_request_id.borrow_mut() = 1;
 
         self.wait_until_ready().await?;
 
@@ -331,8 +331,10 @@ mod tests {
     }
 
     #[wasm_bindgen_test(async)]
-    async fn wipe_and_recreate_clears_all_data() {
-        let db = SQLiteWasmDatabase::new("test_wipe_data").await.unwrap();
+    async fn wipe_and_recreate_tests() {
+        let db = SQLiteWasmDatabase::new("test_wipe").await.unwrap();
+        db.wipe_and_recreate().await.unwrap();
+
         db.query(
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
             None,
@@ -347,24 +349,12 @@ mod tests {
             .query("SELECT COUNT(*) as count FROM users", None)
             .await
             .unwrap();
-        assert!(result.contains("\"count\":1"));
+        assert!(result.contains("\"count\": 1"));
 
         db.wipe_and_recreate().await.unwrap();
 
         let result = db.query("SELECT * FROM users", None).await;
         assert!(result.is_err() || result.unwrap().contains("no such table"));
-    }
-
-    #[wasm_bindgen_test(async)]
-    async fn wipe_and_recreate_allows_new_operations() {
-        let db = SQLiteWasmDatabase::new("test_wipe_new_ops")
-            .await
-            .unwrap();
-        db.query("CREATE TABLE old_table (id INTEGER)", None)
-            .await
-            .unwrap();
-
-        db.wipe_and_recreate().await.unwrap();
 
         let create_result = db
             .query(
@@ -381,11 +371,6 @@ mod tests {
 
         let select_result = db.query("SELECT * FROM new_table", None).await.unwrap();
         assert!(select_result.contains("test"));
-    }
-
-    #[wasm_bindgen_test(async)]
-    async fn wipe_and_recreate_can_be_called_multiple_times() {
-        let db = SQLiteWasmDatabase::new("test_multi_wipe").await.unwrap();
 
         for i in 0..3 {
             db.query(&format!("CREATE TABLE t{} (id INTEGER)", i), None)
@@ -401,5 +386,20 @@ mod tests {
         assert!(!result.contains("t0"));
         assert!(!result.contains("t1"));
         assert!(!result.contains("t2"));
+
+        let arr = Array::new();
+        arr.push(&JsValue::from_f64(f64::NAN));
+        let res = db.query("SELECT ?", Some(arr)).await;
+        assert!(res.is_err(), "NaN should be rejected");
+
+        let arr = Array::new();
+        arr.push(&JsValue::from_f64(f64::INFINITY));
+        let res = db.query("SELECT ?", Some(arr)).await;
+        assert!(res.is_err(), "+Infinity should be rejected");
+
+        let arr = Array::new();
+        arr.push(&JsValue::from_f64(f64::NEG_INFINITY));
+        let res = db.query("SELECT ?", Some(arr)).await;
+        assert!(res.is_err(), "-Infinity should be rejected");
     }
 }
