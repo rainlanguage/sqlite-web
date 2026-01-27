@@ -11,6 +11,7 @@ use web_sys::Worker;
 
 use crate::errors::SQLiteWasmDatabaseError;
 use crate::messages::WORKER_ERROR_TYPE_INITIALIZATION_PENDING;
+use crate::opfs::delete_opfs_sahpool_directory;
 use crate::params::normalize_params_js;
 use crate::ready::{InitializationState, ReadySignal};
 use crate::utils::describe_js_value;
@@ -19,7 +20,8 @@ use crate::worker_template::generate_self_contained_worker;
 
 #[wasm_bindgen]
 pub struct SQLiteWasmDatabase {
-    worker: Worker,
+    worker: Rc<RefCell<Worker>>,
+    db_name: String,
     pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>,
     next_request_id: Rc<RefCell<u32>>,
     ready_signal: ReadySignal,
@@ -63,7 +65,8 @@ impl SQLiteWasmDatabase {
         let next_request_id = Rc::new(RefCell::new(1u32));
 
         Ok(SQLiteWasmDatabase {
-            worker,
+            worker: Rc::new(RefCell::new(worker)),
+            db_name: db_name.to_string(),
             pending_queries,
             next_request_id,
             ready_signal,
@@ -112,7 +115,7 @@ impl SQLiteWasmDatabase {
         sql: &str,
         params: Option<Array>,
     ) -> Result<String, SQLiteWasmDatabaseError> {
-        let worker = &self.worker;
+        let worker = Rc::clone(&self.worker);
         let pending_queries = Rc::clone(&self.pending_queries);
         let sql = sql.to_string();
         let params_array = Self::normalize_params(params)?;
@@ -154,8 +157,8 @@ impl SQLiteWasmDatabase {
         }
 
         let rid_for_insert = request_id;
-        let promise =
-            js_sys::Promise::new(&mut |resolve, reject| match worker.post_message(&message) {
+        let promise = js_sys::Promise::new(&mut |resolve, reject| {
+            match worker.borrow().post_message(&message) {
                 Ok(()) => {
                     pending_queries
                         .borrow_mut()
@@ -164,7 +167,8 @@ impl SQLiteWasmDatabase {
                 Err(err) => {
                     let _ = reject.call1(&JsValue::NULL, &err);
                 }
-            });
+            }
+        });
 
         let result = match JsFuture::from(promise).await {
             Ok(value) => value,
@@ -176,6 +180,37 @@ impl SQLiteWasmDatabase {
             }
         };
         Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
+    }
+
+    #[wasm_export(js_name = "wipeAndRecreate", unchecked_return_type = "void")]
+    pub async fn wipe_and_recreate(&self) -> Result<(), SQLiteWasmDatabaseError> {
+        self.worker.borrow().terminate();
+
+        for (_, (_, reject)) in self.pending_queries.borrow_mut().drain() {
+            let err = JsValue::from_str("Database wipe in progress");
+            let _ = reject.call1(&JsValue::NULL, &err);
+        }
+
+        self.ready_signal.reset();
+
+        delete_opfs_sahpool_directory().await?;
+
+        let worker_code = generate_self_contained_worker(&self.db_name);
+        let new_worker =
+            create_worker_from_code(&worker_code).map_err(SQLiteWasmDatabaseError::JsError)?;
+
+        install_onmessage_handler(
+            &new_worker,
+            Rc::clone(&self.pending_queries),
+            self.ready_signal.clone(),
+        );
+
+        *self.worker.borrow_mut() = new_worker;
+        *self.next_request_id.borrow_mut() = 1;
+
+        self.wait_until_ready().await?;
+
+        Ok(())
     }
 }
 
@@ -293,5 +328,78 @@ mod tests {
     fn detects_string_initialization_pending_errors() {
         let js_val = JsValue::from_str(WORKER_ERROR_TYPE_INITIALIZATION_PENDING);
         assert!(is_initialization_pending_error(&js_val));
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn wipe_and_recreate_clears_all_data() {
+        let db = SQLiteWasmDatabase::new("test_wipe_data").await.unwrap();
+        db.query(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+            None,
+        )
+        .await
+        .unwrap();
+        db.query("INSERT INTO users (name) VALUES ('Alice')", None)
+            .await
+            .unwrap();
+
+        let result = db
+            .query("SELECT COUNT(*) as count FROM users", None)
+            .await
+            .unwrap();
+        assert!(result.contains("\"count\":1"));
+
+        db.wipe_and_recreate().await.unwrap();
+
+        let result = db.query("SELECT * FROM users", None).await;
+        assert!(result.is_err() || result.unwrap().contains("no such table"));
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn wipe_and_recreate_allows_new_operations() {
+        let db = SQLiteWasmDatabase::new("test_wipe_new_ops")
+            .await
+            .unwrap();
+        db.query("CREATE TABLE old_table (id INTEGER)", None)
+            .await
+            .unwrap();
+
+        db.wipe_and_recreate().await.unwrap();
+
+        let create_result = db
+            .query(
+                "CREATE TABLE new_table (id INTEGER PRIMARY KEY, value TEXT)",
+                None,
+            )
+            .await;
+        assert!(create_result.is_ok());
+
+        let insert_result = db
+            .query("INSERT INTO new_table (value) VALUES ('test')", None)
+            .await;
+        assert!(insert_result.is_ok());
+
+        let select_result = db.query("SELECT * FROM new_table", None).await.unwrap();
+        assert!(select_result.contains("test"));
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn wipe_and_recreate_can_be_called_multiple_times() {
+        let db = SQLiteWasmDatabase::new("test_multi_wipe").await.unwrap();
+
+        for i in 0..3 {
+            db.query(&format!("CREATE TABLE t{} (id INTEGER)", i), None)
+                .await
+                .unwrap();
+            db.wipe_and_recreate().await.unwrap();
+        }
+
+        let result = db
+            .query("SELECT name FROM sqlite_master WHERE type='table'", None)
+            .await
+            .unwrap();
+        assert!(!result.contains("t0"));
+        assert!(!result.contains("t1"));
+        assert!(!result.contains("t2"));
     }
 }
