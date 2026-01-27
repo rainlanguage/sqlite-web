@@ -81,7 +81,7 @@ jobs:
       # get hash of latest published pkgs from npm and concat them
       - name: Get Old Hash
         run: |
-          OLD_HASH=$(npm view @rainlanguage/sqlite-web@alpha dist.shasum 2>/dev/null || echo "none")
+          OLD_HASH=$(npm view @rainlanguage/sqlite-web dist.shasum 2>/dev/null || echo "none")
           echo "OLD_HASH=$OLD_HASH" >> $GITHUB_ENV
           echo "old hash: $OLD_HASH"
 
@@ -125,7 +125,6 @@ jobs:
         run: |
           npm publish sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz \
             --access public \
-            --tag alpha \
             --verbose
 
       # Commit changes and tag
