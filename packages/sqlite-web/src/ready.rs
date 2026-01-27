@@ -87,6 +87,14 @@ impl ReadySignal {
         }
         self.promise.borrow_mut().take();
     }
+
+    pub(crate) fn reset(&self) {
+        *self.state.borrow_mut() = InitializationState::Pending;
+        self.resolve.borrow_mut().take();
+        self.reject.borrow_mut().take();
+        let ready_promise = create_ready_promise(&self.resolve, &self.reject);
+        self.promise.borrow_mut().replace(ready_promise);
+    }
 }
 
 fn create_ready_promise(
@@ -143,5 +151,45 @@ mod tests {
             .await
             .expect_err("promise should reject");
         assert_eq!(err.as_string().as_deref(), Some("boom"));
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn ready_signal_reset_returns_to_pending() {
+        let signal = ReadySignal::new();
+        signal.mark_ready();
+        assert!(matches!(signal.current_state(), InitializationState::Ready));
+
+        signal.reset();
+
+        assert!(
+            matches!(signal.current_state(), InitializationState::Pending),
+            "state should be Pending after reset"
+        );
+        assert!(
+            signal.wait_promise().is_ok(),
+            "promise should exist after reset"
+        );
+
+        signal.mark_ready();
+        let promise = signal.wait_promise().expect("promise exists after mark_ready");
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .expect("promise should resolve after mark_ready");
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn ready_signal_reset_from_failed_state() {
+        let signal = ReadySignal::new();
+        signal.mark_failed("initial failure".into());
+
+        signal.reset();
+
+        assert!(
+            matches!(signal.current_state(), InitializationState::Pending),
+            "state should be Pending after reset from failed"
+        );
+
+        signal.mark_ready();
+        assert!(matches!(signal.current_state(), InitializationState::Ready));
     }
 }
