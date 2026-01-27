@@ -89,9 +89,12 @@ impl ReadySignal {
     }
 
     pub(crate) fn reset(&self) {
-        *self.state.borrow_mut() = InitializationState::Pending;
         self.resolve.borrow_mut().take();
-        self.reject.borrow_mut().take();
+        if let Some(reject) = self.reject.borrow_mut().take() {
+            let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("Ready signal reset"));
+        }
+        self.promise.borrow_mut().take();
+        *self.state.borrow_mut() = InitializationState::Pending;
         let ready_promise = create_ready_promise(&self.resolve, &self.reject);
         self.promise.borrow_mut().replace(ready_promise);
     }
@@ -170,8 +173,8 @@ mod tests {
             "promise should exist after reset"
         );
 
+        let promise = signal.wait_promise().expect("promise exists after reset");
         signal.mark_ready();
-        let promise = signal.wait_promise().expect("promise exists after mark_ready");
         wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .expect("promise should resolve after mark_ready");
