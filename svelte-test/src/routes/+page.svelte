@@ -106,6 +106,39 @@
             isLoading = false;
         }
     }
+
+    async function wipeAndRecreate() {
+        if (!db) return;
+        if (!confirm('This will completely wipe the database and recreate it from scratch. All data will be lost. Continue?')) {
+            return;
+        }
+        try {
+            isLoading = true;
+            status = 'Wiping database...';
+
+            const result = await db.wipeAndRecreate();
+            if (result.error) {
+                throw new Error(result.error.msg);
+            }
+
+            status = 'Recreating schema...';
+            await db.query(`
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    email TEXT UNIQUE,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            `);
+
+            await loadUsers();
+            status = 'Ready - Database wiped and recreated ✅';
+        } catch (error) {
+            status = `Wipe error: ${error instanceof Error ? error.message : 'Unknown error'}`;
+        } finally {
+            isLoading = false;
+        }
+    }
 </script>
 
 <div class="database-demo">
@@ -149,6 +182,9 @@
                             Clear All
                         </button>
                     {/if}
+                    <button class="wipe-btn" onclick={wipeAndRecreate} disabled={isLoading}>
+                        Wipe & Recreate DB
+                    </button>
                 </div>
             </div>
 
@@ -326,6 +362,25 @@
 
     .clear-btn:hover:not(:disabled) {
         background: #c82333;
+    }
+
+    .wipe-btn {
+        background: #6f42c1;
+        color: white;
+        padding: 6px 12px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 12px;
+    }
+
+    .wipe-btn:hover:not(:disabled) {
+        background: #5a32a3;
+    }
+
+    .wipe-btn:disabled {
+        background: #6c757d;
+        cursor: not-allowed;
     }
 
     .loading {

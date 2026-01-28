@@ -20,17 +20,23 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "Blob",
-    "BlobPropertyBag", 
+    "BlobPropertyBag",
     "Url",
     "Worker",
     "WorkerOptions",
     "WorkerType",
     "BroadcastChannel",
-    "MessageEvent", 
+    "MessageEvent",
     "DedicatedWorkerGlobalScope",
     "Navigator",
     "Window",
-    "Location"
+    "Location",
+    "StorageManager",
+    "FileSystemDirectoryHandle",
+    "FileSystemHandle",
+    "FileSystemRemoveOptions",
+    "FileSystemGetDirectoryOptions",
+    "DomException"
 ]}
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
