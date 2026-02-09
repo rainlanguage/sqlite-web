@@ -9,10 +9,10 @@ rm -rf pkg/*.tgz 2>/dev/null || true
 
 # Clear embedded_worker.js file contents first
 echo "🧹 Clearing embedded_worker.js..."
-echo "" > packages/sqlite-web/src/embedded_worker.js
+echo "" > crates/sqlite-web/src/embedded_worker.js
 
 echo "📦 Step 1: Building core package with web target..."
-cd packages/sqlite-web-core
+cd crates/sqlite-web-core
 wasm-pack build --target web --out-dir ../../pkg
 cd ../..
 
@@ -29,7 +29,7 @@ base64 < pkg/sqlite_web_core_bg.wasm | tr -d '\n' > pkg/sqlite_web_core_bg.wasm.
 echo "🔧 Generating embedded worker template..."
 
 # Create the embedded worker with fetch interceptor
-cat > packages/sqlite-web/src/embedded_worker.js << 'EOF'
+cat > crates/sqlite-web/src/embedded_worker.js << 'EOF'
 (function(){
   // Base64 decoder utility - works in both Node.js and browser
   self.__b64ToU8 = function(b64) {
@@ -90,25 +90,25 @@ echo "🔄 Assembling final worker..."
 # Create the final embedded worker by combining template + JS glue + base64 substitution
 {
   # Start with the template (everything before JS_GLUE_PLACEHOLDER)
-  sed '/JS_GLUE_PLACEHOLDER/,$d' packages/sqlite-web/src/embedded_worker.js
+  sed '/JS_GLUE_PLACEHOLDER/,$d' crates/sqlite-web/src/embedded_worker.js
   
   # Add the JS glue code (convert exports to regular variables for worker context)
   sed 's/^export function /function /; s/^export class /class /; s/^export { initSync };/self.initSync = initSync;/; s/^export default __wbg_init;/self.wasm_bindgen = __wbg_init;/; s/import\.meta\.url/self.location.href/g' pkg/sqlite_web_core.js
   
   # Add the rest of the template (everything after JS_GLUE_PLACEHOLDER)
-  sed '1,/JS_GLUE_PLACEHOLDER/d' packages/sqlite-web/src/embedded_worker.js
-} | awk 'BEGIN{getline b64<"pkg/sqlite_web_core_bg.wasm.b64"} {gsub(/__WASM_B64_CORE__/, b64)}1' > packages/sqlite-web/src/embedded_worker.js.final
+  sed '1,/JS_GLUE_PLACEHOLDER/d' crates/sqlite-web/src/embedded_worker.js
+} | awk 'BEGIN{getline b64<"pkg/sqlite_web_core_bg.wasm.b64"} {gsub(/__WASM_B64_CORE__/, b64)}1' > crates/sqlite-web/src/embedded_worker.js.final
 
 # Replace the original with the final version
-mv packages/sqlite-web/src/embedded_worker.js.final packages/sqlite-web/src/embedded_worker.js
+mv crates/sqlite-web/src/embedded_worker.js.final crates/sqlite-web/src/embedded_worker.js
 
-echo "✅ Core embedding complete! Generated packages/sqlite-web/src/embedded_worker.js"
+echo "✅ Core embedding complete! Generated crates/sqlite-web/src/embedded_worker.js"
 echo "📊 Embedded WASM size: $(wc -c < pkg/sqlite_web_core_bg.wasm.b64) base64 characters"
 echo "📊 JS glue code lines: $(wc -l < pkg/sqlite_web_core.js)"
 
 echo ""
 echo "📦 Step 2: Building main package with embedded core..."
-cd packages/sqlite-web
+cd crates/sqlite-web
 wasm-pack build --target web --out-dir ../../pkg
 cd ../..
 
@@ -122,7 +122,7 @@ else
 fi
 
 echo "📌 Syncing package version with Cargo manifest..."
-CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' packages/sqlite-web/Cargo.toml | head -n 1)
+CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/sqlite-web/Cargo.toml | head -n 1)
 if [ -n "$CARGO_VERSION" ]; then
   sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"$CARGO_VERSION\"/" pkg/package.json
   rm pkg/package.json.bak
@@ -139,13 +139,13 @@ cd ..
 
 # Update Svelte integration with fresh package
 echo "🔄 Updating Svelte integration..."
-cd svelte-test
+cd packages/ui
 npm pkg delete dependencies.sqlite-web 2>/dev/null || true
 npm pkg delete dependencies."@rainlanguage/sqlite-web" 2>/dev/null || true
-npm pkg set dependencies."@rainlanguage/sqlite-web"="file:../pkg/${PACK_FILE}"
+npm pkg set dependencies."@rainlanguage/sqlite-web"="file:../../pkg/${PACK_FILE}"
 rm -rf node_modules package-lock.json
 npm install
-cd ..
+cd ../..
 
 echo ""
 echo "🚀 Your SQLite worker is now fully self-contained with workspace architecture!"

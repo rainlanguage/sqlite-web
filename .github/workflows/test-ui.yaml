@@ -42,12 +42,12 @@ jobs:
 
       - name: Install Playwright browsers with dependencies
         run: |
-          cd svelte-test
+          cd packages/ui
           npx playwright install --with-deps
 
       - run: nix develop -c test-ui
 
       - name: Frontend linting and formatting
         run: |
-          cd svelte-test
+          cd packages/ui
           npm run lint-format-check

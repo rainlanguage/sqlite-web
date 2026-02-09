@@ -3,7 +3,7 @@
 !pkg/package.json
 !pkg/.gitignore
 # Generated files from bundle.sh
-packages/sqlite-web/src/embedded_worker.js
+crates/sqlite-web/src/embedded_worker.js
 pkg/sqlite_web_bg.wasm.b64
 
 # macOS
