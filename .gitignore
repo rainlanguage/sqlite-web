@@ -8,3 +8,5 @@ pkg/sqlite_web_bg.wasm.b64
 
 # macOS
 .DS_Store
+
+.claude
