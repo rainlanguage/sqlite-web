@@ -18,17 +18,6 @@ pub async fn delete_opfs_sahpool_directory() -> Result<(), SQLiteWasmDatabaseErr
 
     delete_directory_contents(&sahpool_dir).await?;
 
-    let remove_options = FileSystemRemoveOptions::new();
-    remove_options.set_recursive(true);
-    JsFuture::from(root.remove_entry_with_options(SAHPOOL_DIR_NAME, &remove_options))
-        .await
-        .map_err(|e| {
-            SQLiteWasmDatabaseError::OpfsDeletionFailed(format!(
-                "failed to remove sahpool directory: {}",
-                describe_js_value(&e)
-            ))
-        })?;
-
     Ok(())
 }
 
