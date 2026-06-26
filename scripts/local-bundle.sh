@@ -67,7 +67,7 @@ JS_GLUE_PLACEHOLDER
   // Initialize the worker after everything is set up
   // For web target, wasm_bindgen is a function, not an object
   console.log('[Worker] Initializing core WASM...');
-  wasm_bindgen('./sqlite_web_core_bg.wasm').then(function(wasm) {
+  self.wasm_bindgen('./sqlite_web_core_bg.wasm').then(function(wasm) {
     console.log('[Worker] Core WASM loaded, starting worker_main...');
     if (typeof wasm.worker_main === 'function') {
       wasm.worker_main();
@@ -93,7 +93,7 @@ echo "🔄 Assembling final worker..."
   sed '/JS_GLUE_PLACEHOLDER/,$d' packages/sqlite-web/src/embedded_worker.js
   
   # Add the JS glue code (convert exports to regular variables for worker context)
-  sed 's/^export function /function /; s/^export class /class /; s/^export { initSync };/self.initSync = initSync;/; s/^export default __wbg_init;/self.wasm_bindgen = __wbg_init;/; s/import\.meta\.url/self.location.href/g' pkg/sqlite_web_core.js
+  sed 's/^export function /function /; s/^export class /class /; s/^export { initSync };/self.initSync = initSync;/; s/^export default __wbg_init;/self.wasm_bindgen = __wbg_init;/; s/^export { initSync, __wbg_init as default };/self.initSync = initSync; self.wasm_bindgen = __wbg_init;/; s/import\.meta\.url/self.location.href/g' pkg/sqlite_web_core.js
   
   # Add the rest of the template (everything after JS_GLUE_PLACEHOLDER)
   sed '1,/JS_GLUE_PLACEHOLDER/d' packages/sqlite-web/src/embedded_worker.js

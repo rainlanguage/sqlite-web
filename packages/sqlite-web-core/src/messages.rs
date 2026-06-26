@@ -13,6 +13,14 @@ pub struct WorkerErrorPayload {
     pub message: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SqlBatchStatement {
+    pub sql: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub params: Option<Vec<serde_json::Value>>,
+}
+
 // Message types for BroadcastChannel communication
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
@@ -35,6 +43,12 @@ pub enum ChannelMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         params: Option<Vec<serde_json::Value>>,
+    },
+    #[serde(rename = "batch-request")]
+    BatchRequest {
+        #[serde(rename = "queryId")]
+        query_id: String,
+        statements: Vec<SqlBatchStatement>,
     },
     #[serde(rename = "query-response")]
     QueryResponse {
@@ -62,6 +76,12 @@ pub enum WorkerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         params: Option<Vec<serde_json::Value>>,
+    },
+    #[serde(rename = "execute-batch")]
+    ExecuteBatch {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        statements: Vec<SqlBatchStatement>,
     },
 }
 
@@ -126,6 +146,19 @@ mod tests {
             assert!(json.contains("\"sql\":\"SELECT * FROM users\""));
         });
 
+        let batch_request = ChannelMessage::BatchRequest {
+            query_id: "batch-456".to_string(),
+            statements: vec![SqlBatchStatement {
+                sql: "INSERT INTO users (name) VALUES (?)".to_string(),
+                params: Some(vec![serde_json::json!("Alice")]),
+            }],
+        };
+        assert_serialization_roundtrip(batch_request, "batch-request", |json| {
+            assert!(json.contains("\"queryId\":\"batch-456\""));
+            assert!(json.contains("\"statements\""));
+            assert!(json.contains("\"params\""));
+        });
+
         let query_success = ChannelMessage::QueryResponse {
             query_id: "query-789".to_string(),
             result: Some("[{\"id\": 1, \"name\": \"test\"}]".to_string()),
@@ -175,6 +208,37 @@ mod tests {
                 assert_eq!(sql, "INSERT INTO table VALUES (1, 'test')");
                 assert_eq!(request_id, 42);
             }
+            other => panic!("expected ExecuteQuery, got {other:?}"),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn test_worker_message_execute_batch_serialization() {
+        // Guard the JS/Rust worker wire format against accidental message renames.
+        let msg = WorkerMessage::ExecuteBatch {
+            request_id: 43,
+            statements: vec![SqlBatchStatement {
+                sql: "INSERT INTO table VALUES (?)".to_string(),
+                params: Some(vec![serde_json::json!(1)]),
+            }],
+        };
+
+        let json = serde_json::to_string(&msg).expect("Should serialize");
+        assert!(json.contains("\"type\":\"execute-batch\""));
+        assert!(json.contains("\"requestId\":43"));
+        assert!(json.contains("\"statements\""));
+
+        let deserialized: WorkerMessage = serde_json::from_str(&json).expect("Should deserialize");
+        match deserialized {
+            WorkerMessage::ExecuteBatch {
+                request_id,
+                statements,
+            } => {
+                assert_eq!(request_id, 43);
+                assert_eq!(statements.len(), 1);
+                assert_eq!(statements[0].sql, "INSERT INTO table VALUES (?)");
+            }
+            other => panic!("expected ExecuteBatch, got {other:?}"),
         }
     }
 

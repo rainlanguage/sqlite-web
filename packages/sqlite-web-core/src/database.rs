@@ -1,4 +1,5 @@
 use crate::database_functions::register_custom_functions;
+use crate::messages::SqlBatchStatement;
 use crate::util::sanitize_db_filename;
 use base64::Engine;
 use sqlite_wasm_rs::export::{install_opfs_sahpool, *};
@@ -579,6 +580,124 @@ impl SQLiteDatabase {
         self.exec_prepared_statement(stmt_guard.take())
     }
 
+    async fn exec_single_statement_strict(
+        &self,
+        sql: &str,
+    ) -> Result<(Option<Vec<serde_json::Value>>, i32), String> {
+        let sql_cstr = CString::new(sql).map_err(|e| format!("Invalid SQL string: {e}"))?;
+        let ptr = sql_cstr.as_ptr();
+        let (stmt_opt, tail) = self.prepare_one(ptr)?;
+        let Some(stmt) = stmt_opt else {
+            if !Self::is_trivia_tail_only(tail) {
+                return Err("Batch statements must contain a single statement.".to_string());
+            }
+            return Ok((None, 0));
+        };
+        let mut stmt_guard = StmtGuard::new(stmt);
+        if !Self::is_trivia_tail_only(tail) {
+            return Err("Batch statements must contain a single statement.".to_string());
+        }
+        self.exec_prepared_statement(stmt_guard.take())
+    }
+
+    fn is_transaction_control_statement(sql: &str) -> bool {
+        let Some(keyword) = Self::first_sql_keyword(sql) else {
+            return false;
+        };
+        let upper = keyword.to_ascii_uppercase();
+        matches!(
+            upper.as_str(),
+            "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE"
+        )
+    }
+
+    fn first_sql_keyword(sql: &str) -> Option<&str> {
+        let bytes = sql.as_bytes();
+        let mut i = 0;
+
+        loop {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+
+            if bytes.get(i) == Some(&b'-') && bytes.get(i + 1) == Some(&b'-') {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+
+            if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+                i += 2;
+                let mut closed = false;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        closed = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    return None;
+                }
+                continue;
+            }
+
+            break;
+        }
+
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            i += 1;
+        }
+
+        if i == start {
+            None
+        } else {
+            Some(&sql[start..i])
+        }
+    }
+
+    fn is_sql_trivia_only(sql: &str) -> bool {
+        let bytes = sql.as_bytes();
+        let mut i = 0;
+
+        loop {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+
+            if bytes.get(i) == Some(&b'-') && bytes.get(i + 1) == Some(&b'-') {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+
+            if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+                i += 2;
+                let mut closed = false;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        closed = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    return true;
+                }
+                continue;
+            }
+
+            return i == bytes.len();
+        }
+    }
+
     pub async fn initialize_opfs(db_name: &str) -> Result<Self, JsValue> {
         // Install OPFS VFS and set as default
         install_opfs_sahpool(None, true)
@@ -814,6 +933,97 @@ impl SQLiteDatabase {
         } else {
             Ok(format!(
                 "Query executed successfully. Rows affected: {affected}"
+            ))
+        }
+    }
+
+    /// Execute a list of single statements atomically as one database-worker job.
+    pub async fn exec_batch(
+        &mut self,
+        statements: Vec<SqlBatchStatement>,
+    ) -> Result<String, String> {
+        if statements.is_empty() {
+            return Err("Batch must contain at least one statement.".to_string());
+        }
+        self.refresh_transaction_state();
+        if self.in_transaction {
+            return Err("Cannot execute a batch while a transaction is already open.".to_string());
+        }
+
+        self.exec_single_statement("BEGIN TRANSACTION").await?;
+        self.refresh_transaction_state();
+
+        let mut last_statement_rows: Option<Vec<serde_json::Value>> = None;
+        let mut total_affected_rows = 0;
+        let mut executed_any = false;
+
+        for (idx, statement) in statements.into_iter().enumerate() {
+            let sql = statement.sql.trim();
+            if sql.is_empty() {
+                continue;
+            }
+            if Self::first_sql_keyword(sql).is_none() {
+                if Self::is_sql_trivia_only(sql) {
+                    continue;
+                }
+                let _ = self.exec_single_statement("ROLLBACK").await;
+                self.refresh_transaction_state();
+                return Err(format!(
+                    "Batch statement {} must contain exactly one executable statement.",
+                    idx + 1
+                ));
+            }
+            if Self::is_transaction_control_statement(sql) {
+                let _ = self.exec_single_statement("ROLLBACK").await;
+                self.refresh_transaction_state();
+                return Err(format!(
+                    "Batch statement {} contains a transaction-control keyword; transaction() manages the transaction for you.",
+                    idx + 1
+                ));
+            }
+
+            let statement_result = match statement.params {
+                Some(params) => self.exec_single_statement_with_params(sql, params).await,
+                None => self.exec_single_statement_strict(sql).await,
+            };
+
+            match statement_result {
+                Ok((rows_opt, affected)) => {
+                    executed_any = true;
+                    if rows_opt.is_some() {
+                        last_statement_rows = rows_opt;
+                    } else {
+                        last_statement_rows = None;
+                        total_affected_rows += affected;
+                    }
+                }
+                Err(err) => {
+                    let _ = self.exec_single_statement("ROLLBACK").await;
+                    self.refresh_transaction_state();
+                    return Err(format!("Batch statement {} failed: {}", idx + 1, err));
+                }
+            }
+        }
+
+        if !executed_any {
+            let _ = self.exec_single_statement("ROLLBACK").await;
+            self.refresh_transaction_state();
+            return Err("Batch must contain at least one executable statement.".to_string());
+        }
+
+        if let Err(err) = self.exec_single_statement("COMMIT").await {
+            let _ = self.exec_single_statement("ROLLBACK").await;
+            self.refresh_transaction_state();
+            return Err(format!("Batch commit failed: {err}"));
+        }
+        self.refresh_transaction_state();
+
+        if let Some(results) = last_statement_rows {
+            serde_json::to_string_pretty(&results)
+                .map_err(|e| format!("JSON serialization error: {e}"))
+        } else {
+            Ok(format!(
+                "Batch executed successfully. Rows affected: {total_affected_rows}"
             ))
         }
     }
@@ -1684,6 +1894,402 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    async fn split_transaction_calls_can_interleave_and_nested_begin_fails() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("ROLLBACK").await.ok();
+        db.exec("BEGIN TRANSACTION")
+            .await
+            .expect("first logical client starts a transaction");
+
+        let second_begin = db.exec("BEGIN TRANSACTION").await;
+        assert!(
+            second_begin
+                .expect_err("second logical client BEGIN should fail")
+                .contains("cannot start a transaction within a transaction"),
+            "SQLite reports the nested BEGIN failure"
+        );
+
+        db.exec("ROLLBACK").await.ok();
+    }
+
+    #[wasm_bindgen_test]
+    async fn exec_batch_wraps_statements_in_one_transaction() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("DROP TABLE IF EXISTS batch_test").await.ok();
+        let result = db
+            .exec_batch(vec![
+                SqlBatchStatement {
+                    sql: "CREATE TABLE batch_test (id INTEGER PRIMARY KEY, name TEXT)".to_string(),
+                    params: None,
+                },
+                SqlBatchStatement {
+                    sql: "INSERT INTO batch_test (name) VALUES (?)".to_string(),
+                    params: Some(vec![json!("Alice")]),
+                },
+                SqlBatchStatement {
+                    sql: "SELECT COUNT(*) as count FROM batch_test".to_string(),
+                    params: None,
+                },
+            ])
+            .await
+            .expect("batch should execute");
+
+        let rows: serde_json::Value = serde_json::from_str(&result).expect("select result json");
+        assert_eq!(rows[0]["count"].as_i64(), Some(1));
+        assert!(!db.in_transaction, "batch should commit before returning");
+    }
+
+    #[wasm_bindgen_test]
+    async fn exec_batch_returns_last_row_result() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        let result = db
+            .exec_batch(vec![
+                SqlBatchStatement {
+                    sql: "SELECT 'first' as label".to_string(),
+                    params: None,
+                },
+                SqlBatchStatement {
+                    sql: "CREATE TABLE IF NOT EXISTS batch_last_result_test (id INTEGER)"
+                        .to_string(),
+                    params: None,
+                },
+                SqlBatchStatement {
+                    sql: "SELECT 'last' as label".to_string(),
+                    params: None,
+                },
+            ])
+            .await
+            .expect("batch should execute");
+
+        let rows: serde_json::Value = serde_json::from_str(&result).expect("select result json");
+        assert_eq!(rows[0]["label"].as_str(), Some("last"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn exec_batch_returns_success_when_last_statement_has_no_rows() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("DROP TABLE IF EXISTS batch_last_non_query_test")
+            .await
+            .ok();
+        db.exec("CREATE TABLE batch_last_non_query_test (id INTEGER PRIMARY KEY, name TEXT)")
+            .await
+            .expect("create table");
+
+        let result = db
+            .exec_batch(vec![
+                SqlBatchStatement {
+                    sql: "SELECT 'stale' as label".to_string(),
+                    params: None,
+                },
+                SqlBatchStatement {
+                    sql: "INSERT INTO batch_last_non_query_test (name) VALUES ('Alice')"
+                        .to_string(),
+                    params: None,
+                },
+            ])
+            .await
+            .expect("batch should execute");
+
+        assert!(
+            result.starts_with("Batch executed successfully."),
+            "final non-query statement should not return stale rows: {result}"
+        );
+        assert!(
+            result.contains("Rows affected: 1"),
+            "row-returning statements should not contribute stale affected rows: {result}"
+        );
+
+        let count = db
+            .exec("SELECT COUNT(*) as count FROM batch_last_non_query_test")
+            .await
+            .expect("count query");
+        let rows: serde_json::Value = serde_json::from_str(&count).expect("count json");
+        assert_eq!(rows[0]["count"].as_i64(), Some(1));
+    }
+
+    #[wasm_bindgen_test]
+    async fn exec_batch_rejects_non_trivia_statement_without_keyword() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("DROP TABLE IF EXISTS batch_no_keyword_test")
+            .await
+            .ok();
+        db.exec("CREATE TABLE batch_no_keyword_test (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        let result = db
+            .exec_batch(vec![SqlBatchStatement {
+                sql: "; INSERT INTO batch_no_keyword_test DEFAULT VALUES".to_string(),
+                params: None,
+            }])
+            .await;
+
+        assert_eq!(
+            result.expect_err("delimiter-prefixed SQL should be rejected"),
+            "Batch statement 1 must contain exactly one executable statement."
+        );
+        assert!(
+            !db.in_transaction,
+            "invalid batch statement should roll back before returning"
+        );
+
+        let count = db
+            .exec("SELECT COUNT(*) as count FROM batch_no_keyword_test")
+            .await
+            .expect("count query");
+        let rows: serde_json::Value = serde_json::from_str(&count).expect("count json");
+        assert_eq!(rows[0]["count"].as_i64(), Some(0));
+    }
+
+    #[wasm_bindgen_test]
+    async fn exec_batch_rolls_back_on_failure() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("DROP TABLE IF EXISTS batch_rollback_test")
+            .await
+            .ok();
+        db.exec("CREATE TABLE batch_rollback_test (id INTEGER PRIMARY KEY, name TEXT)")
+            .await
+            .expect("create table");
+
+        let result = db
+            .exec_batch(vec![
+                SqlBatchStatement {
+                    sql: "INSERT INTO batch_rollback_test (id, name) VALUES (1, 'Alice')"
+                        .to_string(),
+                    params: None,
+                },
+                SqlBatchStatement {
+                    sql: "INSERT INTO missing_batch_table (id) VALUES (1)".to_string(),
+                    params: None,
+                },
+            ])
+            .await;
+        assert!(result.is_err(), "batch should fail");
+        assert!(
+            !db.in_transaction,
+            "failure should roll back before returning"
+        );
+
+        let count = db
+            .exec("SELECT COUNT(*) as count FROM batch_rollback_test")
+            .await
+            .expect("count query");
+        let rows: serde_json::Value = serde_json::from_str(&count).expect("count json");
+        assert_eq!(rows[0]["count"].as_i64(), Some(0));
+    }
+
+    #[wasm_bindgen_test]
+    async fn exec_batch_rejects_when_transaction_is_already_open() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("ROLLBACK").await.ok();
+        db.exec("BEGIN TRANSACTION")
+            .await
+            .expect("begin transaction");
+        assert!(db.in_transaction, "BEGIN should mark transaction open");
+
+        let result = db
+            .exec_batch(vec![SqlBatchStatement {
+                sql: "SELECT 1".to_string(),
+                params: None,
+            }])
+            .await;
+
+        assert_eq!(
+            result.expect_err("batch should reject nested transaction"),
+            "Cannot execute a batch while a transaction is already open."
+        );
+        assert!(
+            db.in_transaction,
+            "rejected batch should not close the caller's transaction"
+        );
+
+        db.exec("ROLLBACK").await.ok();
+        assert!(!db.in_transaction, "cleanup should close transaction");
+    }
+
+    #[wasm_bindgen_test]
+    async fn exec_batch_rejects_all_empty_statements_and_rolls_back() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        let result = db
+            .exec_batch(vec![SqlBatchStatement {
+                sql: " \n\t ".to_string(),
+                params: None,
+            }])
+            .await;
+
+        assert_eq!(
+            result.expect_err("empty statement batch should be rejected"),
+            "Batch must contain at least one executable statement."
+        );
+        assert!(
+            !db.in_transaction,
+            "empty batch rejection should leave no open transaction"
+        );
+
+        let result = db
+            .exec_batch(vec![SqlBatchStatement {
+                sql: "-- comment only\n/* and another comment */".to_string(),
+                params: None,
+            }])
+            .await;
+
+        assert_eq!(
+            result.expect_err("comment-only batch should be rejected"),
+            "Batch must contain at least one executable statement."
+        );
+        assert!(
+            !db.in_transaction,
+            "comment-only batch rejection should leave no open transaction"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn exec_batch_ignores_comment_only_statements_around_executable_statements() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        let result = db
+            .exec_batch(vec![
+                SqlBatchStatement {
+                    sql: "-- comment only".to_string(),
+                    params: None,
+                },
+                SqlBatchStatement {
+                    sql: "SELECT 'executed' as label".to_string(),
+                    params: None,
+                },
+                SqlBatchStatement {
+                    sql: "/* trailing comment only */".to_string(),
+                    params: None,
+                },
+            ])
+            .await
+            .expect("batch should execute non-comment statement");
+
+        let rows: serde_json::Value = serde_json::from_str(&result).expect("select result json");
+        assert_eq!(rows[0]["label"].as_str(), Some("executed"));
+        assert!(!db.in_transaction, "batch should commit before returning");
+    }
+
+    #[wasm_bindgen_test]
+    async fn exec_batch_rejects_transaction_control_statements() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        for sql in [
+            "BEGIN TRANSACTION",
+            "COMMIT",
+            "ROLLBACK",
+            "END TRANSACTION",
+            "SAVEPOINT sp1",
+            "RELEASE sp1",
+        ] {
+            let result = db
+                .exec_batch(vec![SqlBatchStatement {
+                    sql: sql.to_string(),
+                    params: None,
+                }])
+                .await;
+            assert!(result
+                .expect_err("transaction control should be rejected")
+                .contains("transaction() manages the transaction for you"));
+            assert!(
+                !db.in_transaction,
+                "rejection should leave no open transaction"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn exec_batch_refreshes_stale_transaction_state_before_rejecting() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+
+        db.exec("DROP TABLE IF EXISTS batch_stale_state_test")
+            .await
+            .ok();
+        db.exec("CREATE TABLE batch_stale_state_test (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+        db.exec("BEGIN TRANSACTION")
+            .await
+            .expect("begin transaction");
+        assert!(db.in_transaction, "BEGIN should mark the cache as open");
+
+        let result = db
+            .exec("COMMIT; SELECT * FROM missing_batch_stale_state_table;")
+            .await;
+        assert!(result.is_err(), "second statement should fail after COMMIT");
+        assert!(
+            db.in_transaction,
+            "the error path leaves the cached transaction state stale"
+        );
+
+        db.exec_batch(vec![SqlBatchStatement {
+            sql: "INSERT INTO batch_stale_state_test DEFAULT VALUES".to_string(),
+            params: None,
+        }])
+        .await
+        .expect("batch should refresh stale state before checking for open transactions");
+        assert!(
+            !db.in_transaction,
+            "successful batch should leave no open transaction"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn transaction_control_detection_skips_leading_comments() {
+        assert!(SQLiteDatabase::is_transaction_control_statement(
+            "/* leading */ COMMIT;"
+        ));
+        assert!(SQLiteDatabase::is_transaction_control_statement(
+            "-- leading\nROLLBACK"
+        ));
+        assert!(SQLiteDatabase::is_transaction_control_statement(
+            "END TRANSACTION"
+        ));
+        assert!(SQLiteDatabase::is_transaction_control_statement(
+            "SAVEPOINT sp1"
+        ));
+        assert!(SQLiteDatabase::is_transaction_control_statement(
+            "RELEASE sp1"
+        ));
+        assert!(!SQLiteDatabase::is_transaction_control_statement(
+            "INSERT INTO t VALUES ('COMMIT')"
+        ));
+        assert!(!SQLiteDatabase::is_transaction_control_statement(
+            "START TRANSACTION"
+        ));
+    }
+
+    #[wasm_bindgen_test]
     async fn test_sql_splitting_utility() {
         // Ensure production logic handles multiple semicolons and empty statements gracefully
         let Some(mut db) = get_test_db().await else {
@@ -1698,6 +2304,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&res).expect("Invalid JSON");
         let array = parsed.as_array().expect("Should be array");
         assert_eq!(array.len(), 1, "Only first result set should be returned");
+        assert_eq!(array[0]["1"].as_i64(), Some(1));
     }
 
     #[wasm_bindgen_test]
