@@ -5,6 +5,7 @@ use std::rc::Rc;
 use js_sys::{Array, Reflect};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_utils::prelude::*;
 use web_sys::Worker;
@@ -76,6 +77,63 @@ impl SQLiteWasmDatabase {
     fn normalize_params(params: Option<Array>) -> Result<Array, SQLiteWasmDatabaseError> {
         let params_js = params.map(JsValue::from).unwrap_or(JsValue::UNDEFINED);
         normalize_params_js(&params_js)
+    }
+
+    fn normalize_batch_statements(statements: Array) -> Result<Array, SQLiteWasmDatabaseError> {
+        if statements.length() == 0 {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "transaction requires at least one statement",
+            )));
+        }
+
+        (0..statements.length()).try_fold(Array::new(), |normalized, i| {
+            let input = statements.get(i);
+            if !input.is_object() || input.is_null() {
+                return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                    &format!("Batch statement {} must be an object", i + 1),
+                )));
+            }
+            let sql = Reflect::get(&input, &JsValue::from_str("sql"))
+                .map_err(SQLiteWasmDatabaseError::JsError)?
+                .as_string()
+                .ok_or_else(|| {
+                    SQLiteWasmDatabaseError::JsError(JsValue::from_str(&format!(
+                        "Batch statement {} must include a sql string",
+                        i + 1
+                    )))
+                })?;
+            if sql.trim().is_empty() {
+                return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                    &format!(
+                        "Batch statement {} must include a non-empty sql string",
+                        i + 1
+                    ),
+                )));
+            }
+
+            let statement = js_sys::Object::new();
+            Reflect::set(
+                &statement,
+                &JsValue::from_str("sql"),
+                &JsValue::from_str(&sql),
+            )
+            .map_err(SQLiteWasmDatabaseError::JsError)?;
+
+            let params_value = Reflect::get(&input, &JsValue::from_str("params"))
+                .map_err(SQLiteWasmDatabaseError::JsError)?;
+            if !params_value.is_undefined() && !params_value.is_null() {
+                let params = normalize_params_js(&params_value)?;
+                Reflect::set(
+                    &statement,
+                    &JsValue::from_str("params"),
+                    &JsValue::from(params),
+                )
+                .map_err(SQLiteWasmDatabaseError::JsError)?;
+            }
+
+            normalized.push(&statement);
+            Ok(normalized)
+        })
     }
 
     async fn wait_until_ready(&self) -> Result<(), SQLiteWasmDatabaseError> {
@@ -183,6 +241,81 @@ impl SQLiteWasmDatabase {
         Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
     }
 
+    /// Execute a list of single SQL statements atomically as one worker job.
+    ///
+    /// Each item must be `{ sql: string, params?: Array }`. Do not include
+    /// transaction-control statements; the worker owns the transaction.
+    #[wasm_export(js_name = "transaction", unchecked_return_type = "string")]
+    pub async fn transaction(&self, statements: Array) -> Result<String, SQLiteWasmDatabaseError> {
+        self.transaction_inner(statements).await
+    }
+
+    async fn transaction_inner(
+        &self,
+        statements: Array,
+    ) -> Result<String, SQLiteWasmDatabaseError> {
+        let worker = Rc::clone(&self.worker);
+        let pending_queries = Rc::clone(&self.pending_queries);
+        let statements = Self::normalize_batch_statements(statements)?;
+
+        if let InitializationState::Failed(reason) = self.ready_signal.current_state() {
+            return Err(SQLiteWasmDatabaseError::InitializationFailed(reason));
+        }
+
+        let message = js_sys::Object::new();
+        Reflect::set(
+            &message,
+            &JsValue::from_str("type"),
+            &JsValue::from_str("execute-batch"),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+
+        let request_id = {
+            let mut n = self.next_request_id.borrow_mut();
+            let id = *n;
+            *n = n.wrapping_add(1).max(1);
+            id
+        };
+        Reflect::set(
+            &message,
+            &JsValue::from_str("requestId"),
+            &JsValue::from_f64(request_id as f64),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("statements"),
+            &JsValue::from(statements),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+
+        let rid_for_insert = request_id;
+        let promise = js_sys::Promise::new(&mut |resolve, reject| match worker
+            .borrow()
+            .post_message(&message)
+        {
+            Ok(()) => {
+                pending_queries
+                    .borrow_mut()
+                    .insert(rid_for_insert, (resolve, reject));
+            }
+            Err(err) => {
+                let _ = reject.call1(&JsValue::NULL, &err);
+            }
+        });
+
+        let result = match JsFuture::from(promise).await {
+            Ok(value) => value,
+            Err(err) if is_initialization_pending_error(&err) => {
+                return Err(SQLiteWasmDatabaseError::InitializationPending);
+            }
+            Err(err) => {
+                return Err(SQLiteWasmDatabaseError::JsError(err));
+            }
+        };
+        Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
+    }
+
     #[wasm_export(js_name = "wipeAndRecreate", unchecked_return_type = "void")]
     pub async fn wipe_and_recreate(&self) -> Result<(), SQLiteWasmDatabaseError> {
         self.worker.borrow().terminate();
@@ -194,7 +327,7 @@ impl SQLiteWasmDatabase {
 
         self.ready_signal.reset();
 
-        let deletion_result = delete_opfs_sahpool_directory().await;
+        let deletion_result = delete_opfs_sahpool_directory_with_retries().await;
 
         let worker_code = generate_self_contained_worker(&self.db_name);
         let new_worker =
@@ -224,11 +357,46 @@ fn is_initialization_pending_error(err: &JsValue) -> bool {
     err.as_string().as_deref() == Some(WORKER_ERROR_TYPE_INITIALIZATION_PENDING)
 }
 
+async fn delete_opfs_sahpool_directory_with_retries() -> Result<(), SQLiteWasmDatabaseError> {
+    let mut deletion_result = delete_opfs_sahpool_directory().await;
+    for _ in 0..4 {
+        if deletion_result.is_ok() {
+            return deletion_result;
+        }
+        sleep_ms(50).await;
+        deletion_result = delete_opfs_sahpool_directory().await;
+    }
+    deletion_result
+}
+
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let Some(window) = web_sys::window() else {
+            let _ = resolve.call0(&JsValue::UNDEFINED);
+            return;
+        };
+
+        let resolve_for_timeout = resolve.clone();
+        let callback = wasm_bindgen::closure::Closure::once_into_js(move || {
+            let _ = resolve_for_timeout.call0(&JsValue::UNDEFINED);
+        });
+
+        if window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), ms)
+            .is_err()
+        {
+            let _ = resolve.call0(&JsValue::UNDEFINED);
+        }
+    });
+
+    let _ = JsFuture::from(promise).await;
+}
+
 #[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use super::*;
     use base64::Engine;
-    use js_sys::{Array, ArrayBuffer, BigInt, Object, Uint8Array};
+    use js_sys::{Array, ArrayBuffer, BigInt, Function, Object, Uint8Array};
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -242,6 +410,123 @@ mod tests {
         let normalized =
             SQLiteWasmDatabase::normalize_params(Some(arr)).expect("empty array stays empty");
         assert_eq!(normalized.length(), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn normalize_batch_statements_requires_non_empty_array() {
+        let empty = Array::new();
+        let err = SQLiteWasmDatabase::normalize_batch_statements(empty)
+            .expect_err("empty batch should be rejected");
+        match err {
+            SQLiteWasmDatabaseError::JsError(js) => assert_eq!(
+                js.as_string().as_deref(),
+                Some("transaction requires at least one statement")
+            ),
+            other => panic!("expected JsError, got {other:?}"),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn normalize_batch_statements_rejects_empty_sql() {
+        let statements = Array::new();
+        let statement = Object::new();
+        Reflect::set(
+            &statement,
+            &JsValue::from_str("sql"),
+            &JsValue::from_str(" \n\t "),
+        )
+        .unwrap();
+        statements.push(&statement);
+
+        let err = SQLiteWasmDatabase::normalize_batch_statements(statements)
+            .expect_err("empty SQL should be rejected");
+        match err {
+            SQLiteWasmDatabaseError::JsError(js) => assert_eq!(
+                js.as_string().as_deref(),
+                Some("Batch statement 1 must include a non-empty sql string")
+            ),
+            other => panic!("expected JsError, got {other:?}"),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn normalize_batch_statements_normalizes_params() {
+        let statements = Array::new();
+        let statement = Object::new();
+        Reflect::set(
+            &statement,
+            &JsValue::from_str("sql"),
+            &JsValue::from_str("SELECT ?"),
+        )
+        .unwrap();
+        let params = Array::new();
+        let bi: JsValue = BigInt::from(77u32).into();
+        params.push(&bi);
+        Reflect::set(&statement, &JsValue::from_str("params"), &params).unwrap();
+        statements.push(&statement);
+
+        let normalized = SQLiteWasmDatabase::normalize_batch_statements(statements)
+            .expect("valid batch should normalize");
+        let first = normalized.get(0);
+        assert_eq!(
+            Reflect::get(&first, &JsValue::from_str("sql"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("SELECT ?")
+        );
+        let normalized_params = Reflect::get(&first, &JsValue::from_str("params")).unwrap();
+        let normalized_params: Array = normalized_params.unchecked_into();
+        let encoded_bigint = normalized_params.get(0);
+        assert_eq!(
+            Reflect::get(&encoded_bigint, &JsValue::from_str("__type"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("bigint")
+        );
+        assert_eq!(
+            Reflect::get(&encoded_bigint, &JsValue::from_str("value"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("77")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn normalize_batch_statements_propagates_params_getter_errors() {
+        let statements = Array::new();
+        let statement = Object::new();
+        Reflect::set(
+            &statement,
+            &JsValue::from_str("sql"),
+            &JsValue::from_str("SELECT ?"),
+        )
+        .unwrap();
+
+        let descriptor = Object::new();
+        Reflect::set(
+            &descriptor,
+            &JsValue::from_str("get"),
+            &Function::new_no_args("throw new Error('params getter failed')"),
+        )
+        .unwrap();
+        Object::define_property(&statement, &JsValue::from_str("params"), &descriptor);
+        statements.push(&statement);
+
+        let err = SQLiteWasmDatabase::normalize_batch_statements(statements)
+            .expect_err("throwing params getter should be propagated");
+        match err {
+            SQLiteWasmDatabaseError::JsError(js) => {
+                let message = describe_js_value(&js);
+                assert!(
+                    message.contains("params getter failed"),
+                    "unexpected JS error: {message}"
+                );
+            }
+            other => panic!("expected JsError, got {other:?}"),
+        }
     }
 
     #[wasm_bindgen_test]

@@ -45,11 +45,11 @@ uuid = { version = "1.0", features = ["v4", "js"] }
 console_error_panic_hook = "0.1"
 base64 = "0.21"
 sqlite-wasm-rs = { version = "=0.3.0", default-features = false, features = ["precompiled"] }
-alloy = { version = "1.0.9", features = ["sol-types", "json", "json-abi"] }
+alloy = { version = "1.0.9", default-features = false, features = ["sol-types", "json", "json-abi"] }
 thiserror = "2.0.12"
 proptest = "1.7.0"
-revm = { version = "25.0.0", default-features = false }
-wasm-bindgen-utils = { git = "https://github.com/rainlanguage/rain.wasm", rev = "06990d85a0b7c55378a1c8cca4dd9e2bc34a596a" }
+revm = { version = "36", default-features = false, features = ["portable", "std", "tracer"] }
+wasm-bindgen-utils = "0.1.2"
 wasm-bindgen-test = "0.3"
 
 [profile.release]

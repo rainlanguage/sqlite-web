@@ -16,7 +16,7 @@ use web_sys::{
 
 use crate::database::SQLiteDatabase;
 use crate::messages::{
-    ChannelMessage, MainThreadMessage, WorkerErrorPayload, WorkerMessage,
+    ChannelMessage, MainThreadMessage, SqlBatchStatement, WorkerErrorPayload, WorkerMessage,
     WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
 };
 use crate::util::{js_value_to_string, sanitize_identifier, set_js_property};
@@ -28,7 +28,6 @@ pub enum LeadershipRole {
 }
 
 const MAX_DB_WORKER_RESPAWNS: u32 = 3;
-
 pub struct WorkerConfig {
     pub db_name: String,
     pub follower_timeout_ms: f64,
@@ -89,26 +88,32 @@ enum DbRequestOrigin {
 
 struct DbJob {
     request_id: u32,
-    sql: String,
-    params: Option<Vec<serde_json::Value>>,
+    payload: DbJobPayload,
+}
+
+pub(crate) enum DbJobPayload {
+    Query {
+        sql: String,
+        params: Option<Vec<serde_json::Value>>,
+    },
+    Batch {
+        statements: Vec<SqlBatchStatement>,
+    },
 }
 
 type DbExecFuture = Pin<Box<dyn Future<Output = Result<String, String>> + 'static>>;
-type DbExecFn = dyn Fn(
-    Rc<RefCell<Option<SQLiteDatabase>>>,
-    String,
-    Option<Vec<serde_json::Value>>,
-) -> DbExecFuture;
+type DbExecFn = dyn Fn(Rc<RefCell<Option<SQLiteDatabase>>>, DbJobPayload) -> DbExecFuture;
 type DbDeliverFn = dyn Fn(&js_sys::Object);
 
 #[derive(Clone)]
-pub struct DbWorkerHooks {
+pub(crate) struct DbWorkerHooks {
     exec: Rc<DbExecFn>,
     deliver: Rc<DbDeliverFn>,
 }
 
 impl DbWorkerHooks {
-    pub fn new(exec: Rc<DbExecFn>, deliver: Rc<DbDeliverFn>) -> Self {
+    #[cfg_attr(not(all(test, target_family = "wasm")), allow(dead_code))]
+    pub(crate) fn new(exec: Rc<DbExecFn>, deliver: Rc<DbDeliverFn>) -> Self {
         Self { exec, deliver }
     }
 }
@@ -116,7 +121,7 @@ impl DbWorkerHooks {
 impl Default for DbWorkerHooks {
     fn default() -> Self {
         Self {
-            exec: Rc::new(|db, sql, params| Box::pin(exec_on_db(db, sql, params))),
+            exec: Rc::new(|db, payload| Box::pin(exec_on_db(db, payload))),
             deliver: Rc::new(deliver_db_result),
         }
     }
@@ -185,6 +190,20 @@ impl CoordinatorState {
             .set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
         Ok(())
+    }
+
+    fn batch_timeout_ms(&self, statement_count: usize) -> f64 {
+        let count = statement_count.max(1) as f64;
+        if self.query_timeout_ms.is_finite() {
+            self.query_timeout_ms.max(0.0) * count
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    fn handle_follower_forward_failure(&self, query_id: &str, request_id: u32, err: &str) {
+        self.follower_pending.borrow_mut().remove(query_id);
+        let _ = send_query_result_to_main(request_id, Err(err.to_string()));
     }
 
     pub fn start_leader_probe(self: &Rc<Self>) {
@@ -444,6 +463,7 @@ impl CoordinatorState {
                         .insert(query_id.clone(), request_id);
                     let pending = Rc::clone(&self.follower_pending);
                     let timeout = self.query_timeout_ms;
+                    let cleanup_query_id = query_id.clone();
                     let timeout_query_id = query_id.clone();
                     spawn_local(async move {
                         sleep_ms(timeout.ceil() as i32).await;
@@ -460,6 +480,56 @@ impl CoordinatorState {
                         params,
                     };
                     if let Err(err) = send_channel_message(&self.channel, &request) {
+                        self.handle_follower_forward_failure(&cleanup_query_id, request_id, &err);
+                        let _ = send_worker_error_message(&err);
+                    }
+                }
+            },
+            WorkerMessage::ExecuteBatch {
+                request_id,
+                statements,
+            } => match *self.role.borrow() {
+                LeadershipRole::Leader => {
+                    if !*self.db_worker_ready.borrow() {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                        );
+                        return;
+                    }
+                    self.forward_batch_to_db(DbRequestOrigin::Local { request_id }, statements);
+                }
+                LeadershipRole::Follower => {
+                    if !*self.leader_ready.borrow() {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                        );
+                        return;
+                    }
+                    let query_id = Uuid::new_v4().to_string();
+                    self.follower_pending
+                        .borrow_mut()
+                        .insert(query_id.clone(), request_id);
+                    let pending = Rc::clone(&self.follower_pending);
+                    let timeout = self.batch_timeout_ms(statements.len());
+                    let cleanup_query_id = query_id.clone();
+                    let timeout_query_id = query_id.clone();
+                    spawn_local(async move {
+                        sleep_ms(timeout.ceil() as i32).await;
+                        if let Some(original) = pending.borrow_mut().remove(&timeout_query_id) {
+                            let _ = send_query_result_to_main(
+                                original,
+                                Err("Query timeout".to_string()),
+                            );
+                        }
+                    });
+                    let request = ChannelMessage::BatchRequest {
+                        query_id,
+                        statements,
+                    };
+                    if let Err(err) = send_channel_message(&self.channel, &request) {
+                        self.handle_follower_forward_failure(&cleanup_query_id, request_id, &err);
                         let _ = send_worker_error_message(&err);
                     }
                 }
@@ -519,6 +589,25 @@ impl CoordinatorState {
                         return;
                     }
                     self.forward_query_to_db(DbRequestOrigin::Forwarded { query_id }, sql, params);
+                }
+            }
+            ChannelMessage::BatchRequest {
+                query_id,
+                statements,
+            } => {
+                if matches!(*self.role.borrow(), LeadershipRole::Leader) {
+                    if !*self.db_worker_ready.borrow() {
+                        let _ = send_channel_message(
+                            &self.channel,
+                            &ChannelMessage::QueryResponse {
+                                query_id,
+                                result: None,
+                                error: Some(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                            },
+                        );
+                        return;
+                    }
+                    self.forward_batch_to_db(DbRequestOrigin::Forwarded { query_id }, statements);
                 }
             }
             ChannelMessage::QueryResponse {
@@ -583,6 +672,56 @@ impl CoordinatorState {
             sql,
             params,
         };
+        self.post_db_worker_message(worker, db_request_id, msg);
+    }
+
+    fn forward_batch_to_db(
+        self: &Rc<Self>,
+        origin: DbRequestOrigin,
+        statements: Vec<SqlBatchStatement>,
+    ) {
+        let worker = {
+            let borrow = self.db_worker.borrow();
+            let Some(worker) = borrow.as_ref() else {
+                match origin {
+                    DbRequestOrigin::Local { request_id } => {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                        );
+                    }
+                    DbRequestOrigin::Forwarded { query_id } => {
+                        let _ = send_channel_message(
+                            &self.channel,
+                            &ChannelMessage::QueryResponse {
+                                query_id,
+                                result: None,
+                                error: Some(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                            },
+                        );
+                    }
+                }
+                return;
+            };
+            worker.clone()
+        };
+
+        let db_request_id = {
+            let mut next = self.next_db_request_id.borrow_mut();
+            let id = *next;
+            *next = next.wrapping_add(1).max(1);
+            id
+        };
+        self.db_pending.borrow_mut().insert(db_request_id, origin);
+
+        let msg = WorkerMessage::ExecuteBatch {
+            request_id: db_request_id,
+            statements,
+        };
+        self.post_db_worker_message(worker, db_request_id, msg);
+    }
+
+    fn post_db_worker_message(&self, worker: Worker, db_request_id: u32, msg: WorkerMessage) {
         match serde_wasm_bindgen::to_value(&msg) {
             Ok(val) => {
                 if let Err(err) = worker.post_message(&val) {
@@ -685,7 +824,7 @@ impl DbWorkerState {
         Self::new_with_hooks(config, DbWorkerHooks::default())
     }
 
-    pub fn new_with_hooks(config: WorkerConfig, hooks: DbWorkerHooks) -> Rc<Self> {
+    pub(crate) fn new_with_hooks(config: WorkerConfig, hooks: DbWorkerHooks) -> Rc<Self> {
         Rc::new(DbWorkerState {
             db: Rc::new(RefCell::new(None)),
             db_name: config.db_name,
@@ -717,21 +856,21 @@ impl DbWorkerState {
                 sql,
                 params,
             } => {
-                self.enqueue_query(request_id, sql, params);
+                self.enqueue_job(request_id, DbJobPayload::Query { sql, params });
+            }
+            WorkerMessage::ExecuteBatch {
+                request_id,
+                statements,
+            } => {
+                self.enqueue_job(request_id, DbJobPayload::Batch { statements });
             }
         }
     }
 
-    fn enqueue_query(
-        self: &Rc<Self>,
-        request_id: u32,
-        sql: String,
-        params: Option<Vec<serde_json::Value>>,
-    ) {
+    fn enqueue_job(self: &Rc<Self>, request_id: u32, payload: DbJobPayload) {
         self.db_queue.borrow_mut().push_back(DbJob {
             request_id,
-            sql,
-            params,
+            payload,
         });
         self.start_queue_processor();
     }
@@ -752,7 +891,7 @@ impl DbWorkerState {
                 let db = Rc::clone(&state.db);
                 let exec = Rc::clone(&hooks.exec);
                 let deliver = Rc::clone(&hooks.deliver);
-                let result = exec.as_ref()(db, job.sql, job.params).await;
+                let result = exec.as_ref()(db, job.payload).await;
                 match make_query_result_message(job.request_id, result) {
                     Ok(resp) => deliver.as_ref()(&resp),
                     Err(err) => {
@@ -900,15 +1039,17 @@ fn deliver_db_result(obj: &js_sys::Object) {
 }
 async fn exec_on_db(
     db: Rc<RefCell<Option<SQLiteDatabase>>>,
-    sql: String,
-    params: Option<Vec<serde_json::Value>>,
+    payload: DbJobPayload,
 ) -> Result<String, String> {
     let db_opt = db.borrow_mut().take();
     let result = match db_opt {
         Some(mut database) => {
-            let result = match params {
-                Some(p) => database.exec_with_params(&sql, p).await,
-                None => database.exec(&sql).await,
+            let result = match payload {
+                DbJobPayload::Query { sql, params } => match params {
+                    Some(p) => database.exec_with_params(&sql, p).await,
+                    None => database.exec(&sql).await,
+                },
+                DbJobPayload::Batch { statements } => database.exec_batch(statements).await,
             };
             *db.borrow_mut() = Some(database);
             result
@@ -1004,6 +1145,42 @@ mod tests {
 
         let cfg = worker_config_from_global().expect("config");
         assert_eq!(cfg.query_timeout_ms, 30000.0);
+    }
+
+    #[wasm_bindgen_test]
+    fn batch_timeout_scales_with_statement_count() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-batch-timeout".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 50.0,
+        })
+        .expect("state");
+
+        assert_eq!(state.batch_timeout_ms(0), 50.0);
+        assert_eq!(state.batch_timeout_ms(1), 50.0);
+        assert_eq!(state.batch_timeout_ms(3), 150.0);
+    }
+
+    #[wasm_bindgen_test]
+    fn follower_forward_failure_removes_pending_request() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-forward-failure".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 50.0,
+        })
+        .expect("state");
+
+        state
+            .follower_pending
+            .borrow_mut()
+            .insert("query-1".to_string(), 42);
+
+        state.handle_follower_forward_failure("query-1", 42, "post failed");
+
+        assert!(
+            !state.follower_pending.borrow().contains_key("query-1"),
+            "failed follower forwards should not wait for timeout cleanup"
+        );
     }
 
     #[wasm_bindgen_test(async)]
@@ -1244,7 +1421,7 @@ mod tests {
         let hooks = DbWorkerHooks::new(
             {
                 let busy_flag = Rc::clone(&busy_flag);
-                Rc::new(move |_db, _sql, _params| {
+                Rc::new(move |_db, _payload| {
                     let busy_flag = Rc::clone(&busy_flag);
                     Box::pin(async move {
                         if busy_flag.replace(true) {

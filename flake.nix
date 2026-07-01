@@ -60,8 +60,9 @@
             name = "build-submodules";
             body = ''
               set -euxo pipefail
-              rainix-sol-prelude
               cd lib/rain.math.float
+              forge soldeer install --config-location foundry
+              forge install
               forge build
               cd ../..
             '';
