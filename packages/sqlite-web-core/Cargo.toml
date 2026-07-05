@@ -17,7 +17,7 @@ serde-wasm-bindgen = { workspace = true }
 uuid = { workspace = true }
 console_error_panic_hook = { workspace = true }
 sqlite-wasm-rs = { workspace = true }
-rain-math-float = { path = "../../lib/rain.math.float/crates/float"}
+rain-math-float = { path = "../../lib/rain.math.float/crates/float" }
 alloy = { workspace = true }
 base64 = { workspace = true }
 
