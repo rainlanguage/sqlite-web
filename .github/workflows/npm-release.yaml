@@ -18,10 +18,10 @@ jobs:
           ssh-key: ${{ secrets.PUBLISH_PRIVATE_KEY }}
           submodules: recursive
           fetch-depth: 0
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: rainlanguage/rainix/.github/actions/nix-cachix-setup@main
         with:
-          determinate: true
-      - uses: DeterminateSystems/flakehub-cache-action@main
+          checkout: 'false'
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
