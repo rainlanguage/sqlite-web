@@ -35,7 +35,7 @@ unsafe extern "C" fn xRandomness(
     zOut: *mut ::std::os::raw::c_char,
 ) -> ::std::os::raw::c_int {
     for i in 0..nByte {
-        *zOut.offset(i as isize) = (Math::random() * 255000.0) as _;
+        *zOut.offset(i as isize) = (Math::random() * 256.0) as u8 as _;
     }
     nByte
 }
@@ -94,23 +94,44 @@ unsafe extern "C" fn xOpen(
     flags: ::std::os::raw::c_int,
     pOutFlags: *mut ::std::os::raw::c_int,
 ) -> ::std::os::raw::c_int {
-    let Ok(s) = CStr::from_ptr(zName).to_str() else {
-        return SQLITE_ERROR;
+    let requested_name = if zName.is_null() {
+        None
+    } else {
+        let Ok(name) = CStr::from_ptr(zName).to_str() else {
+            return SQLITE_ERROR;
+        };
+        Some(name.to_owned())
     };
 
     let mut name2file = name2file();
-    let mem_file = if let Some(mem_file) = name2file.get(s) {
+    let (name, flags) = match requested_name {
+        Some(name) => (name, flags),
+        None => {
+            let name = loop {
+                let candidate = format!(
+                    ":sqlite-temp:{:08x}",
+                    (Math::random() * (u32::MAX as f64 + 1.0)) as u32
+                );
+                if !name2file.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            (name, flags | SQLITE_OPEN_CREATE | SQLITE_OPEN_DELETEONCLOSE)
+        }
+    };
+
+    let mem_file = if let Some(mem_file) = name2file.get(&name) {
         Arc::clone(mem_file)
     } else {
         if flags & SQLITE_OPEN_CREATE == 0 {
             return SQLITE_CANTOPEN;
         }
         let file = Arc::new(RwLock::new(MemFile {
-            name: s.into(),
+            name: name.clone(),
             flags,
             data: Vec::new(),
         }));
-        name2file.insert(s.into(), Arc::clone(&file));
+        name2file.insert(name, Arc::clone(&file));
         file
     };
 
@@ -156,7 +177,17 @@ unsafe extern "C" fn xFullPathname(
     nOut: ::std::os::raw::c_int,
     zOut: *mut ::std::os::raw::c_char,
 ) -> ::std::os::raw::c_int {
-    zName.copy_to(zOut, nOut as usize);
+    if zName.is_null() || zOut.is_null() || nOut <= 0 {
+        return SQLITE_CANTOPEN;
+    }
+    let bytes = CStr::from_ptr(zName).to_bytes_with_nul();
+    if bytes.len() > nOut as usize {
+        return SQLITE_CANTOPEN;
+    }
+    bytes
+        .as_ptr()
+        .cast::<::std::os::raw::c_char>()
+        .copy_to_nonoverlapping(zOut, bytes.len());
     SQLITE_OK
 }
 

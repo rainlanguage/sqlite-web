@@ -33,6 +33,10 @@ const HEADER_OFFSET_DATA: usize = SECTOR_SIZE;
 const PERSISTENT_FILE_TYPES: i32 =
     SQLITE_OPEN_MAIN_DB | SQLITE_OPEN_MAIN_JOURNAL | SQLITE_OPEN_SUPER_JOURNAL | SQLITE_OPEN_WAL;
 
+// sqlite-wasm-rs 0.3.0 wrote a zero digest. Reuse a VFS-irrelevant flag to
+// distinguish new metadata while retaining compatibility with existing pools.
+const FLAG_COMPUTE_DIGEST_V2: i32 = SQLITE_OPEN_MEMORY;
+
 static VFS2SAH: Lazy<RwLock<HashMap<usize, Arc<OpfsSAH>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
@@ -50,18 +54,28 @@ unsafe fn file2vfs(file: *mut sqlite3_file) -> *mut sqlite3_vfs {
     (*(file.cast::<OpfsFile>())).vfs
 }
 
-// this function only return [0, 0] for now
-//
-// https://github.com/sqlite/sqlite-wasm/issues/97
-fn compute_digest(_byte_array: &Uint8Array) -> Uint32Array {
-    let u32_array = Uint32Array::new_with_length(2);
-    u32_array.set_index(0, 0);
-    u32_array.set_index(1, 0);
-    u32_array
+fn compute_digest(byte_array: &Uint8Array, file_flags: u32) -> Uint32Array {
+    let digest = Uint32Array::new_with_length(2);
+    if file_flags & FLAG_COMPUTE_DIGEST_V2 as u32 == 0 {
+        return digest;
+    }
+
+    let mut h1 = 0xdead_beefu32;
+    let mut h2 = 0x41c6_ce57u32;
+    for index in 0..byte_array.length() {
+        let value = byte_array.get_index(index) as u32;
+        h1 = (h1 ^ value).wrapping_mul(2_654_435_761);
+        h2 = (h2 ^ value).wrapping_mul(104_729);
+    }
+    digest.set_index(0, h1);
+    digest.set_index(1, h2);
+    digest
 }
 
 fn get_random_name() -> String {
-    let random = Number::from(Math::random()).to_string(36).unwrap();
+    let random = Number::from(Math::random())
+        .to_string_with_radix(36)
+        .unwrap();
     random.slice(2, random.length()).as_string().unwrap()
 }
 
@@ -286,7 +300,7 @@ impl OpfsSAHPool {
         )
         .map_err(OpfsSAHError::Read)?;
 
-        let comp_digest = compute_digest(&self.ap_body);
+        let comp_digest = compute_digest(&self.ap_body, flags);
         if Array::from(&file_digest)
             .every(&mut |v, i, _| v.as_f64().unwrap() as u32 == comp_digest.get_index(i))
         {
@@ -335,11 +349,17 @@ impl OpfsSAHPool {
             self.ap_body.set_index(idx as u32, byte);
         }
 
+        let flags = if !path.is_empty() && flags != 0 {
+            flags | FLAG_COMPUTE_DIGEST_V2
+        } else {
+            flags
+        };
+
         self.ap_body
             .fill(0, path.len() as u32, HEADER_MAX_PATH_SIZE as u32);
         self.dv_body.set_uint32(HEADER_OFFSET_FLAGS, flags as u32);
 
-        let digest = compute_digest(&self.ap_body);
+        let digest = compute_digest(&self.ap_body, flags as u32);
 
         sah.write_with_js_u8_array_and_options(&self.ap_body, &read_write_options(0.0))
             .map_err(OpfsSAHError::Write)?;
@@ -565,7 +585,7 @@ impl OpfsSAHPool {
             FileSystemSyncAccessHandle::from(sah)
         };
         let length = bytes.len();
-        if length < 512 && length % 512 != 0 {
+        if length < 512 || length % 512 != 0 {
             return Err(OpfsSAHError::Custom(
                 "Byte array size is invalid for an SQLite db.".into(),
             ));
@@ -650,10 +670,20 @@ unsafe extern "C" fn xFileSize(
 ) -> ::std::os::raw::c_int {
     let vfs = file2vfs(pFile);
     let pool = pool(vfs);
+    pool.pop_err();
 
-    if let Ok(file) = pool.get_o_file_for_s3_file(pFile) {
-        let size = file.sah.get_size().unwrap() as i64 - HEADER_OFFSET_DATA as i64;
-        *pSize = size;
+    let result = pool.get_o_file_for_s3_file(pFile).and_then(|file| {
+        let size = file.sah.get_size().map_err(OpfsSAHError::GetSize)?;
+        if size < HEADER_OFFSET_DATA as f64 {
+            return Err(OpfsSAHError::Custom(
+                "OPFS file is smaller than its metadata header".into(),
+            ));
+        }
+        *pSize = size as i64 - HEADER_OFFSET_DATA as i64;
+        Ok(())
+    });
+    if let Err(error) = result {
+        return pool.store_err(&error, Some(SQLITE_IOERR_FSTAT));
     }
     SQLITE_OK
 }
@@ -811,7 +841,10 @@ unsafe extern "C" fn xDelete(
     let pool = pool(pVfs);
     pool.pop_err();
 
-    if let Err(e) = pool.get_path(zName).map(|name| pool.delete_path(&name)) {
+    if let Err(e) = pool
+        .get_path(zName)
+        .and_then(|name| pool.delete_path(&name))
+    {
         return pool.store_err(&e, Some(SQLITE_IOERR_DELETE));
     }
 
@@ -824,7 +857,17 @@ unsafe extern "C" fn xFullPathname(
     nOut: ::std::os::raw::c_int,
     zOut: *mut ::std::os::raw::c_char,
 ) -> ::std::os::raw::c_int {
-    zName.copy_to(zOut, nOut as usize);
+    if zName.is_null() || zOut.is_null() || nOut <= 0 {
+        return SQLITE_CANTOPEN;
+    }
+    let bytes = CStr::from_ptr(zName).to_bytes_with_nul();
+    if bytes.len() > nOut as usize {
+        return SQLITE_CANTOPEN;
+    }
+    bytes
+        .as_ptr()
+        .cast::<::std::os::raw::c_char>()
+        .copy_to_nonoverlapping(zOut, bytes.len());
     SQLITE_OK
 }
 
@@ -1081,6 +1124,110 @@ pub struct OpfsSAHPoolUtil {
     pool: Arc<FragileComfirmed<OpfsSAHPool>>,
 }
 
+/// Incremental SQLite database importer for the OPFS SAH pool.
+///
+/// This keeps only the caller's current chunk in memory and writes it directly
+/// into the pool slot. The database becomes visible under `path` only after
+/// [`finish`](Self::finish) validates and commits the import.
+pub struct OpfsSAHPoolImport {
+    pool: Arc<FragileComfirmed<OpfsSAHPool>>,
+    sah: FileSystemSyncAccessHandle,
+    path: String,
+    length: usize,
+    header: Vec<u8>,
+    finished: bool,
+}
+
+impl OpfsSAHPoolImport {
+    fn cleanup(&self) {
+        let _ = self.pool.set_associated_path(&self.sah, "", 0);
+        let _ = self.sah.truncate_with_u32(HEADER_OFFSET_DATA as u32);
+    }
+
+    /// Append one decompressed database-file chunk.
+    pub fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), OpfsSAHError> {
+        if self.finished {
+            return Err(OpfsSAHError::Custom(
+                "Cannot write to a finished database import.".into(),
+            ));
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        if self.header.len() < 16 {
+            let needed = 16 - self.header.len();
+            self.header
+                .extend_from_slice(&bytes[..bytes.len().min(needed)]);
+            if self.header.len() == 16
+                && (&self.header[..15] != b"SQLite format 3" || self.header[15] != 0)
+            {
+                self.cleanup();
+                return Err(OpfsSAHError::Custom(
+                    "Input does not contain an SQLite database header.".into(),
+                ));
+            }
+        }
+
+        let write = self
+            .sah
+            .write_with_u8_array_and_options(
+                bytes,
+                &read_write_options((HEADER_OFFSET_DATA + self.length) as f64),
+            )
+            .map_err(OpfsSAHError::Write)?;
+        if write != bytes.len() as f64 {
+            self.cleanup();
+            return Err(OpfsSAHError::Custom(format!(
+                "Expected to write {} bytes but wrote {}.",
+                bytes.len(),
+                write
+            )));
+        }
+        self.length += bytes.len();
+        Ok(())
+    }
+
+    /// Validate and publish the imported database under its requested path.
+    pub fn finish(mut self) -> Result<usize, OpfsSAHError> {
+        if self.header.len() < 16 || self.length < 512 || self.length % 512 != 0 {
+            self.cleanup();
+            return Err(OpfsSAHError::Custom(
+                "Byte stream size is invalid for an SQLite database.".into(),
+            ));
+        }
+
+        self.sah
+            .truncate_with_f64((HEADER_OFFSET_DATA + self.length) as f64)
+            .map_err(OpfsSAHError::Truncate)?;
+        self.sah
+            .write_with_u8_array_and_options(
+                &[1, 1],
+                &read_write_options((HEADER_OFFSET_DATA + 18) as f64),
+            )
+            .map_err(OpfsSAHError::Write)?;
+        self.sah.flush().map_err(OpfsSAHError::Flush)?;
+        self.pool
+            .set_associated_path(&self.sah, &self.path, SQLITE_OPEN_MAIN_DB)?;
+        self.finished = true;
+        Ok(self.length)
+    }
+
+    /// Discard a partial import and return its pool slot for reuse.
+    pub fn abort(mut self) {
+        self.cleanup();
+        self.finished = true;
+    }
+}
+
+impl Drop for OpfsSAHPoolImport {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cleanup();
+        }
+    }
+}
+
 impl OpfsSAHPoolUtil {
     /// Adds n entries to the current pool.
     pub async fn add_capacity(&self, n: u32) -> Result<u32, OpfsSAHError> {
@@ -1106,6 +1253,39 @@ impl OpfsSAHPoolUtil {
     /// Returns an array of the names of the files currently allocated to VFS slots.
     pub fn get_file_names(&self) -> Vec<String> {
         self.pool.get_file_names()
+    }
+
+    /// Returns whether a logical path is currently associated with a pool
+    /// entry.
+    pub fn has_path(&self, path: &str) -> bool {
+        self.pool.has_filename(path)
+    }
+
+    /// Reassociate an existing logical path with a new logical path without
+    /// copying its database bytes.
+    pub fn rename_path(&self, from: &str, to: &str) -> Result<(), OpfsSAHError> {
+        if from.is_empty() || to.is_empty() {
+            return Err(OpfsSAHError::Custom(
+                "Source and destination paths must not be empty.".into(),
+            ));
+        }
+        if self.pool.has_filename(to) {
+            return Err(OpfsSAHError::Custom(format!(
+                "Destination path already exists: {to}"
+            )));
+        }
+
+        let sah = self.pool.map_filename_to_sah.get(&JsValue::from(from));
+        if sah.is_undefined() {
+            return Err(OpfsSAHError::Custom(format!(
+                "Source path does not exist: {from}"
+            )));
+        }
+        let sah: FileSystemSyncAccessHandle = sah.into();
+        self.pool
+            .set_associated_path(&sah, to, SQLITE_OPEN_MAIN_DB)?;
+        self.pool.map_filename_to_sah.delete(&JsValue::from(from));
+        Ok(())
     }
 
     /// Removes up to n entries from the pool, with the caveat that it can only
@@ -1138,6 +1318,34 @@ impl OpfsSAHPoolUtil {
             return Err(OpfsSAHError::Custom("path must start with '/'".into()));
         }
         self.pool.import_db(path, bytes)
+    }
+
+    /// Begin a bounded-memory import into an unused or existing pool slot.
+    /// The target database must not be open while the import is active.
+    pub fn begin_import_db(&self, path: &str) -> Result<OpfsSAHPoolImport, OpfsSAHError> {
+        if path.is_empty() {
+            return Err(OpfsSAHError::Custom("path must not be empty".into()));
+        }
+
+        let sah = self.pool.map_filename_to_sah.get(&JsValue::from(path));
+        let sah = if sah.is_undefined() {
+            self.pool
+                .next_available_sah()
+                .ok_or_else(|| OpfsSAHError::Custom("No available handles to import to.".into()))?
+        } else {
+            FileSystemSyncAccessHandle::from(sah)
+        };
+        sah.truncate_with_u32(HEADER_OFFSET_DATA as u32)
+            .map_err(OpfsSAHError::Truncate)?;
+
+        Ok(OpfsSAHPoolImport {
+            pool: Arc::clone(&self.pool),
+            sah,
+            path: path.to_string(),
+            length: 0,
+            header: Vec::with_capacity(16),
+            finished: false,
+        })
     }
 
     /// Clears all client-defined state of all SAHs and makes all of them available
