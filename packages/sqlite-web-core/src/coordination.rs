@@ -1,6 +1,6 @@
 use js_sys::{Function, Object, Promise, Reflect};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -14,10 +14,10 @@ use web_sys::{
     Blob, BlobPropertyBag, BroadcastChannel, DedicatedWorkerGlobalScope, MessageEvent, Url, Worker,
 };
 
-use crate::database::SQLiteDatabase;
+use crate::database::{SQLiteDatabase, SnapshotCancellation, MAX_SNAPSHOT_SIZE};
 use crate::messages::{
-    ChannelMessage, MainThreadMessage, SqlBatchStatement, WorkerErrorPayload, WorkerMessage,
-    WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
+    ChannelMessage, MainThreadMessage, SnapshotCompression, SqlBatchStatement, WorkerErrorPayload,
+    WorkerMessage, WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
 };
 use crate::util::{js_value_to_string, sanitize_identifier, set_js_property};
 
@@ -28,6 +28,8 @@ pub enum LeadershipRole {
 }
 
 const MAX_DB_WORKER_RESPAWNS: u32 = 3;
+const SNAPSHOT_CANCELLATION_TOMBSTONE_TTL_MS: f64 = 30_000.0;
+const MAX_SNAPSHOT_CANCELLATION_TOMBSTONES: usize = 1024;
 pub struct WorkerConfig {
     pub db_name: String,
     pub follower_timeout_ms: f64,
@@ -81,9 +83,71 @@ pub fn worker_config_from_global() -> Result<WorkerConfig, JsValue> {
     })
 }
 
+fn worker_id_from_global() -> String {
+    Reflect::get(&js_sys::global(), &JsValue::from_str("__SQLITE_CLIENT_ID"))
+        .ok()
+        .and_then(|value| value.as_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+#[derive(Clone)]
 enum DbRequestOrigin {
-    Local { request_id: u32 },
-    Forwarded { query_id: String },
+    Local {
+        request_id: u32,
+    },
+    Forwarded {
+        query_id: String,
+    },
+    Snapshot {
+        key: SnapshotKey,
+        waiters: Vec<SnapshotWaiter>,
+        cancelling: Vec<SnapshotWaiter>,
+        phase: SnapshotJobPhase,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SnapshotKey {
+    url: String,
+    compression: SnapshotCompression,
+    sha256: String,
+    uncompressed_size: u64,
+}
+
+#[derive(Clone)]
+enum SnapshotWaiter {
+    Local {
+        request_id: u32,
+        requester_id: String,
+        query_id: String,
+    },
+    Forwarded {
+        requester_id: String,
+        query_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotJobPhase {
+    Active,
+    CancellingLastWaiter,
+}
+
+impl SnapshotWaiter {
+    fn snapshot_identity(&self) -> (&str, &str) {
+        match self {
+            Self::Local {
+                requester_id,
+                query_id,
+                ..
+            }
+            | Self::Forwarded {
+                requester_id,
+                query_id,
+            } => (requester_id, query_id),
+        }
+    }
 }
 
 struct DbJob {
@@ -98,6 +162,14 @@ pub(crate) enum DbJobPayload {
     },
     Batch {
         statements: Vec<SqlBatchStatement>,
+    },
+    Snapshot {
+        db_name: String,
+        url: String,
+        compression: SnapshotCompression,
+        sha256: String,
+        uncompressed_size: f64,
+        cancellation: SnapshotCancellation,
     },
 }
 
@@ -143,6 +215,10 @@ pub struct CoordinatorState {
     pub follower_pending: Rc<RefCell<HashMap<String, u32>>>,
     pub next_db_request_id: Rc<RefCell<u32>>,
     db_worker_restart_attempts: Rc<Cell<u32>>,
+    cancelled_snapshot_requests: Rc<RefCell<HashMap<(String, String), f64>>>,
+    snapshot_cancellation_pending: Rc<RefCell<HashSet<String>>>,
+    leader_draining: Rc<Cell<bool>>,
+    shutdown_requests: Rc<RefCell<Vec<u32>>>,
 }
 
 pub struct DbWorkerState {
@@ -150,6 +226,7 @@ pub struct DbWorkerState {
     pub db_name: String,
     db_queue: Rc<RefCell<VecDeque<DbJob>>>,
     db_processing: Rc<Cell<bool>>,
+    snapshot_cancellations: Rc<RefCell<HashMap<u32, SnapshotCancellation>>>,
     hooks: DbWorkerHooks,
 }
 
@@ -161,7 +238,7 @@ pub fn create_broadcast_channel(db_name: &str) -> Result<BroadcastChannel, JsVal
 impl CoordinatorState {
     pub fn new(config: WorkerConfig) -> Result<Rc<Self>, JsValue> {
         Ok(Rc::new(CoordinatorState {
-            worker_id: Uuid::new_v4().to_string(),
+            worker_id: worker_id_from_global(),
             role: Rc::new(RefCell::new(LeadershipRole::Follower)),
             leader_id: Rc::new(RefCell::new(None)),
             leader_ready: Rc::new(RefCell::new(false)),
@@ -176,6 +253,10 @@ impl CoordinatorState {
             follower_pending: Rc::new(RefCell::new(HashMap::new())),
             next_db_request_id: Rc::new(RefCell::new(1)),
             db_worker_restart_attempts: Rc::new(Cell::new(0)),
+            cancelled_snapshot_requests: Rc::new(RefCell::new(HashMap::new())),
+            snapshot_cancellation_pending: Rc::new(RefCell::new(HashSet::new())),
+            leader_draining: Rc::new(Cell::new(false)),
+            shutdown_requests: Rc::new(RefCell::new(Vec::new())),
         }))
     }
 
@@ -201,9 +282,107 @@ impl CoordinatorState {
         }
     }
 
+    fn attach_to_inflight_snapshot(&self, key: &SnapshotKey, waiter: SnapshotWaiter) -> bool {
+        let mut pending = self.db_pending.borrow_mut();
+        if let Some(DbRequestOrigin::Snapshot { waiters, .. }) = pending
+            .values_mut()
+            .find(|origin| matches!(origin, DbRequestOrigin::Snapshot { key: pending_key, phase: SnapshotJobPhase::Active, .. } if pending_key == key))
+        {
+            waiters.push(waiter);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn prune_snapshot_cancellation_tombstones(&self, now_ms: f64) {
+        let mut tombstones = self.cancelled_snapshot_requests.borrow_mut();
+        tombstones.retain(|_, expiry| *expiry > now_ms);
+        while tombstones.len() > MAX_SNAPSHOT_CANCELLATION_TOMBSTONES {
+            let Some(oldest) = tombstones
+                .iter()
+                .min_by(|left, right| left.1.total_cmp(right.1))
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            tombstones.remove(&oldest);
+        }
+    }
+
+    fn remember_snapshot_cancellation(self: &Rc<Self>, requester_id: String, query_id: String) {
+        let now_ms = js_sys::Date::now();
+        self.prune_snapshot_cancellation_tombstones(now_ms);
+        let key = (requester_id, query_id);
+        let expiry = now_ms + SNAPSHOT_CANCELLATION_TOMBSTONE_TTL_MS;
+        {
+            let mut tombstones = self.cancelled_snapshot_requests.borrow_mut();
+            if tombstones.len() >= MAX_SNAPSHOT_CANCELLATION_TOMBSTONES {
+                if let Some(oldest) = tombstones
+                    .iter()
+                    .min_by(|left, right| left.1.total_cmp(right.1))
+                    .map(|(key, _)| key.clone())
+                {
+                    tombstones.remove(&oldest);
+                }
+            }
+            tombstones.insert(key.clone(), expiry);
+        }
+        let state = Rc::clone(self);
+        spawn_local(async move {
+            sleep_ms(SNAPSHOT_CANCELLATION_TOMBSTONE_TTL_MS as i32).await;
+            let mut tombstones = state.cancelled_snapshot_requests.borrow_mut();
+            if tombstones.get(&key).is_some_and(|stored| *stored <= expiry) {
+                tombstones.remove(&key);
+            }
+        });
+    }
+
+    fn take_snapshot_cancellation(&self, requester_id: &str, query_id: &str) -> bool {
+        self.prune_snapshot_cancellation_tombstones(js_sys::Date::now());
+        self.cancelled_snapshot_requests
+            .borrow_mut()
+            .remove(&(requester_id.to_string(), query_id.to_string()))
+            .is_some()
+    }
+
     fn handle_follower_forward_failure(&self, query_id: &str, request_id: u32, err: &str) {
         self.follower_pending.borrow_mut().remove(query_id);
         let _ = send_query_result_to_main(request_id, Err(err.to_string()));
+    }
+
+    fn begin_snapshot_timeout_cancellation(&self, query_id: &str) -> bool {
+        if !self.follower_pending.borrow().contains_key(query_id) {
+            return false;
+        }
+        self.snapshot_cancellation_pending
+            .borrow_mut()
+            .insert(query_id.to_string());
+        if let Err(error) = send_channel_message(
+            &self.channel,
+            &ChannelMessage::CancelSnapshotRequest {
+                requester_id: self.worker_id.clone(),
+                query_id: query_id.to_string(),
+            },
+        ) {
+            let _ = send_worker_error_message(&error);
+        }
+        true
+    }
+
+    fn reject_if_leader_draining(&self, query_id: &str) -> bool {
+        if !self.leader_draining.get() {
+            return false;
+        }
+        let _ = send_channel_message(
+            &self.channel,
+            &ChannelMessage::QueryResponse {
+                query_id: query_id.to_string(),
+                result: None,
+                error: Some("Leader is shutting down; retry on the next leader".to_string()),
+            },
+        );
+        true
     }
 
     pub fn start_leader_probe(self: &Rc<Self>) {
@@ -304,6 +483,9 @@ impl CoordinatorState {
     }
 
     fn on_lock_granted(self: &Rc<Self>) {
+        if self.leader_draining.get() {
+            return;
+        }
         *self.role.borrow_mut() = LeadershipRole::Leader;
         self.mark_leader_known(self.worker_id.clone());
 
@@ -398,6 +580,14 @@ impl CoordinatorState {
             }) => {
                 self.handle_db_query_result(request_id, result, error);
             }
+            Ok(MainThreadMessage::SnapshotCancelled {
+                request_id,
+                cancelled,
+            }) => {
+                if cancelled {
+                    self.handle_snapshot_cancelled(request_id);
+                }
+            }
             Err(_) => {
                 if let Some(err) = parse_worker_error_payload(&data) {
                     self.handle_db_worker_failure(err);
@@ -420,6 +610,10 @@ impl CoordinatorState {
         for (_, origin) in pending {
             self.fail_origin(origin, error.clone());
         }
+        self.finish_shutdown_if_drained();
+        if self.leader_draining.get() {
+            return;
+        }
         if attempts > MAX_DB_WORKER_RESPAWNS {
             let message = format!(
                 "DB worker restart limit reached (max {MAX_DB_WORKER_RESPAWNS}); leaving worker failed"
@@ -440,6 +634,13 @@ impl CoordinatorState {
                 params,
             } => match *self.role.borrow() {
                 LeadershipRole::Leader => {
+                    if self.leader_draining.get() {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err("Coordinator is shutting down".to_string()),
+                        );
+                        return;
+                    }
                     if !*self.db_worker_ready.borrow() {
                         let _ = send_query_result_to_main(
                             request_id,
@@ -490,6 +691,13 @@ impl CoordinatorState {
                 statements,
             } => match *self.role.borrow() {
                 LeadershipRole::Leader => {
+                    if self.leader_draining.get() {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err("Coordinator is shutting down".to_string()),
+                        );
+                        return;
+                    }
                     if !*self.db_worker_ready.borrow() {
                         let _ = send_query_result_to_main(
                             request_id,
@@ -534,6 +742,111 @@ impl CoordinatorState {
                     }
                 }
             },
+            WorkerMessage::InstallSnapshot {
+                request_id,
+                url,
+                compression,
+                sha256,
+                uncompressed_size,
+            } => {
+                let query_id = format!("{}:{request_id}", self.worker_id);
+                if self.take_snapshot_cancellation(&self.worker_id, &query_id) {
+                    let _ = send_query_result_to_main(
+                        request_id,
+                        Err("Snapshot installation cancelled".to_string()),
+                    );
+                    return;
+                }
+                match *self.role.borrow() {
+                    LeadershipRole::Leader => {
+                        if self.leader_draining.get() {
+                            let _ = send_query_result_to_main(
+                                request_id,
+                                Err("Coordinator is shutting down".to_string()),
+                            );
+                            return;
+                        }
+                        if !*self.db_worker_ready.borrow() {
+                            let _ = send_query_result_to_main(
+                                request_id,
+                                Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                            );
+                            return;
+                        }
+                        self.forward_snapshot_to_db(
+                            DbRequestOrigin::Local { request_id },
+                            SnapshotWaiter::Local {
+                                request_id,
+                                requester_id: self.worker_id.clone(),
+                                query_id,
+                            },
+                            url,
+                            compression,
+                            sha256,
+                            uncompressed_size,
+                        );
+                    }
+                    LeadershipRole::Follower => {
+                        if !*self.leader_ready.borrow() {
+                            let _ = send_query_result_to_main(
+                                request_id,
+                                Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                            );
+                            return;
+                        }
+                        self.follower_pending
+                            .borrow_mut()
+                            .insert(query_id.clone(), request_id);
+                        let timeout_query_id = query_id.clone();
+                        let timeout_state = Rc::clone(self);
+                        // Snapshot downloads may legitimately outlive ordinary
+                        // query timeouts, but must still settle if no leader reply
+                        // ever arrives.
+                        let timeout = self.query_timeout_ms.max(600_000.0);
+                        spawn_local(async move {
+                            sleep_ms(timeout.ceil().min(i32::MAX as f64) as i32).await;
+                            timeout_state.begin_snapshot_timeout_cancellation(&timeout_query_id);
+                        });
+                        let request = ChannelMessage::InstallSnapshotRequest {
+                            query_id: query_id.clone(),
+                            requester_id: self.worker_id.clone(),
+                            url,
+                            compression,
+                            sha256,
+                            uncompressed_size,
+                        };
+                        if let Err(err) = send_channel_message(&self.channel, &request) {
+                            self.handle_follower_forward_failure(&query_id, request_id, &err);
+                            let _ = send_worker_error_message(&err);
+                        }
+                    }
+                }
+            }
+            WorkerMessage::CancelSnapshot { .. } => {}
+            WorkerMessage::CancelForwardedSnapshot { request_id } => {
+                let query_id = format!("{}:{request_id}", self.worker_id);
+                if let Err(error) = send_channel_message(
+                    &self.channel,
+                    &ChannelMessage::CancelSnapshotRequest {
+                        requester_id: self.worker_id.clone(),
+                        query_id,
+                    },
+                ) {
+                    let _ = send_worker_error_message(&error);
+                }
+            }
+            WorkerMessage::Shutdown { request_id } => {
+                self.leader_draining.set(true);
+                if matches!(*self.role.borrow(), LeadershipRole::Leader) {
+                    self.shutdown_requests.borrow_mut().push(request_id);
+                    self.finish_shutdown_if_drained();
+                } else {
+                    let _ = send_query_result_to_main(
+                        request_id,
+                        Ok("Coordinator drained".to_string()),
+                    );
+                }
+            }
         }
     }
 
@@ -577,6 +890,9 @@ impl CoordinatorState {
                 params,
             } => {
                 if matches!(*self.role.borrow(), LeadershipRole::Leader) {
+                    if self.reject_if_leader_draining(&query_id) {
+                        return;
+                    }
                     if !*self.db_worker_ready.borrow() {
                         let _ = send_channel_message(
                             &self.channel,
@@ -596,6 +912,9 @@ impl CoordinatorState {
                 statements,
             } => {
                 if matches!(*self.role.borrow(), LeadershipRole::Leader) {
+                    if self.reject_if_leader_draining(&query_id) {
+                        return;
+                    }
                     if !*self.db_worker_ready.borrow() {
                         let _ = send_channel_message(
                             &self.channel,
@@ -610,12 +929,80 @@ impl CoordinatorState {
                     self.forward_batch_to_db(DbRequestOrigin::Forwarded { query_id }, statements);
                 }
             }
+            ChannelMessage::InstallSnapshotRequest {
+                query_id,
+                requester_id,
+                url,
+                compression,
+                sha256,
+                uncompressed_size,
+            } => {
+                if matches!(*self.role.borrow(), LeadershipRole::Leader) {
+                    if self.reject_if_leader_draining(&query_id) {
+                        return;
+                    }
+                    if self.take_snapshot_cancellation(&requester_id, &query_id) {
+                        return;
+                    }
+                    if !*self.db_worker_ready.borrow() {
+                        let _ = send_channel_message(
+                            &self.channel,
+                            &ChannelMessage::QueryResponse {
+                                query_id,
+                                result: None,
+                                error: Some(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                            },
+                        );
+                        return;
+                    }
+                    self.forward_snapshot_to_db(
+                        DbRequestOrigin::Forwarded {
+                            query_id: query_id.clone(),
+                        },
+                        SnapshotWaiter::Forwarded {
+                            requester_id,
+                            query_id,
+                        },
+                        url,
+                        compression,
+                        sha256,
+                        uncompressed_size,
+                    );
+                }
+            }
+            ChannelMessage::CancelSnapshotRequest {
+                requester_id,
+                query_id,
+            } => {
+                if matches!(*self.role.borrow(), LeadershipRole::Leader) {
+                    if !self.detach_snapshot_waiter(&requester_id, &query_id) {
+                        self.remember_snapshot_cancellation(requester_id.clone(), query_id.clone());
+                        let _ = send_channel_message(
+                            &self.channel,
+                            &ChannelMessage::SnapshotCancellationResponse {
+                                query_id,
+                                result: None,
+                                error: Some("Snapshot installation cancelled".to_string()),
+                            },
+                        );
+                    }
+                }
+            }
+            ChannelMessage::SnapshotCancellationResponse { query_id, .. } => {
+                self.follower_pending.borrow_mut().remove(&query_id);
+                self.snapshot_cancellation_pending
+                    .borrow_mut()
+                    .remove(&query_id);
+            }
             ChannelMessage::QueryResponse {
                 query_id,
                 result,
                 error,
             } => {
                 if let Some(request_id) = self.follower_pending.borrow_mut().remove(&query_id) {
+                    self.snapshot_cancellation_pending
+                        .borrow_mut()
+                        .remove(&query_id);
                     let outcome = match (result, error) {
                         (Some(res), _) => Ok(res),
                         (_, Some(err)) => Err(err),
@@ -652,6 +1039,11 @@ impl CoordinatorState {
                                 error: Some(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
                             },
                         );
+                    }
+                    DbRequestOrigin::Snapshot { .. } => {
+                        unreachable!(
+                            "snapshot origins are only dispatched by forward_snapshot_to_db"
+                        )
                     }
                 }
                 return;
@@ -700,6 +1092,11 @@ impl CoordinatorState {
                             },
                         );
                     }
+                    DbRequestOrigin::Snapshot { .. } => {
+                        unreachable!(
+                            "snapshot origins are only dispatched by forward_snapshot_to_db"
+                        )
+                    }
                 }
                 return;
             };
@@ -721,6 +1118,180 @@ impl CoordinatorState {
         self.post_db_worker_message(worker, db_request_id, msg);
     }
 
+    fn forward_snapshot_to_db(
+        self: &Rc<Self>,
+        origin: DbRequestOrigin,
+        waiter: SnapshotWaiter,
+        url: String,
+        compression: SnapshotCompression,
+        sha256: String,
+        uncompressed_size: f64,
+    ) {
+        if !uncompressed_size.is_finite()
+            || uncompressed_size < 512.0
+            || uncompressed_size.fract() != 0.0
+            || uncompressed_size > MAX_SNAPSHOT_SIZE as f64
+        {
+            self.fail_origin(
+                origin,
+                format!(
+                    "Snapshot uncompressed size must be an integer between 512 and {MAX_SNAPSHOT_SIZE}"
+                ),
+            );
+            return;
+        }
+        let key = SnapshotKey {
+            url: url.clone(),
+            compression,
+            sha256: sha256.to_ascii_lowercase(),
+            uncompressed_size: uncompressed_size as u64,
+        };
+        if self.attach_to_inflight_snapshot(&key, waiter.clone()) {
+            return;
+        }
+        let worker = {
+            let borrow = self.db_worker.borrow();
+            let Some(worker) = borrow.as_ref() else {
+                self.fail_origin(origin, WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string());
+                return;
+            };
+            worker.clone()
+        };
+        let db_request_id = {
+            let mut next = self.next_db_request_id.borrow_mut();
+            let id = *next;
+            *next = next.wrapping_add(1).max(1);
+            id
+        };
+        self.db_pending.borrow_mut().insert(
+            db_request_id,
+            DbRequestOrigin::Snapshot {
+                key,
+                waiters: vec![waiter],
+                cancelling: Vec::new(),
+                phase: SnapshotJobPhase::Active,
+            },
+        );
+        self.post_db_worker_message(
+            worker,
+            db_request_id,
+            WorkerMessage::InstallSnapshot {
+                request_id: db_request_id,
+                url,
+                compression,
+                sha256,
+                uncompressed_size,
+            },
+        );
+    }
+
+    fn detach_snapshot_waiter(&self, requester_id: &str, query_id: &str) -> bool {
+        let mut cancel_db_request = None;
+        let mut acknowledge_now = Vec::new();
+        let mut detached = false;
+        {
+            let mut pending = self.db_pending.borrow_mut();
+            for (request_id, origin) in pending.iter_mut() {
+                let DbRequestOrigin::Snapshot {
+                    waiters,
+                    cancelling,
+                    phase,
+                    ..
+                } = origin
+                else {
+                    continue;
+                };
+                if cancelling
+                    .iter()
+                    .any(|waiter| waiter.snapshot_identity() == (requester_id, query_id))
+                {
+                    return true;
+                }
+                let Some(index) = waiters
+                    .iter()
+                    .position(|waiter| waiter.snapshot_identity() == (requester_id, query_id))
+                else {
+                    continue;
+                };
+                let waiter = waiters.remove(index);
+                detached = true;
+                if waiters.is_empty() {
+                    cancelling.push(waiter);
+                    *phase = SnapshotJobPhase::CancellingLastWaiter;
+                    cancel_db_request = Some(*request_id);
+                } else if matches!(waiter, SnapshotWaiter::Local { .. }) {
+                    // The leader coordinator owns the DB worker, so its local
+                    // close cannot complete until the shared job has delivered
+                    // the forwarded waiters that still depend on it.
+                    cancelling.push(waiter);
+                } else {
+                    acknowledge_now.push(waiter);
+                }
+                break;
+            }
+        }
+
+        for waiter in acknowledge_now {
+            self.deliver_snapshot_cancellation(
+                waiter,
+                Err("Snapshot installation cancelled".to_string()),
+            );
+        }
+        let worker = self.db_worker.borrow().clone();
+        if let (Some(worker), Some(request_id)) = (worker, cancel_db_request) {
+            self.post_db_worker_cancellation(&worker, request_id);
+        }
+        detached
+    }
+
+    fn deliver_snapshot_cancellation(
+        &self,
+        waiter: SnapshotWaiter,
+        outcome: Result<String, String>,
+    ) {
+        let (_, query_id) = waiter.snapshot_identity();
+        let (result, error) = match outcome {
+            Ok(result) => (Some(result), None),
+            Err(error) => (None, Some(error)),
+        };
+        let _ = send_channel_message(
+            &self.channel,
+            &ChannelMessage::SnapshotCancellationResponse {
+                query_id: query_id.to_string(),
+                result,
+                error,
+            },
+        );
+    }
+
+    fn finish_shutdown_if_drained(&self) {
+        if !self.leader_draining.get() || !self.db_pending.borrow().is_empty() {
+            return;
+        }
+        for request_id in self.shutdown_requests.borrow_mut().drain(..) {
+            let _ = send_query_result_to_main(request_id, Ok("Coordinator drained".to_string()));
+        }
+    }
+
+    fn post_db_worker_cancellation(&self, worker: &Worker, request_id: u32) {
+        let message = WorkerMessage::CancelSnapshot { request_id };
+        match serde_wasm_bindgen::to_value(&message) {
+            Ok(value) => {
+                if let Err(error) = worker.post_message(&value) {
+                    let _ = send_worker_error_message(&format!(
+                        "Failed to cancel snapshot installation: {}",
+                        js_value_to_string(&error)
+                    ));
+                }
+            }
+            Err(error) => {
+                let _ = send_worker_error_message(&format!(
+                    "Failed to serialize snapshot cancellation: {error:?}"
+                ));
+            }
+        }
+    }
+
     fn post_db_worker_message(&self, worker: Worker, db_request_id: u32, msg: WorkerMessage) {
         match serde_wasm_bindgen::to_value(&msg) {
             Ok(val) => {
@@ -731,6 +1302,7 @@ impl CoordinatorState {
                             origin,
                             "Failed to dispatch query to DB worker".to_string(),
                         );
+                        self.finish_shutdown_if_drained();
                     }
                 }
             }
@@ -738,6 +1310,7 @@ impl CoordinatorState {
                 let _ = send_worker_error_message(&format!("{err:?}"));
                 if let Some(origin) = self.db_pending.borrow_mut().remove(&db_request_id) {
                     self.fail_origin(origin, "Failed to serialize query".to_string());
+                    self.finish_shutdown_if_drained();
                 }
             }
         }
@@ -755,6 +1328,40 @@ impl CoordinatorState {
                         query_id,
                         result: None,
                         error: Some(error),
+                    },
+                );
+            }
+            DbRequestOrigin::Snapshot {
+                waiters,
+                cancelling,
+                ..
+            } => {
+                for waiter in waiters {
+                    self.deliver_snapshot_waiter(waiter, Err(error.clone()));
+                }
+                for waiter in cancelling {
+                    self.deliver_snapshot_cancellation(waiter, Err(error.clone()));
+                }
+            }
+        }
+    }
+
+    fn deliver_snapshot_waiter(&self, waiter: SnapshotWaiter, outcome: Result<String, String>) {
+        match waiter {
+            SnapshotWaiter::Local { request_id, .. } => {
+                let _ = send_query_result_to_main(request_id, outcome);
+            }
+            SnapshotWaiter::Forwarded { query_id, .. } => {
+                let (result, error) = match outcome {
+                    Ok(result) => (Some(result), None),
+                    Err(error) => (None, Some(error)),
+                };
+                let _ = send_channel_message(
+                    &self.channel,
+                    &ChannelMessage::QueryResponse {
+                        query_id,
+                        result,
+                        error,
                     },
                 );
             }
@@ -801,11 +1408,67 @@ impl CoordinatorState {
                     );
                 }
             },
+            DbRequestOrigin::Snapshot {
+                waiters,
+                cancelling,
+                phase,
+                ..
+            } => {
+                for waiter in waiters {
+                    self.deliver_snapshot_waiter(waiter, outcome.clone());
+                }
+                for waiter in cancelling {
+                    let cancellation_outcome = match phase {
+                        SnapshotJobPhase::Active => {
+                            Err("Snapshot installation cancelled".to_string())
+                        }
+                        SnapshotJobPhase::CancellingLastWaiter => outcome.clone(),
+                    };
+                    self.deliver_snapshot_cancellation(waiter, cancellation_outcome);
+                }
+            }
         }
+        self.finish_shutdown_if_drained();
+    }
+
+    fn handle_snapshot_cancelled(&self, db_request_id: u32) {
+        let Some(DbRequestOrigin::Snapshot {
+            waiters,
+            cancelling,
+            ..
+        }) = self.db_pending.borrow_mut().remove(&db_request_id)
+        else {
+            return;
+        };
+        debug_assert!(waiters.is_empty());
+        for waiter in cancelling {
+            self.deliver_snapshot_cancellation(
+                waiter,
+                Err("Snapshot installation cancelled".to_string()),
+            );
+        }
+        self.finish_shutdown_if_drained();
     }
 
     fn mark_leader_known(&self, leader_id: String) {
-        *self.leader_id.borrow_mut() = Some(leader_id);
+        let previous = self.leader_id.borrow_mut().replace(leader_id.clone());
+        if previous
+            .as_ref()
+            .is_some_and(|current| current != &leader_id)
+        {
+            self.snapshot_cancellation_pending.borrow_mut().clear();
+            let pending = self
+                .follower_pending
+                .borrow_mut()
+                .drain()
+                .collect::<Vec<_>>();
+            for (_, request_id) in pending {
+                let _ = send_query_result_to_main(
+                    request_id,
+                    Err("Leader changed while request was pending".to_string()),
+                );
+            }
+        }
     }
 
     fn signal_ready_once(&self) {
@@ -830,6 +1493,7 @@ impl DbWorkerState {
             db_name: config.db_name,
             db_queue: Rc::new(RefCell::new(VecDeque::new())),
             db_processing: Rc::new(Cell::new(false)),
+            snapshot_cancellations: Rc::new(RefCell::new(HashMap::new())),
             hooks,
         })
     }
@@ -864,6 +1528,47 @@ impl DbWorkerState {
             } => {
                 self.enqueue_job(request_id, DbJobPayload::Batch { statements });
             }
+            WorkerMessage::InstallSnapshot {
+                request_id,
+                url,
+                compression,
+                sha256,
+                uncompressed_size,
+            } => {
+                let cancellation = SnapshotCancellation::default();
+                self.snapshot_cancellations
+                    .borrow_mut()
+                    .insert(request_id, cancellation.clone());
+                self.enqueue_job(
+                    request_id,
+                    DbJobPayload::Snapshot {
+                        db_name: self.db_name.clone(),
+                        url,
+                        compression,
+                        sha256,
+                        uncompressed_size,
+                        cancellation,
+                    },
+                );
+            }
+            WorkerMessage::CancelSnapshot { request_id } => {
+                let cancelled = if let Some(cancellation) =
+                    self.snapshot_cancellations.borrow().get(&request_id)
+                {
+                    cancellation.cancel();
+                    true
+                } else {
+                    false
+                };
+                match make_snapshot_cancelled_message(request_id, cancelled) {
+                    Ok(response) => self.hooks.deliver.as_ref()(&response),
+                    Err(error) => {
+                        let _ = send_worker_error(error);
+                    }
+                }
+            }
+            WorkerMessage::CancelForwardedSnapshot { .. } => {}
+            WorkerMessage::Shutdown { .. } => {}
         }
     }
 
@@ -892,6 +1597,10 @@ impl DbWorkerState {
                 let exec = Rc::clone(&hooks.exec);
                 let deliver = Rc::clone(&hooks.deliver);
                 let result = exec.as_ref()(db, job.payload).await;
+                state
+                    .snapshot_cancellations
+                    .borrow_mut()
+                    .remove(&job.request_id);
                 match make_query_result_message(job.request_id, result) {
                     Ok(resp) => deliver.as_ref()(&resp),
                     Err(err) => {
@@ -1024,6 +1733,21 @@ pub fn make_query_result_message(
     Ok(response)
 }
 
+fn make_snapshot_cancelled_message(
+    request_id: u32,
+    cancelled: bool,
+) -> Result<js_sys::Object, JsValue> {
+    let response = js_sys::Object::new();
+    set_js_property(&response, "type", &JsValue::from_str("snapshot-cancelled"))?;
+    set_js_property(
+        &response,
+        "requestId",
+        &JsValue::from_f64(request_id as f64),
+    )?;
+    set_js_property(&response, "cancelled", &JsValue::from_bool(cancelled))?;
+    Ok(response)
+}
+
 pub fn send_query_result_to_main(
     request_id: u32,
     result: Result<String, String>,
@@ -1043,17 +1767,53 @@ async fn exec_on_db(
 ) -> Result<String, String> {
     let db_opt = db.borrow_mut().take();
     let result = match db_opt {
-        Some(mut database) => {
-            let result = match payload {
-                DbJobPayload::Query { sql, params } => match params {
+        Some(mut database) => match payload {
+            DbJobPayload::Snapshot {
+                db_name,
+                url,
+                compression,
+                sha256,
+                uncompressed_size,
+                cancellation,
+            } => {
+                drop(database);
+                match SQLiteDatabase::install_snapshot_cancellable(
+                    &db_name,
+                    &url,
+                    compression,
+                    &sha256,
+                    uncompressed_size,
+                    cancellation,
+                )
+                .await
+                {
+                    Ok((database, stats)) => {
+                        *db.borrow_mut() = Some(database);
+                        serde_json::to_string(&stats)
+                            .map_err(|e| format!("Failed to encode snapshot result: {e}"))
+                    }
+                    Err(err) => {
+                        if let Ok(database) = SQLiteDatabase::initialize_opfs(&db_name).await {
+                            *db.borrow_mut() = Some(database);
+                        }
+                        Err(err)
+                    }
+                }
+            }
+            DbJobPayload::Query { sql, params } => {
+                let result = match params {
                     Some(p) => database.exec_with_params(&sql, p).await,
                     None => database.exec(&sql).await,
-                },
-                DbJobPayload::Batch { statements } => database.exec_batch(statements).await,
-            };
-            *db.borrow_mut() = Some(database);
-            result
-        }
+                };
+                *db.borrow_mut() = Some(database);
+                result
+            }
+            DbJobPayload::Batch { statements } => {
+                let result = database.exec_batch(statements).await;
+                *db.borrow_mut() = Some(database);
+                result
+            }
+        },
         None => Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
     };
     result
@@ -1210,19 +1970,27 @@ mod tests {
         listener.forget();
 
         state.on_lock_granted();
-        sleep_ms(50).await;
+        for _ in 0..40 {
+            let ready_received = received
+                .borrow()
+                .iter()
+                .any(|message| matches!(message, ChannelMessage::LeaderReady { .. }));
+            if ready_received {
+                break;
+            }
+            sleep_ms(25).await;
+        }
 
-        let msgs = received.borrow();
-        assert!(
-            msgs.iter()
-                .any(|m| matches!(m, ChannelMessage::NewLeader { .. })),
-            "should announce new-leader"
-        );
-        assert!(
-            msgs.iter()
-                .any(|m| matches!(m, ChannelMessage::LeaderReady { .. })),
-            "should announce leader-ready"
-        );
+        let new_leader_received = received
+            .borrow()
+            .iter()
+            .any(|message| matches!(message, ChannelMessage::NewLeader { .. }));
+        let ready_received = received
+            .borrow()
+            .iter()
+            .any(|message| matches!(message, ChannelMessage::LeaderReady { .. }));
+        assert!(new_leader_received, "should announce new-leader");
+        assert!(ready_received, "should announce leader-ready");
     }
 
     #[wasm_bindgen_test(async)]
@@ -1461,7 +2229,12 @@ mod tests {
             params: None,
         });
 
-        sleep_ms(30).await;
+        for _ in 0..40 {
+            if results.length() == 2 {
+                break;
+            }
+            sleep_ms(5).await;
+        }
 
         assert_eq!(results.length(), 2, "both queued queries should complete");
         for entry in results.iter() {
@@ -1476,5 +2249,397 @@ mod tests {
                 .map(|v| js_value_to_string(&v));
             assert!(error.is_none(), "no error expected");
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn identical_snapshot_requests_coalesce_to_one_db_job() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-snapshot-coalesce".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 10.0,
+        })
+        .expect("state");
+        let key = SnapshotKey {
+            url: "https://example.invalid/snapshot.db".to_string(),
+            compression: SnapshotCompression::None,
+            sha256: "a".repeat(64),
+            uncompressed_size: 1024,
+        };
+        state.db_pending.borrow_mut().insert(
+            1,
+            DbRequestOrigin::Snapshot {
+                key: key.clone(),
+                waiters: vec![SnapshotWaiter::Local {
+                    request_id: 10,
+                    requester_id: "local".to_string(),
+                    query_id: "local:10".to_string(),
+                }],
+                cancelling: Vec::new(),
+                phase: SnapshotJobPhase::Active,
+            },
+        );
+
+        assert!(state.attach_to_inflight_snapshot(
+            &key,
+            SnapshotWaiter::Forwarded {
+                requester_id: "follower-a".to_string(),
+                query_id: "remote-1".to_string(),
+            },
+        ));
+        assert_eq!(state.db_pending.borrow().len(), 1);
+        let pending = state.db_pending.borrow();
+        let DbRequestOrigin::Snapshot { waiters, .. } = pending.get(&1).expect("job") else {
+            panic!("expected snapshot job");
+        };
+        assert_eq!(waiters.len(), 2);
+    }
+
+    #[wasm_bindgen_test]
+    fn snapshot_cancellation_detaches_only_matching_forwarded_waiters() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-snapshot-detach".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 10.0,
+        })
+        .expect("state");
+        let key = SnapshotKey {
+            url: "https://example.invalid/snapshot.db".to_string(),
+            compression: SnapshotCompression::None,
+            sha256: "a".repeat(64),
+            uncompressed_size: 1024,
+        };
+        state.db_pending.borrow_mut().insert(
+            1,
+            DbRequestOrigin::Snapshot {
+                key,
+                waiters: vec![
+                    SnapshotWaiter::Forwarded {
+                        requester_id: "closing-follower".to_string(),
+                        query_id: "closing-query".to_string(),
+                    },
+                    SnapshotWaiter::Forwarded {
+                        requester_id: "live-follower".to_string(),
+                        query_id: "live-query".to_string(),
+                    },
+                ],
+                cancelling: Vec::new(),
+                phase: SnapshotJobPhase::Active,
+            },
+        );
+
+        state.detach_snapshot_waiter("closing-follower", "closing-query");
+
+        let pending = state.db_pending.borrow();
+        let DbRequestOrigin::Snapshot { waiters, .. } = pending.get(&1).expect("live job") else {
+            panic!("expected snapshot job");
+        };
+        assert_eq!(waiters.len(), 1);
+        assert!(matches!(
+            &waiters[0],
+            SnapshotWaiter::Forwarded { requester_id, query_id }
+                if requester_id == "live-follower" && query_id == "live-query"
+        ));
+    }
+
+    #[wasm_bindgen_test]
+    fn cancelling_last_waiter_does_not_accept_a_new_coalesced_waiter() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-snapshot-cancelling-successor".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 10.0,
+        })
+        .expect("state");
+        let key = SnapshotKey {
+            url: "https://example.invalid/snapshot.db".to_string(),
+            compression: SnapshotCompression::None,
+            sha256: "a".repeat(64),
+            uncompressed_size: 1024,
+        };
+        state.db_pending.borrow_mut().insert(
+            1,
+            DbRequestOrigin::Snapshot {
+                key: key.clone(),
+                waiters: vec![SnapshotWaiter::Forwarded {
+                    requester_id: "follower-a".to_string(),
+                    query_id: "a:1".to_string(),
+                }],
+                cancelling: Vec::new(),
+                phase: SnapshotJobPhase::Active,
+            },
+        );
+        assert!(state.detach_snapshot_waiter("follower-a", "a:1"));
+        assert!(!state.attach_to_inflight_snapshot(
+            &key,
+            SnapshotWaiter::Forwarded {
+                requester_id: "follower-b".to_string(),
+                query_id: "b:1".to_string(),
+            },
+        ));
+        let pending = state.db_pending.borrow();
+        let DbRequestOrigin::Snapshot {
+            waiters,
+            cancelling,
+            phase,
+            ..
+        } = pending.get(&1).expect("cancelling job")
+        else {
+            panic!("expected snapshot job");
+        };
+        assert!(waiters.is_empty());
+        assert_eq!(cancelling.len(), 1);
+        assert_eq!(*phase, SnapshotJobPhase::CancellingLastWaiter);
+    }
+
+    #[wasm_bindgen_test]
+    fn leader_local_cancellation_waits_for_forwarded_coalesced_waiter() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-snapshot-leader-close".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 10.0,
+        })
+        .expect("state");
+        state.db_pending.borrow_mut().insert(
+            1,
+            DbRequestOrigin::Snapshot {
+                key: SnapshotKey {
+                    url: "https://example.invalid/snapshot.db".to_string(),
+                    compression: SnapshotCompression::None,
+                    sha256: "a".repeat(64),
+                    uncompressed_size: 1024,
+                },
+                waiters: vec![
+                    SnapshotWaiter::Local {
+                        request_id: 1,
+                        requester_id: "leader".to_string(),
+                        query_id: "leader:1".to_string(),
+                    },
+                    SnapshotWaiter::Forwarded {
+                        requester_id: "follower".to_string(),
+                        query_id: "follower:1".to_string(),
+                    },
+                ],
+                cancelling: Vec::new(),
+                phase: SnapshotJobPhase::Active,
+            },
+        );
+        assert!(state.detach_snapshot_waiter("leader", "leader:1"));
+        let pending = state.db_pending.borrow();
+        let DbRequestOrigin::Snapshot {
+            waiters,
+            cancelling,
+            phase,
+            ..
+        } = pending.get(&1).expect("shared job")
+        else {
+            panic!("expected snapshot job");
+        };
+        assert_eq!(waiters.len(), 1);
+        assert_eq!(cancelling.len(), 1);
+        assert_eq!(*phase, SnapshotJobPhase::Active);
+    }
+
+    #[wasm_bindgen_test]
+    fn leader_shutdown_rejects_successor_before_acknowledging_local_cancel() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-snapshot-draining-successor".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 10.0,
+        })
+        .expect("state");
+        *state.role.borrow_mut() = LeadershipRole::Leader;
+        *state.db_worker_ready.borrow_mut() = true;
+        state.db_pending.borrow_mut().insert(
+            1,
+            DbRequestOrigin::Snapshot {
+                key: SnapshotKey {
+                    url: "https://example.invalid/snapshot.db".to_string(),
+                    compression: SnapshotCompression::None,
+                    sha256: "a".repeat(64),
+                    uncompressed_size: 1024,
+                },
+                waiters: vec![SnapshotWaiter::Local {
+                    request_id: 1,
+                    requester_id: "leader".to_string(),
+                    query_id: "leader:1".to_string(),
+                }],
+                cancelling: Vec::new(),
+                phase: SnapshotJobPhase::Active,
+            },
+        );
+        assert!(state.detach_snapshot_waiter("leader", "leader:1"));
+        state.handle_main_message(WorkerMessage::Shutdown { request_id: 99 });
+        assert!(state.leader_draining.get());
+        assert_eq!(state.shutdown_requests.borrow().as_slice(), &[99]);
+
+        state.handle_channel_message(ChannelMessage::InstallSnapshotRequest {
+            requester_id: "follower".to_string(),
+            query_id: "follower:2".to_string(),
+            url: "https://example.invalid/snapshot.db".to_string(),
+            compression: SnapshotCompression::None,
+            sha256: "a".repeat(64),
+            uncompressed_size: 1024.0,
+        });
+        assert_eq!(state.db_pending.borrow().len(), 1);
+
+        state.handle_snapshot_cancelled(1);
+        assert!(state.db_pending.borrow().is_empty());
+        assert!(state.shutdown_requests.borrow().is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn local_cancel_before_request_still_drains_unrelated_forwarded_work() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-local-cancel-before-request-drain".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 10.0,
+        })
+        .expect("state");
+        *state.role.borrow_mut() = LeadershipRole::Leader;
+        *state.db_worker_ready.borrow_mut() = true;
+        state.db_pending.borrow_mut().insert(
+            7,
+            DbRequestOrigin::Forwarded {
+                query_id: "follower:7".to_string(),
+            },
+        );
+
+        let local_query_id = format!("{}:5", state.worker_id);
+        state.handle_channel_message(ChannelMessage::CancelSnapshotRequest {
+            requester_id: state.worker_id.clone(),
+            query_id: local_query_id,
+        });
+        assert_eq!(state.cancelled_snapshot_requests.borrow().len(), 1);
+
+        state.handle_main_message(WorkerMessage::InstallSnapshot {
+            request_id: 5,
+            url: "https://example.invalid/snapshot.db".to_string(),
+            compression: SnapshotCompression::None,
+            sha256: "a".repeat(64),
+            uncompressed_size: 1024.0,
+        });
+        assert!(state.cancelled_snapshot_requests.borrow().is_empty());
+        assert_eq!(state.db_pending.borrow().len(), 1);
+
+        state.handle_main_message(WorkerMessage::Shutdown { request_id: 99 });
+        assert!(state.leader_draining.get());
+        assert_eq!(state.shutdown_requests.borrow().as_slice(), &[99]);
+
+        state.handle_channel_message(ChannelMessage::QueryRequest {
+            query_id: "new-follower:8".to_string(),
+            sql: "SELECT 1".to_string(),
+            params: None,
+        });
+        assert_eq!(state.db_pending.borrow().len(), 1);
+
+        state.handle_db_query_result(7, Some("[]".to_string()), None);
+        assert!(state.db_pending.borrow().is_empty());
+        assert!(state.shutdown_requests.borrow().is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn snapshot_cancellation_arriving_before_request_prevents_dispatch() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-snapshot-cancel-before-request".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 10.0,
+        })
+        .expect("state");
+        *state.role.borrow_mut() = LeadershipRole::Leader;
+        state.handle_channel_message(ChannelMessage::CancelSnapshotRequest {
+            requester_id: "closing-follower".to_string(),
+            query_id: "closing-follower:7".to_string(),
+        });
+        assert_eq!(state.cancelled_snapshot_requests.borrow().len(), 1);
+
+        state.handle_channel_message(ChannelMessage::InstallSnapshotRequest {
+            requester_id: "closing-follower".to_string(),
+            query_id: "closing-follower:7".to_string(),
+            url: "https://example.invalid/snapshot.db".to_string(),
+            compression: SnapshotCompression::None,
+            sha256: "a".repeat(64),
+            uncompressed_size: 1024.0,
+        });
+
+        assert!(state.cancelled_snapshot_requests.borrow().is_empty());
+        assert!(state.db_pending.borrow().is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn unmatched_snapshot_cancellation_tombstones_expire_and_remain_bounded() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-snapshot-cancel-expiry".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 10.0,
+        })
+        .expect("state");
+        state
+            .cancelled_snapshot_requests
+            .borrow_mut()
+            .insert(("late".to_string(), "completed".to_string()), 10.0);
+        state.prune_snapshot_cancellation_tombstones(10.0);
+        assert!(state.cancelled_snapshot_requests.borrow().is_empty());
+
+        for index in 0..(MAX_SNAPSHOT_CANCELLATION_TOMBSTONES + 20) {
+            state.cancelled_snapshot_requests.borrow_mut().insert(
+                ("orphan".to_string(), format!("query-{index}")),
+                1000.0 + index as f64,
+            );
+        }
+        state.prune_snapshot_cancellation_tombstones(0.0);
+        assert_eq!(
+            state.cancelled_snapshot_requests.borrow().len(),
+            MAX_SNAPSHOT_CANCELLATION_TOMBSTONES
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn follower_timeout_waits_for_authoritative_activation_outcome() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-snapshot-timeout-outcome".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 10.0,
+        })
+        .expect("state");
+        let query_id = "follower:9".to_string();
+        state
+            .follower_pending
+            .borrow_mut()
+            .insert(query_id.clone(), 9);
+
+        assert!(state.begin_snapshot_timeout_cancellation(&query_id));
+        assert_eq!(state.follower_pending.borrow().get(&query_id), Some(&9));
+        assert!(state
+            .snapshot_cancellation_pending
+            .borrow()
+            .contains(&query_id));
+
+        state.handle_channel_message(ChannelMessage::SnapshotCancellationResponse {
+            query_id: query_id.clone(),
+            result: Some("activation-won".to_string()),
+            error: None,
+        });
+        assert!(!state.follower_pending.borrow().contains_key(&query_id));
+        assert!(!state
+            .snapshot_cancellation_pending
+            .borrow()
+            .contains(&query_id));
+    }
+
+    #[wasm_bindgen_test]
+    fn leader_change_cleans_up_forwarded_requests() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-leader-change".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 10.0,
+        })
+        .expect("state");
+        state.mark_leader_known("leader-a".to_string());
+        state
+            .follower_pending
+            .borrow_mut()
+            .insert("snapshot-1".to_string(), 99);
+
+        state.mark_leader_known("leader-b".to_string());
+        assert!(state.follower_pending.borrow().is_empty());
     }
 }

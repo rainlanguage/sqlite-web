@@ -21,6 +21,13 @@ pub struct SqlBatchStatement {
     pub params: Option<Vec<serde_json::Value>>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotCompression {
+    None,
+    Gzip,
+}
+
 // Message types for BroadcastChannel communication
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
@@ -49,6 +56,33 @@ pub enum ChannelMessage {
         #[serde(rename = "queryId")]
         query_id: String,
         statements: Vec<SqlBatchStatement>,
+    },
+    #[serde(rename = "install-snapshot-request")]
+    InstallSnapshotRequest {
+        #[serde(rename = "queryId")]
+        query_id: String,
+        #[serde(rename = "requesterId")]
+        requester_id: String,
+        url: String,
+        compression: SnapshotCompression,
+        #[serde(rename = "sha256")]
+        sha256: String,
+        #[serde(rename = "uncompressedSize")]
+        uncompressed_size: f64,
+    },
+    #[serde(rename = "cancel-snapshot-request")]
+    CancelSnapshotRequest {
+        #[serde(rename = "requesterId")]
+        requester_id: String,
+        #[serde(rename = "queryId")]
+        query_id: String,
+    },
+    #[serde(rename = "snapshot-cancellation-response")]
+    SnapshotCancellationResponse {
+        #[serde(rename = "queryId")]
+        query_id: String,
+        result: Option<String>,
+        error: Option<String>,
     },
     #[serde(rename = "query-response")]
     QueryResponse {
@@ -83,6 +117,32 @@ pub enum WorkerMessage {
         request_id: u32,
         statements: Vec<SqlBatchStatement>,
     },
+    #[serde(rename = "install-snapshot")]
+    InstallSnapshot {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        url: String,
+        compression: SnapshotCompression,
+        #[serde(rename = "sha256")]
+        sha256: String,
+        #[serde(rename = "uncompressedSize")]
+        uncompressed_size: f64,
+    },
+    #[serde(rename = "cancel-snapshot")]
+    CancelSnapshot {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+    },
+    #[serde(rename = "cancel-forwarded-snapshot")]
+    CancelForwardedSnapshot {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+    },
+    #[serde(rename = "shutdown")]
+    Shutdown {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+    },
 }
 
 // Messages to main thread
@@ -95,6 +155,12 @@ pub enum MainThreadMessage {
         request_id: u32,
         result: Option<String>,
         error: Option<WorkerErrorPayload>,
+    },
+    #[serde(rename = "snapshot-cancelled")]
+    SnapshotCancelled {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        cancelled: bool,
     },
     #[serde(rename = "worker-ready")]
     WorkerReady,
@@ -157,6 +223,29 @@ mod tests {
             assert!(json.contains("\"queryId\":\"batch-456\""));
             assert!(json.contains("\"statements\""));
             assert!(json.contains("\"params\""));
+        });
+
+        let snapshot_request = ChannelMessage::InstallSnapshotRequest {
+            query_id: "snapshot-456".to_string(),
+            requester_id: "worker-123".to_string(),
+            url: "https://example.com/database.sqlite.gz".to_string(),
+            compression: SnapshotCompression::Gzip,
+            sha256: "a".repeat(64),
+            uncompressed_size: 4096.0,
+        };
+        assert_serialization_roundtrip(snapshot_request, "install-snapshot-request", |json| {
+            assert!(json.contains("\"requesterId\":\"worker-123\""));
+            assert!(json.contains("\"compression\":\"gzip\""));
+            assert!(json.contains("\"uncompressedSize\":4096.0"));
+        });
+
+        let snapshot_cancel = ChannelMessage::CancelSnapshotRequest {
+            requester_id: "worker-123".to_string(),
+            query_id: "snapshot-456".to_string(),
+        };
+        assert_serialization_roundtrip(snapshot_cancel, "cancel-snapshot-request", |json| {
+            assert!(json.contains("\"requesterId\":\"worker-123\""));
+            assert!(json.contains("\"queryId\":\"snapshot-456\""));
         });
 
         let query_success = ChannelMessage::QueryResponse {
@@ -240,6 +329,24 @@ mod tests {
             }
             other => panic!("expected ExecuteBatch, got {other:?}"),
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn test_worker_message_install_snapshot_serialization() {
+        let msg = WorkerMessage::InstallSnapshot {
+            request_id: 44,
+            url: "https://example.com/database.sqlite".to_string(),
+            compression: SnapshotCompression::None,
+            sha256: "b".repeat(64),
+            uncompressed_size: 8192.0,
+        };
+
+        let json = serde_json::to_string(&msg).expect("Should serialize");
+        assert!(json.contains("\"type\":\"install-snapshot\""));
+        assert!(json.contains("\"compression\":\"none\""));
+
+        let deserialized: WorkerMessage = serde_json::from_str(&json).expect("Should deserialize");
+        assert_eq!(msg, deserialized);
     }
 
     #[wasm_bindgen_test]

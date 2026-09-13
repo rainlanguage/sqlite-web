@@ -79,7 +79,7 @@ fn test_error_propagation_chain() {
 
 #[wasm_bindgen_test]
 fn test_worker_template_generation() {
-    let worker_code = generate_self_contained_worker("testdb");
+    let worker_code = generate_self_contained_worker("testdb", "test-client");
 
     assert!(!worker_code.is_empty());
     assert!(

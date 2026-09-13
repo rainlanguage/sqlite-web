@@ -37,10 +37,18 @@ web-sys = { version = "0.3", features = [
     "FileSystemHandle",
     "FileSystemRemoveOptions",
     "FileSystemGetDirectoryOptions",
-    "DomException"
+    "DomException",
+    "Response",
+    "AbortController",
+    "AbortSignal",
+    "Request",
+    "RequestInit",
+    "ReadableStream",
+    "ReadableStreamDefaultReader"
 ]}
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 serde-wasm-bindgen = "0.6"
 uuid = { version = "1.0", features = ["v4", "js"] }
 console_error_panic_hook = "0.1"
