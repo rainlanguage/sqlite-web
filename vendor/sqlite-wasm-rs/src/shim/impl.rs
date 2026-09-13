@@ -45,9 +45,10 @@ fn yday_from_date(date: &Date) -> u32 {
 /// https://github.com/sqlite/sqlite-wasm/blob/7c1b309c3bd07d8e6d92f82344108cebbd14f161/sqlite-wasm/jswasm/sqlite3-bundler-friendly.mjs#L3404
 #[no_mangle]
 pub unsafe extern "C" fn rust_sqlite_wasm_shim_localtime_js(t: time_t, tm: *mut tm) {
-    assert!(!(INT53_MIN..=INT53_MAX).contains(&t), "wrong time range");
+    assert!((INT53_MIN..=INT53_MAX).contains(&t), "wrong time range");
 
-    let date = Date::new(&(t * 1000).into());
+    // Converting i64 directly creates a JavaScript BigInt, which Date rejects.
+    let date = Date::new(&((t as f64) * 1000.0).into());
     (*tm).tm_sec = date.get_seconds() as _;
     (*tm).tm_min = date.get_minutes() as _;
     (*tm).tm_hour = date.get_hours() as _;
@@ -66,7 +67,7 @@ pub unsafe extern "C" fn rust_sqlite_wasm_shim_localtime_js(t: time_t, tm: *mut 
             && date.get_timezone_offset() == winter_offset.min(summer_offset),
     );
 
-    (*tm).tm_gmtoff = (date.get_timezone_offset() * 60.0) as _;
+    (*tm).tm_gmtoff = (-date.get_timezone_offset() * 60.0) as _;
 }
 
 /// https://github.com/sqlite/sqlite-wasm/blob/7c1b309c3bd07d8e6d92f82344108cebbd14f161/sqlite-wasm/jswasm/sqlite3-bundler-friendly.mjs#L3460
