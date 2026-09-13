@@ -21,6 +21,13 @@ pub struct SqlBatchStatement {
     pub params: Option<Vec<serde_json::Value>>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotCompression {
+    None,
+    Gzip,
+}
+
 // Message types for BroadcastChannel communication
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
@@ -49,6 +56,17 @@ pub enum ChannelMessage {
         #[serde(rename = "queryId")]
         query_id: String,
         statements: Vec<SqlBatchStatement>,
+    },
+    #[serde(rename = "install-snapshot-request")]
+    InstallSnapshotRequest {
+        #[serde(rename = "queryId")]
+        query_id: String,
+        url: String,
+        compression: SnapshotCompression,
+        #[serde(rename = "sha256")]
+        sha256: String,
+        #[serde(rename = "uncompressedSize")]
+        uncompressed_size: f64,
     },
     #[serde(rename = "query-response")]
     QueryResponse {
@@ -82,6 +100,17 @@ pub enum WorkerMessage {
         #[serde(rename = "requestId")]
         request_id: u32,
         statements: Vec<SqlBatchStatement>,
+    },
+    #[serde(rename = "install-snapshot")]
+    InstallSnapshot {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        url: String,
+        compression: SnapshotCompression,
+        #[serde(rename = "sha256")]
+        sha256: String,
+        #[serde(rename = "uncompressedSize")]
+        uncompressed_size: f64,
     },
 }
 
@@ -157,6 +186,18 @@ mod tests {
             assert!(json.contains("\"queryId\":\"batch-456\""));
             assert!(json.contains("\"statements\""));
             assert!(json.contains("\"params\""));
+        });
+
+        let snapshot_request = ChannelMessage::InstallSnapshotRequest {
+            query_id: "snapshot-456".to_string(),
+            url: "https://example.com/database.sqlite.gz".to_string(),
+            compression: SnapshotCompression::Gzip,
+            sha256: "a".repeat(64),
+            uncompressed_size: 4096.0,
+        };
+        assert_serialization_roundtrip(snapshot_request, "install-snapshot-request", |json| {
+            assert!(json.contains("\"compression\":\"gzip\""));
+            assert!(json.contains("\"uncompressedSize\":4096.0"));
         });
 
         let query_success = ChannelMessage::QueryResponse {
@@ -240,6 +281,24 @@ mod tests {
             }
             other => panic!("expected ExecuteBatch, got {other:?}"),
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn test_worker_message_install_snapshot_serialization() {
+        let msg = WorkerMessage::InstallSnapshot {
+            request_id: 44,
+            url: "https://example.com/database.sqlite".to_string(),
+            compression: SnapshotCompression::None,
+            sha256: "b".repeat(64),
+            uncompressed_size: 8192.0,
+        };
+
+        let json = serde_json::to_string(&msg).expect("Should serialize");
+        assert!(json.contains("\"type\":\"install-snapshot\""));
+        assert!(json.contains("\"compression\":\"none\""));
+
+        let deserialized: WorkerMessage = serde_json::from_str(&json).expect("Should deserialize");
+        assert_eq!(msg, deserialized);
     }
 
     #[wasm_bindgen_test]

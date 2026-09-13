@@ -1,12 +1,51 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
 import fs from 'fs';
+import { gzipSync } from 'node:zlib';
+
+// A deterministic, two-page SQLite fixture with one `snapshot_items` table.
+// Keeping it inline makes the browser integration test hermetic and avoids
+// coupling the SDK suite to any consumer's production database dump.
+const snapshotFixture = Buffer.from(
+	[
+		'U1FMaXRlIGZvcm1hdCAzAAIAAQEMQCAgAAAABAAAAAIAAAAAAAAAAAAAAAIAAAAEAAAAAAAAAAAAAAAB',
+		'AAAABwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAC6N+A0AAAABAYEAAYEAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHEBBxcpKQGBHXRhYmxlc25hcHNob3RfaXRlbXNzbmFwc2hv',
+		'dF9pdGVtcwJDUkVBVEUgVEFCTEUgc25hcHNob3RfaXRlbXMoaWQgSU5URUdFUiBQUklNQVJZIEtFWSwg',
+		'bGFiZWwgVEVYVCBOT1QgTlVMTCkAAAAAAAAAAAAAAAANAAAAAwHXAAHqAeEB1wAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+		'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAwMAF2dhbW1hBwIDABViZXRhCAEDABdhbHBoYQAAAAAAAAAA',
+		'AAAAAA=='
+	].join(''),
+	'base64'
+);
+const compressedSnapshotFixture = gzipSync(snapshotFixture, { mtime: 0 });
 
 export default defineConfig({
 	plugins: [
 		{
 			name: 'rainlanguage-sqlite-web-serve',
 			configureServer(server) {
+				server.middlewares.use('/snapshot.raw.db', (_req, res) => {
+					res.setHeader('Content-Type', 'application/vnd.sqlite3');
+					res.setHeader('Content-Length', snapshotFixture.length);
+					res.end(snapshotFixture);
+				});
+				server.middlewares.use('/snapshot.db.gz', (_req, res) => {
+					res.setHeader('Content-Type', 'application/gzip');
+					res.setHeader('Content-Length', compressedSnapshotFixture.length);
+					res.end(compressedSnapshotFixture);
+				});
 				server.middlewares.use('/pkg', (req, res, next) => {
 					const filePath = req.url?.substring(1);
 					const fullPath = path.join(process.cwd(), 'node_modules/@rainlanguage/sqlite-web', filePath || '');
