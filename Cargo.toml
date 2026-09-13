@@ -55,3 +55,6 @@ wasm-bindgen-test = "0.3"
 [profile.release]
 opt-level = "z"
 lto = true
+
+[patch.crates-io]
+sqlite-wasm-rs = { path = "vendor/sqlite-wasm-rs" }
