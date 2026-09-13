@@ -316,6 +316,108 @@ impl SQLiteWasmDatabase {
         Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
     }
 
+    /// Stream a SQLite snapshot into OPFS in the database worker. Only the
+    /// source URL and generic transport/validation metadata cross worker
+    /// boundaries. Supported compression values are `none` and `gzip`.
+    #[wasm_export(js_name = "installSnapshot", unchecked_return_type = "string")]
+    pub async fn install_snapshot(
+        &self,
+        url: &str,
+        #[wasm_export(unchecked_param_type = "\"none\" | \"gzip\"")] compression: &str,
+        sha256: &str,
+        uncompressed_size: f64,
+    ) -> Result<String, SQLiteWasmDatabaseError> {
+        let url = url.trim();
+        let compression = match compression.trim().to_ascii_lowercase().as_str() {
+            "none" => "none",
+            "gzip" => "gzip",
+            _ => {
+                return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                    "Snapshot compression must be either 'none' or 'gzip'",
+                )))
+            }
+        };
+        let sha256 = sha256.trim();
+        if url.is_empty() {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Snapshot URL is required",
+            )));
+        }
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Snapshot SHA-256 must contain exactly 64 hexadecimal characters",
+            )));
+        }
+        if !uncompressed_size.is_finite()
+            || uncompressed_size < 512.0
+            || uncompressed_size.fract() != 0.0
+        {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Snapshot uncompressed size must be a positive integer",
+            )));
+        }
+
+        let worker = Rc::clone(&self.worker);
+        let pending_queries = Rc::clone(&self.pending_queries);
+        let request_id = {
+            let mut n = self.next_request_id.borrow_mut();
+            let id = *n;
+            *n = n.wrapping_add(1).max(1);
+            id
+        };
+        let message = js_sys::Object::new();
+        Reflect::set(
+            &message,
+            &JsValue::from_str("type"),
+            &JsValue::from_str("install-snapshot"),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("requestId"),
+            &JsValue::from_f64(request_id as f64),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(&message, &JsValue::from_str("url"), &JsValue::from_str(url))
+            .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("compression"),
+            &JsValue::from_str(compression),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("sha256"),
+            &JsValue::from_str(sha256),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("uncompressedSize"),
+            &JsValue::from_f64(uncompressed_size),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+
+        let promise = js_sys::Promise::new(&mut |resolve, reject| match worker
+            .borrow()
+            .post_message(&message)
+        {
+            Ok(()) => {
+                pending_queries
+                    .borrow_mut()
+                    .insert(request_id, (resolve, reject));
+            }
+            Err(err) => {
+                let _ = reject.call1(&JsValue::NULL, &err);
+            }
+        });
+        let result = JsFuture::from(promise)
+            .await
+            .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
+    }
+
     #[wasm_export(js_name = "wipeAndRecreate", unchecked_return_type = "void")]
     pub async fn wipe_and_recreate(&self) -> Result<(), SQLiteWasmDatabaseError> {
         self.worker.borrow().terminate();

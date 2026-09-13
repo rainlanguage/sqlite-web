@@ -16,8 +16,8 @@ use web_sys::{
 
 use crate::database::SQLiteDatabase;
 use crate::messages::{
-    ChannelMessage, MainThreadMessage, SqlBatchStatement, WorkerErrorPayload, WorkerMessage,
-    WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
+    ChannelMessage, MainThreadMessage, SnapshotCompression, SqlBatchStatement, WorkerErrorPayload,
+    WorkerMessage, WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
 };
 use crate::util::{js_value_to_string, sanitize_identifier, set_js_property};
 
@@ -98,6 +98,13 @@ pub(crate) enum DbJobPayload {
     },
     Batch {
         statements: Vec<SqlBatchStatement>,
+    },
+    Snapshot {
+        db_name: String,
+        url: String,
+        compression: SnapshotCompression,
+        sha256: String,
+        uncompressed_size: f64,
     },
 }
 
@@ -534,6 +541,54 @@ impl CoordinatorState {
                     }
                 }
             },
+            WorkerMessage::InstallSnapshot {
+                request_id,
+                url,
+                compression,
+                sha256,
+                uncompressed_size,
+            } => match *self.role.borrow() {
+                LeadershipRole::Leader => {
+                    if !*self.db_worker_ready.borrow() {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                        );
+                        return;
+                    }
+                    self.forward_snapshot_to_db(
+                        DbRequestOrigin::Local { request_id },
+                        url,
+                        compression,
+                        sha256,
+                        uncompressed_size,
+                    );
+                }
+                LeadershipRole::Follower => {
+                    if !*self.leader_ready.borrow() {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                        );
+                        return;
+                    }
+                    let query_id = Uuid::new_v4().to_string();
+                    self.follower_pending
+                        .borrow_mut()
+                        .insert(query_id.clone(), request_id);
+                    let request = ChannelMessage::InstallSnapshotRequest {
+                        query_id: query_id.clone(),
+                        url,
+                        compression,
+                        sha256,
+                        uncompressed_size,
+                    };
+                    if let Err(err) = send_channel_message(&self.channel, &request) {
+                        self.handle_follower_forward_failure(&query_id, request_id, &err);
+                        let _ = send_worker_error_message(&err);
+                    }
+                }
+            },
         }
     }
 
@@ -608,6 +663,34 @@ impl CoordinatorState {
                         return;
                     }
                     self.forward_batch_to_db(DbRequestOrigin::Forwarded { query_id }, statements);
+                }
+            }
+            ChannelMessage::InstallSnapshotRequest {
+                query_id,
+                url,
+                compression,
+                sha256,
+                uncompressed_size,
+            } => {
+                if matches!(*self.role.borrow(), LeadershipRole::Leader) {
+                    if !*self.db_worker_ready.borrow() {
+                        let _ = send_channel_message(
+                            &self.channel,
+                            &ChannelMessage::QueryResponse {
+                                query_id,
+                                result: None,
+                                error: Some(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                            },
+                        );
+                        return;
+                    }
+                    self.forward_snapshot_to_db(
+                        DbRequestOrigin::Forwarded { query_id },
+                        url,
+                        compression,
+                        sha256,
+                        uncompressed_size,
+                    );
                 }
             }
             ChannelMessage::QueryResponse {
@@ -719,6 +802,42 @@ impl CoordinatorState {
             statements,
         };
         self.post_db_worker_message(worker, db_request_id, msg);
+    }
+
+    fn forward_snapshot_to_db(
+        self: &Rc<Self>,
+        origin: DbRequestOrigin,
+        url: String,
+        compression: SnapshotCompression,
+        sha256: String,
+        uncompressed_size: f64,
+    ) {
+        let worker = {
+            let borrow = self.db_worker.borrow();
+            let Some(worker) = borrow.as_ref() else {
+                self.fail_origin(origin, WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string());
+                return;
+            };
+            worker.clone()
+        };
+        let db_request_id = {
+            let mut next = self.next_db_request_id.borrow_mut();
+            let id = *next;
+            *next = next.wrapping_add(1).max(1);
+            id
+        };
+        self.db_pending.borrow_mut().insert(db_request_id, origin);
+        self.post_db_worker_message(
+            worker,
+            db_request_id,
+            WorkerMessage::InstallSnapshot {
+                request_id: db_request_id,
+                url,
+                compression,
+                sha256,
+                uncompressed_size,
+            },
+        );
     }
 
     fn post_db_worker_message(&self, worker: Worker, db_request_id: u32, msg: WorkerMessage) {
@@ -863,6 +982,24 @@ impl DbWorkerState {
                 statements,
             } => {
                 self.enqueue_job(request_id, DbJobPayload::Batch { statements });
+            }
+            WorkerMessage::InstallSnapshot {
+                request_id,
+                url,
+                compression,
+                sha256,
+                uncompressed_size,
+            } => {
+                self.enqueue_job(
+                    request_id,
+                    DbJobPayload::Snapshot {
+                        db_name: self.db_name.clone(),
+                        url,
+                        compression,
+                        sha256,
+                        uncompressed_size,
+                    },
+                );
             }
         }
     }
@@ -1043,17 +1180,51 @@ async fn exec_on_db(
 ) -> Result<String, String> {
     let db_opt = db.borrow_mut().take();
     let result = match db_opt {
-        Some(mut database) => {
-            let result = match payload {
-                DbJobPayload::Query { sql, params } => match params {
+        Some(mut database) => match payload {
+            DbJobPayload::Snapshot {
+                db_name,
+                url,
+                compression,
+                sha256,
+                uncompressed_size,
+            } => {
+                drop(database);
+                match SQLiteDatabase::install_snapshot(
+                    &db_name,
+                    &url,
+                    compression,
+                    &sha256,
+                    uncompressed_size,
+                )
+                .await
+                {
+                    Ok((database, stats)) => {
+                        *db.borrow_mut() = Some(database);
+                        serde_json::to_string(&stats)
+                            .map_err(|e| format!("Failed to encode snapshot result: {e}"))
+                    }
+                    Err(err) => {
+                        if let Ok(database) = SQLiteDatabase::initialize_opfs(&db_name).await {
+                            *db.borrow_mut() = Some(database);
+                        }
+                        Err(err)
+                    }
+                }
+            }
+            DbJobPayload::Query { sql, params } => {
+                let result = match params {
                     Some(p) => database.exec_with_params(&sql, p).await,
                     None => database.exec(&sql).await,
-                },
-                DbJobPayload::Batch { statements } => database.exec_batch(statements).await,
-            };
-            *db.borrow_mut() = Some(database);
-            result
-        }
+                };
+                *db.borrow_mut() = Some(database);
+                result
+            }
+            DbJobPayload::Batch { statements } => {
+                let result = database.exec_batch(statements).await;
+                *db.borrow_mut() = Some(database);
+                result
+            }
+        },
         None => Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
     };
     result
