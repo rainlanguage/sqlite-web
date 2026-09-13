@@ -51,10 +51,6 @@ precompiled = []
 name = "sqlite_wasm_rs"
 path = "src/lib.rs"
 
-[[test]]
-name = "main"
-path = "tests/main.rs"
-
 [dependencies.fragile]
 version = "2.0.0"
 

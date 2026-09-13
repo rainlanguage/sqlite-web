@@ -39,6 +39,9 @@ export default defineConfig({
 			},
 			// Add cross-origin isolation headers for SharedArrayBuffer and OPFS
 			providerOptions: {
+				context: {
+					timezoneId: 'America/New_York'
+				},
 				launch: {
 					args: [
 						'--enable-features=SharedArrayBuffer',

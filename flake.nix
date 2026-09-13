@@ -15,6 +15,9 @@
             name = "test-wasm";
             body = ''
               set -euxo pipefail
+              cd vendor/sqlite-wasm-rs
+              TZ=America/New_York wasm-pack test --headless --chrome . --lib --no-default-features --features precompiled
+              cd ../..
               cd packages/sqlite-web-core
               wasm-pack test --headless --chrome
               cd ../..

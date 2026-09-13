@@ -21,8 +21,11 @@ pub struct tm {
     pub tm_zone: *mut std::os::raw::c_char,
 }
 
-const INT53_MAX: time_t = 9007199254740992;
-const INT53_MIN: time_t = -9007199254740992;
+// ECMAScript Date's TimeClip range is +/- 8.64e15 milliseconds. Staying
+// within JavaScript's wider safe-integer range is not sufficient because Date
+// returns NaN outside this narrower range.
+const JS_DATE_MAX_SECONDS: time_t = 8_640_000_000_000;
+const JS_DATE_MIN_SECONDS: time_t = -JS_DATE_MAX_SECONDS;
 
 fn yday_from_date(date: &Date) -> u32 {
     const MONTH_DAYS_LEAP_CUMULATIVE: [u32; 12] =
@@ -45,9 +48,13 @@ fn yday_from_date(date: &Date) -> u32 {
 /// https://github.com/sqlite/sqlite-wasm/blob/7c1b309c3bd07d8e6d92f82344108cebbd14f161/sqlite-wasm/jswasm/sqlite3-bundler-friendly.mjs#L3404
 #[no_mangle]
 pub unsafe extern "C" fn rust_sqlite_wasm_shim_localtime_js(t: time_t, tm: *mut tm) {
-    assert!(!(INT53_MIN..=INT53_MAX).contains(&t), "wrong time range");
+    assert!(
+        (JS_DATE_MIN_SECONDS..=JS_DATE_MAX_SECONDS).contains(&t),
+        "wrong time range"
+    );
 
-    let date = Date::new(&(t * 1000).into());
+    // Converting i64 directly creates a JavaScript BigInt, which Date rejects.
+    let date = Date::new(&((t as f64) * 1000.0).into());
     (*tm).tm_sec = date.get_seconds() as _;
     (*tm).tm_min = date.get_minutes() as _;
     (*tm).tm_hour = date.get_hours() as _;
@@ -66,7 +73,7 @@ pub unsafe extern "C" fn rust_sqlite_wasm_shim_localtime_js(t: time_t, tm: *mut 
             && date.get_timezone_offset() == winter_offset.min(summer_offset),
     );
 
-    (*tm).tm_gmtoff = (date.get_timezone_offset() * 60.0) as _;
+    (*tm).tm_gmtoff = (-date.get_timezone_offset() * 60.0) as _;
 }
 
 /// https://github.com/sqlite/sqlite-wasm/blob/7c1b309c3bd07d8e6d92f82344108cebbd14f161/sqlite-wasm/jswasm/sqlite3-bundler-friendly.mjs#L3460
@@ -176,4 +183,49 @@ pub unsafe extern "C" fn rust_sqlite_wasm_shim_realloc(ptr: *mut u8, new_size: u
     *ptr.cast::<usize>() = new_size;
 
     ptr.add(ALIGN)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn localtime_populates_gmt_offset() {
+        let timestamp = 1_593_561_600;
+        let mut value: tm = unsafe { std::mem::zeroed() };
+
+        unsafe { rust_sqlite_wasm_shim_localtime_js(timestamp, &mut value) };
+
+        assert_eq!(
+            Date::new(&((timestamp as f64) * 1000.0).into()).get_timezone_offset(),
+            240.0
+        );
+        assert_eq!(value.tm_gmtoff, -4 * 60 * 60);
+        assert_eq!(value.tm_isdst, 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn localtime_accepts_javascript_date_boundaries() {
+        for timestamp in [JS_DATE_MIN_SECONDS, JS_DATE_MAX_SECONDS] {
+            let mut value: tm = unsafe { std::mem::zeroed() };
+            unsafe { rust_sqlite_wasm_shim_localtime_js(timestamp, &mut value) };
+            assert!((0..=11).contains(&value.tm_mon));
+            assert!((1..=31).contains(&value.tm_mday));
+        }
+    }
+
+    #[wasm_bindgen_test]
+    #[should_panic(expected = "wrong time range")]
+    fn localtime_rejects_above_javascript_date_range() {
+        let mut value: tm = unsafe { std::mem::zeroed() };
+        unsafe { rust_sqlite_wasm_shim_localtime_js(JS_DATE_MAX_SECONDS + 1, &mut value) };
+    }
+
+    #[wasm_bindgen_test]
+    #[should_panic(expected = "wrong time range")]
+    fn localtime_rejects_below_javascript_date_range() {
+        let mut value: tm = unsafe { std::mem::zeroed() };
+        unsafe { rust_sqlite_wasm_shim_localtime_js(JS_DATE_MIN_SECONDS - 1, &mut value) };
+    }
 }

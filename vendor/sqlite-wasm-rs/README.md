@@ -50,6 +50,8 @@ async fn open_db() -> anyhow::Result<()> {
         )
     };
     assert_eq!(ffi::SQLITE_OK, ret);
+
+    Ok(())
 }
 ```
 
