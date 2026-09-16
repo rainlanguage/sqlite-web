@@ -1,11 +1,67 @@
 use crate::database_functions::register_custom_functions;
-use crate::messages::SqlBatchStatement;
+use crate::messages::{SnapshotCompression, SqlBatchStatement};
 use crate::util::sanitize_db_filename;
 use base64::Engine;
+use js_sys::{Array, Date, Function, Reflect, Uint8Array};
+use sha2::{Digest, Sha256};
 use sqlite_wasm_rs::export::{install_opfs_sahpool, *};
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{
+    AbortController, DedicatedWorkerGlobalScope, ReadableStream, ReadableStreamDefaultReader,
+    Request, RequestInit, Response,
+};
+
+const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const OPFS_SAH_HEADER_SIZE: u64 = 4096;
+pub(crate) const MAX_SNAPSHOT_SIZE: u64 = JS_MAX_SAFE_INTEGER - OPFS_SAH_HEADER_SIZE;
+
+#[derive(Clone, Default)]
+pub(crate) struct SnapshotCancellation {
+    cancelled: Rc<Cell<bool>>,
+    abort_controller: Rc<RefCell<Option<AbortController>>>,
+}
+
+impl SnapshotCancellation {
+    pub(crate) fn cancel(&self) {
+        self.cancelled.set(true);
+        if let Some(controller) = self.abort_controller.borrow().as_ref() {
+            controller.abort();
+        }
+    }
+
+    fn register(&self, controller: &AbortController) {
+        if self.cancelled.get() {
+            controller.abort();
+        } else {
+            self.abort_controller
+                .borrow_mut()
+                .replace(controller.clone());
+        }
+    }
+
+    fn ensure_active(&self) -> Result<(), String> {
+        if self.cancelled.get() {
+            Err("Snapshot installation cancelled".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotInstallResult {
+    pub bytes_written: u64,
+    pub compression: SnapshotCompression,
+    pub elapsed_ms: f64,
+    pub sha256: String,
+}
 
 // Real SQLite database using sqlite-wasm-rs FFI
 pub struct SQLiteDatabase {
@@ -698,16 +754,9 @@ impl SQLiteDatabase {
         }
     }
 
-    pub async fn initialize_opfs(db_name: &str) -> Result<Self, JsValue> {
-        // Install OPFS VFS and set as default
-        install_opfs_sahpool(None, true)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Failed to install OPFS VFS: {e:?}")))?;
-
-        // Open database with OPFS
+    fn open_opfs_path(db_path: &str) -> Result<Self, JsValue> {
         let mut db: *mut sqlite3 = std::ptr::null_mut();
-        let sanitized = sanitize_db_filename(db_name);
-        let open_uri = format!("opfs-sahpool:{}", sanitized);
+        let open_uri = format!("opfs-sahpool:{db_path}");
         let db_name = CString::new(open_uri.clone()).map_err(|e| {
             JsValue::from_str(&format!(
                 "Invalid database URI (NUL found): {open_uri} ({e})"
@@ -754,6 +803,401 @@ impl SQLiteDatabase {
             db,
             in_transaction: false,
         })
+    }
+
+    fn open_opfs(db_name: &str) -> Result<Self, JsValue> {
+        Self::open_opfs_path(&sanitize_db_filename(db_name))
+    }
+
+    fn snapshot_paths(db_name: &str) -> Result<(String, String, String), String> {
+        let target = sanitize_db_filename(db_name);
+        let staging = format!("{target}.snapshot-staging");
+        let backup = format!("{target}.snapshot-backup");
+        // sqlite-wasm-rs publishes utility names as rooted paths and requires
+        // their complete UTF-8 representation to be strictly shorter than 512.
+        // SQLite also passes the VFS-prefixed spelling through xFullPathname,
+        // including its trailing NUL, before staged validation can open it.
+        let fits_snapshot_path = |path: &str| {
+            format!("/{path}").len() < 512 && "opfs-sahpool:".len() + path.len() + 1 <= 512
+        };
+        if !fits_snapshot_path(&staging) || !fits_snapshot_path(&backup) {
+            return Err("Database name is too long for atomic snapshot installation".to_string());
+        }
+        Ok((target, staging, backup))
+    }
+
+    /// Complete or roll back an interrupted snapshot activation. The commit
+    /// protocol first moves the old target to `backup`, then moves the fully
+    /// validated staging database to `target`. Therefore a missing target plus
+    /// a backup always means activation was interrupted before commit.
+    async fn validate_snapshot_path(path: &str, label: &str) -> Result<(), String> {
+        let mut database =
+            Self::open_opfs_path(path).map_err(|e| format!("Failed to open {label}: {e:?}"))?;
+        let raw = database
+            .exec("PRAGMA quick_check")
+            .await
+            .map_err(|e| format!("{label} failed SQLite integrity validation: {e}"))?;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&raw)
+            .map_err(|e| format!("{label} returned an invalid integrity result: {e}"))?;
+        let valid = rows.len() == 1
+            && rows[0]
+                .get("quick_check")
+                .and_then(serde_json::Value::as_str)
+                == Some("ok");
+        if !valid {
+            return Err(format!("{label} failed SQLite integrity validation: {raw}"));
+        }
+        Ok(())
+    }
+
+    async fn recover_snapshot_activation(
+        util: &OpfsSAHPoolUtil,
+        target: &str,
+        staging: &str,
+        backup: &str,
+    ) -> Result<(), String> {
+        if !util.has_path(target) && util.has_path(backup) {
+            util.rename_path(backup, target)
+                .map_err(|e| format!("Failed to restore snapshot backup: {e:?}"))?;
+        } else if util.has_path(target) && util.has_path(backup) {
+            // Both names exist between activation and verified commit. Never
+            // discard the known-good backup merely because a target exists.
+            match Self::validate_snapshot_path(target, "recovered snapshot").await {
+                Ok(()) => {
+                    util.unlink(backup).map_err(|e| {
+                        format!("Recovered snapshot is valid, but its backup could not be removed: {e:?}")
+                    })?;
+                }
+                Err(validation_error) => {
+                    Self::restore_snapshot_backup(util, target, backup).map_err(|rollback| {
+                        format!("{validation_error}; rollback also failed: {rollback}")
+                    })?;
+                }
+            }
+        }
+
+        if util.has_path(staging) {
+            let _ = util.unlink(staging);
+        }
+        Ok(())
+    }
+
+    fn activate_snapshot(
+        util: &OpfsSAHPoolUtil,
+        target: &str,
+        staging: &str,
+        backup: &str,
+    ) -> Result<bool, String> {
+        if util.has_path(backup) {
+            util.unlink(backup)
+                .map_err(|e| format!("Failed to clear previous snapshot backup: {e:?}"))?;
+        }
+
+        let had_previous = util.has_path(target);
+        if had_previous {
+            util.rename_path(target, backup)
+                .map_err(|e| format!("Failed to preserve current database: {e:?}"))?;
+        }
+
+        if let Err(error) = util.rename_path(staging, target) {
+            if had_previous && util.has_path(backup) && !util.has_path(target) {
+                if let Err(rollback) = util.rename_path(backup, target) {
+                    return Err(format!(
+                        "Failed to activate snapshot: {error:?}; rollback also failed: {rollback:?}"
+                    ));
+                }
+            }
+            return Err(format!("Failed to activate snapshot: {error:?}"));
+        }
+        Ok(had_previous)
+    }
+
+    fn restore_snapshot_backup(
+        util: &OpfsSAHPoolUtil,
+        target: &str,
+        backup: &str,
+    ) -> Result<(), String> {
+        if util.has_path(target) {
+            util.unlink(target)
+                .map_err(|e| format!("Failed to discard invalid activated snapshot: {e:?}"))?;
+        }
+        if util.has_path(backup) {
+            util.rename_path(backup, target)
+                .map_err(|e| format!("Failed to restore previous database: {e:?}"))?;
+        }
+        Ok(())
+    }
+
+    pub async fn initialize_opfs(db_name: &str) -> Result<Self, JsValue> {
+        let util = install_opfs_sahpool(None, true)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Failed to install OPFS VFS: {e:?}")))?;
+        // Snapshot staging names are longer than ordinary database names.
+        // A database which is valid for the VFS must remain openable even if
+        // it is too long to opt into snapshot installation.
+        if let Ok((target, staging, backup)) = Self::snapshot_paths(db_name) {
+            Self::recover_snapshot_activation(&util, &target, &staging, &backup)
+                .await
+                .map_err(|error| {
+                    JsValue::from_str(&format!("Failed to recover snapshot activation: {error}"))
+                })?;
+        }
+        Self::open_opfs(db_name)
+    }
+
+    /// Download a SQLite file and install it directly into OPFS without
+    /// materializing the full response in memory. Compressed snapshots are
+    /// decompressed as a stream in this database worker.
+    /// The caller must close the target database before invoking this method.
+    pub async fn install_snapshot(
+        db_name: &str,
+        url: &str,
+        compression: SnapshotCompression,
+        expected_sha256: &str,
+        expected_uncompressed_size: f64,
+    ) -> Result<(Self, SnapshotInstallResult), String> {
+        Self::install_snapshot_cancellable(
+            db_name,
+            url,
+            compression,
+            expected_sha256,
+            expected_uncompressed_size,
+            SnapshotCancellation::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn install_snapshot_cancellable(
+        db_name: &str,
+        url: &str,
+        compression: SnapshotCompression,
+        expected_sha256: &str,
+        expected_uncompressed_size: f64,
+        cancellation: SnapshotCancellation,
+    ) -> Result<(Self, SnapshotInstallResult), String> {
+        cancellation.ensure_active()?;
+        if !expected_uncompressed_size.is_finite()
+            || expected_uncompressed_size < 512.0
+            || expected_uncompressed_size.fract() != 0.0
+            || expected_uncompressed_size > MAX_SNAPSHOT_SIZE as f64
+        {
+            return Err(format!(
+                "Expected uncompressed size must be an integer between 512 and {MAX_SNAPSHOT_SIZE}"
+            ));
+        }
+        if url.trim().is_empty() {
+            return Err("Snapshot URL is required".to_string());
+        }
+        if expected_sha256.len() != 64
+            || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(
+                "Snapshot SHA-256 must contain exactly 64 hexadecimal characters".to_string(),
+            );
+        }
+        let expected_uncompressed_size = expected_uncompressed_size as u64;
+        let started_at = Date::now();
+        let util = install_opfs_sahpool(None, true)
+            .await
+            .map_err(|e| format!("Failed to install OPFS VFS: {e:?}"))?;
+        let (target, staging, backup) = Self::snapshot_paths(db_name)?;
+        Self::recover_snapshot_activation(&util, &target, &staging, &backup).await?;
+        if util.get_capacity() == util.get_file_count() {
+            util.add_capacity(1)
+                .await
+                .map_err(|e| format!("Failed to allocate snapshot staging space: {e:?}"))?;
+        }
+        let mut importer = util
+            .begin_import_db(&staging)
+            .map_err(|e| format!("Failed to begin snapshot import: {e:?}"))?;
+        let mut hasher = Sha256::new();
+        let mut streamed_bytes = 0u64;
+
+        let global: DedicatedWorkerGlobalScope = js_sys::global()
+            .dyn_into()
+            .map_err(|_| "Snapshot installation must run in a dedicated worker".to_string())?;
+        let abort_controller = AbortController::new()
+            .map_err(|e| format!("Failed to create snapshot abort controller: {e:?}"))?;
+        cancellation.register(&abort_controller);
+        cancellation.ensure_active()?;
+        let request_init = RequestInit::new();
+        request_init.set_signal(Some(&abort_controller.signal()));
+        let request = Request::new_with_str_and_init(url, &request_init)
+            .map_err(|e| format!("Failed to create snapshot request: {e:?}"))?;
+        let response: Response = JsFuture::from(global.fetch_with_request(&request))
+            .await
+            .map_err(|e| format!("Snapshot fetch failed: {e:?}"))?
+            .dyn_into()
+            .map_err(|_| "Snapshot fetch returned an invalid response".to_string())?;
+        if !response.ok() {
+            if let Some(body) = response.body() {
+                let _ = JsFuture::from(body.cancel()).await;
+            }
+            abort_controller.abort();
+            return Err(format!(
+                "Snapshot fetch returned HTTP {} {}",
+                response.status(),
+                response.status_text()
+            ));
+        }
+        let body = match response.body() {
+            Some(body) => body,
+            None => {
+                abort_controller.abort();
+                return Err("Snapshot response did not contain a body".to_string());
+            }
+        };
+
+        let content_result: Result<ReadableStream, String> = match compression {
+            SnapshotCompression::None => Ok(body.clone()),
+            SnapshotCompression::Gzip => (|| {
+                // web-sys still marks DecompressionStream as unstable, so
+                // construct this worker API through reflection.
+                let ctor: Function =
+                    Reflect::get(&js_sys::global(), &JsValue::from_str("DecompressionStream"))
+                        .map_err(|e| format!("DecompressionStream is unavailable: {e:?}"))?
+                        .dyn_into()
+                        .map_err(|_| "DecompressionStream is unavailable".to_string())?;
+                let args = Array::new();
+                args.push(&JsValue::from_str("gzip"));
+                let decompressor = Reflect::construct(&ctor, &args)
+                    .map_err(|e| format!("Failed to create gzip decompressor: {e:?}"))?;
+                let pipe_through: Function =
+                    Reflect::get(body.as_ref(), &JsValue::from_str("pipeThrough"))
+                        .map_err(|e| format!("ReadableStream.pipeThrough is unavailable: {e:?}"))?
+                        .dyn_into()
+                        .map_err(|_| "ReadableStream.pipeThrough is unavailable".to_string())?;
+                pipe_through
+                    .call1(body.as_ref(), &decompressor)
+                    .map_err(|e| format!("Failed to start gzip decompression: {e:?}"))?
+                    .dyn_into::<ReadableStream>()
+                    .map_err(|_| "Gzip decompressor returned an invalid stream".to_string())
+            })(),
+        };
+        let content = match content_result {
+            Ok(content) => content,
+            Err(error) => {
+                let _ = JsFuture::from(body.cancel()).await;
+                abort_controller.abort();
+                return Err(error);
+            }
+        };
+        let reader = match ReadableStreamDefaultReader::new(&content) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = JsFuture::from(content.cancel()).await;
+                abort_controller.abort();
+                return Err(format!("Failed to open snapshot stream: {error:?}"));
+            }
+        };
+
+        let stream_result: Result<(), String> = async {
+            loop {
+                cancellation.ensure_active()?;
+                let item = JsFuture::from(reader.read())
+                    .await
+                    .map_err(|e| format!("Failed while reading snapshot: {e:?}"))?;
+                cancellation.ensure_active()?;
+                let done = Reflect::get(&item, &JsValue::from_str("done"))
+                    .map_err(|e| format!("Invalid stream result: {e:?}"))?
+                    .as_bool()
+                    .unwrap_or(false);
+                if done {
+                    break;
+                }
+                let value = Reflect::get(&item, &JsValue::from_str("value"))
+                    .map_err(|e| format!("Invalid stream chunk: {e:?}"))?;
+                let chunk = Uint8Array::new(&value).to_vec();
+                hasher.update(&chunk);
+                let chunk_len = u64::try_from(chunk.len())
+                    .map_err(|_| "Snapshot chunk size overflow".to_string())?;
+                streamed_bytes = streamed_bytes
+                    .checked_add(chunk_len)
+                    .ok_or_else(|| "Snapshot size overflow".to_string())?;
+                if streamed_bytes > expected_uncompressed_size {
+                    return Err(format!(
+                        "Snapshot exceeded expected size of {:.0} bytes",
+                        expected_uncompressed_size
+                    ));
+                }
+                importer
+                    .write_chunk(&chunk)
+                    .map_err(|e| format!("Failed to write snapshot chunk: {e:?}"))?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = stream_result {
+            let _ = JsFuture::from(reader.cancel()).await;
+            reader.release_lock();
+            abort_controller.abort();
+            return Err(error);
+        }
+        reader.release_lock();
+
+        let actual_sha256 = format!("{:x}", hasher.finalize());
+        cancellation.ensure_active()?;
+        if streamed_bytes != expected_uncompressed_size {
+            return Err(format!(
+                "Snapshot size mismatch: expected {:.0} bytes but received {}",
+                expected_uncompressed_size, streamed_bytes
+            ));
+        }
+        if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+            return Err(format!(
+                "Snapshot SHA-256 mismatch: expected {} but received {}",
+                expected_sha256, actual_sha256
+            ));
+        }
+
+        let bytes_written = importer
+            .finish()
+            .map_err(|e| format!("Failed to finish snapshot import: {e:?}"))?;
+
+        let staging_validation = Self::validate_snapshot_path(&staging, "staged snapshot").await;
+        if let Err(error) = staging_validation {
+            let _ = util.unlink(&staging);
+            return Err(error);
+        }
+
+        // Give the DB worker one task turn to process a cancellation posted
+        // while synchronous importer finalization or quick_check was running.
+        crate::coordination::sleep_ms(0).await;
+        cancellation.ensure_active()?;
+
+        let had_previous = Self::activate_snapshot(&util, &target, &staging, &backup)?;
+        let database_result = async {
+            let database = Self::open_opfs(db_name)
+                .map_err(|e| format!("Failed to open activated snapshot: {e:?}"))?;
+            drop(database);
+            Self::validate_snapshot_path(&target, "activated snapshot").await?;
+            let database = Self::open_opfs(db_name)
+                .map_err(|e| format!("Failed to reopen activated snapshot: {e:?}"))?;
+            Ok::<Self, String>(database)
+        }
+        .await;
+        let database = match database_result {
+            Ok(database) => database,
+            Err(error) => {
+                Self::restore_snapshot_backup(&util, &target, &backup)?;
+                return Err(error);
+            }
+        };
+
+        if had_previous && util.has_path(&backup) {
+            // Activation is already committed and verified. A stale backup is
+            // harmless and startup recovery will retry this cleanup.
+            let _ = util.unlink(&backup);
+        }
+        Ok((
+            database,
+            SnapshotInstallResult {
+                bytes_written,
+                compression,
+                elapsed_ms: Date::now() - started_at,
+                sha256: actual_sha256,
+            },
+        ))
     }
 
     /// Execute a prepared statement, collecting any result rows and the affected row count.
@@ -2447,5 +2891,29 @@ mod tests {
         assert_eq!(array.len(), 2, "Trigger should have inserted two rows");
         assert_eq!(array[0]["msg"].as_str().unwrap(), "insert; happened");
         assert_eq!(array[1]["msg"].as_str().unwrap(), "second; line");
+    }
+
+    #[wasm_bindgen_test]
+    fn snapshot_paths_honor_rooted_opfs_limit() {
+        let accepted = "a".repeat(478);
+        let (_, staging, _) = SQLiteDatabase::snapshot_paths(&accepted).expect("boundary path");
+        assert_eq!("opfs-sahpool:".len() + staging.len() + 1, 512);
+
+        let rejected = "a".repeat(479);
+        assert!(SQLiteDatabase::snapshot_paths(&rejected).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn snapshot_result_bytes_are_exact_js_integers() {
+        let result = SnapshotInstallResult {
+            bytes_written: MAX_SNAPSHOT_SIZE,
+            compression: SnapshotCompression::None,
+            elapsed_ms: 1.0,
+            sha256: "0".repeat(64),
+        };
+        let json = serde_json::to_string(&result).expect("serialize snapshot result");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse snapshot result");
+        assert_eq!(value["bytesWritten"].as_u64(), Some(MAX_SNAPSHOT_SIZE));
+        assert!(MAX_SNAPSHOT_SIZE <= JS_MAX_SAFE_INTEGER);
     }
 }

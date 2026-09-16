@@ -1,5 +1,5 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use js_sys::{Array, Reflect};
@@ -7,8 +7,10 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
+
+const MAX_SNAPSHOT_SIZE: f64 = 9_007_199_254_736_895.0;
 use wasm_bindgen_utils::prelude::*;
-use web_sys::Worker;
+use web_sys::{BroadcastChannel, MessageEvent, Worker};
 
 use crate::errors::SQLiteWasmDatabaseError;
 use crate::messages::WORKER_ERROR_TYPE_INITIALIZATION_PENDING;
@@ -19,6 +21,97 @@ use crate::utils::describe_js_value;
 use crate::worker::{create_worker_from_code, install_onmessage_handler};
 use crate::worker_template::generate_self_contained_worker;
 
+fn sanitize_identifier(name: &str) -> String {
+    let sanitized: String = name
+        .trim()
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => character,
+            _ => '_',
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "db".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn install_snapshot_cancellation_listener(
+    channel: &BroadcastChannel,
+    pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>,
+    pending_snapshots: Rc<RefCell<HashSet<u32>>>,
+    client_id: Rc<RefCell<String>>,
+) {
+    let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let data = event.data();
+        let message_type = Reflect::get(&data, &JsValue::from_str("type"))
+            .ok()
+            .and_then(|value| value.as_string());
+        if message_type.as_deref() != Some("snapshot-cancellation-response") {
+            return;
+        }
+        let Some(query_id) = Reflect::get(&data, &JsValue::from_str("queryId"))
+            .ok()
+            .and_then(|value| value.as_string())
+        else {
+            return;
+        };
+        let prefix = format!("{}:", client_id.borrow());
+        let Some(request_id) = query_id
+            .strip_prefix(&prefix)
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return;
+        };
+        if !pending_snapshots.borrow_mut().remove(&request_id) {
+            return;
+        }
+        let Some((resolve, reject)) = pending_queries.borrow_mut().remove(&request_id) else {
+            return;
+        };
+        let error = Reflect::get(&data, &JsValue::from_str("error"))
+            .ok()
+            .filter(|value| !value.is_null() && !value.is_undefined());
+        if let Some(error) = error {
+            let _ = reject.call1(&JsValue::NULL, &error);
+            return;
+        }
+        let result = Reflect::get(&data, &JsValue::from_str("result"))
+            .ok()
+            .filter(|value| !value.is_null() && !value.is_undefined())
+            .unwrap_or(JsValue::UNDEFINED);
+        let _ = resolve.call1(&JsValue::NULL, &result);
+    }) as Box<dyn FnMut(MessageEvent)>);
+    channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+    onmessage.forget();
+}
+
+async fn yield_main_thread() {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let callback = Closure::once(move || {
+            let _ = resolve.call0(&JsValue::NULL);
+        });
+        if let Some(window) = web_sys::window() {
+            if window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    callback.as_ref().unchecked_ref(),
+                    0,
+                )
+                .is_ok()
+            {
+                callback.forget();
+                return;
+            }
+        }
+        let _ = callback
+            .as_ref()
+            .unchecked_ref::<js_sys::Function>()
+            .call0(&JsValue::NULL);
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
 #[wasm_bindgen]
 pub struct SQLiteWasmDatabase {
     worker: Rc<RefCell<Worker>>,
@@ -26,6 +119,13 @@ pub struct SQLiteWasmDatabase {
     pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>,
     next_request_id: Rc<RefCell<u32>>,
     ready_signal: ReadySignal,
+    worker_stopped: Rc<Cell<bool>>,
+    shutdown_complete: Rc<Cell<bool>>,
+    permanently_closed: Rc<Cell<bool>>,
+    lifecycle_generation: Rc<Cell<u64>>,
+    client_id: Rc<RefCell<String>>,
+    coordination_channel: BroadcastChannel,
+    pending_snapshot_requests: Rc<RefCell<HashSet<u32>>>,
 }
 
 impl Serialize for SQLiteWasmDatabase {
@@ -56,22 +156,207 @@ impl SQLiteWasmDatabase {
     }
 
     fn construct(db_name: &str) -> Result<SQLiteWasmDatabase, SQLiteWasmDatabaseError> {
-        let worker_code = generate_self_contained_worker(db_name);
+        let client_id = format!(
+            "{:.0}-{:016x}",
+            js_sys::Date::now(),
+            (js_sys::Math::random() * u64::MAX as f64) as u64
+        );
+        let worker_code = generate_self_contained_worker(db_name, &client_id);
         let worker = create_worker_from_code(&worker_code)?;
+        let channel_name = format!("sqlite-queries-{}", sanitize_identifier(db_name));
+        let coordination_channel = BroadcastChannel::new(&channel_name)?;
 
         let pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>> =
             Rc::new(RefCell::new(HashMap::new()));
+        let pending_snapshot_requests = Rc::new(RefCell::new(HashSet::new()));
+        let client_id_state = Rc::new(RefCell::new(client_id.clone()));
         let ready_signal = ReadySignal::new();
         install_onmessage_handler(&worker, Rc::clone(&pending_queries), ready_signal.clone());
+        let worker = Rc::new(RefCell::new(worker));
+        let worker_stopped = Rc::new(Cell::new(false));
         let next_request_id = Rc::new(RefCell::new(1u32));
+        install_snapshot_cancellation_listener(
+            &coordination_channel,
+            Rc::clone(&pending_queries),
+            Rc::clone(&pending_snapshot_requests),
+            Rc::clone(&client_id_state),
+        );
 
         Ok(SQLiteWasmDatabase {
-            worker: Rc::new(RefCell::new(worker)),
+            worker,
             db_name: db_name.to_string(),
             pending_queries,
             next_request_id,
             ready_signal,
+            worker_stopped,
+            shutdown_complete: Rc::new(Cell::new(false)),
+            permanently_closed: Rc::new(Cell::new(false)),
+            lifecycle_generation: Rc::new(Cell::new(0)),
+            client_id: client_id_state,
+            coordination_channel,
+            pending_snapshot_requests,
         })
+    }
+
+    fn ensure_open(&self) -> Result<(), SQLiteWasmDatabaseError> {
+        if self.permanently_closed.get() || self.worker_stopped.get() {
+            Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Database is closed",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn advance_lifecycle_generation(&self) -> u64 {
+        let generation = self.lifecycle_generation.get().wrapping_add(1);
+        self.lifecycle_generation.set(generation);
+        generation
+    }
+
+    fn begin_worker_shutdown(&self, reason: &str) {
+        if !self.worker_stopped.replace(true) {
+            self.cancel_forwarded_snapshots();
+        }
+        let error = JsValue::from_str(reason);
+        let snapshot_requests = self.pending_snapshot_requests.borrow();
+        self.pending_queries
+            .borrow_mut()
+            .retain(|request_id, (_, reject)| {
+                if snapshot_requests.contains(request_id) {
+                    true
+                } else {
+                    let _ = reject.call1(&JsValue::NULL, &error);
+                    false
+                }
+            });
+        self.ready_signal.mark_failed(reason.to_string());
+    }
+
+    async fn request_coordinator_shutdown(&self) -> Result<(), SQLiteWasmDatabaseError> {
+        let request_id = {
+            let mut next = self.next_request_id.borrow_mut();
+            let id = *next;
+            *next = next.wrapping_add(1).max(1);
+            id
+        };
+        let message = js_sys::Object::new();
+        Reflect::set(
+            &message,
+            &JsValue::from_str("type"),
+            &JsValue::from_str("shutdown"),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("requestId"),
+            &JsValue::from_f64(request_id as f64),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+
+        let worker = Rc::clone(&self.worker);
+        let pending_queries = Rc::clone(&self.pending_queries);
+        let promise = js_sys::Promise::new(&mut |resolve, reject| {
+            pending_queries
+                .borrow_mut()
+                .insert(request_id, (resolve, reject));
+            if let Err(error) = worker.borrow().post_message(&message) {
+                if let Some((_, reject)) = pending_queries.borrow_mut().remove(&request_id) {
+                    let _ = reject.call1(&JsValue::NULL, &error);
+                }
+            }
+        });
+        JsFuture::from(promise)
+            .await
+            .map(|_| ())
+            .map_err(SQLiteWasmDatabaseError::JsError)
+    }
+
+    fn terminate_worker(&self, reason: &str) {
+        self.worker.borrow().terminate();
+        let error = JsValue::from_str(reason);
+        for (_, (_, reject)) in self.pending_queries.borrow_mut().drain() {
+            let _ = reject.call1(&JsValue::NULL, &error);
+        }
+        self.pending_snapshot_requests.borrow_mut().clear();
+        self.shutdown_complete.set(true);
+    }
+
+    async fn shutdown_worker(&self, reason: &str) -> Result<(), SQLiteWasmDatabaseError> {
+        if self.worker_stopped.get() {
+            while !self.shutdown_complete.get() {
+                yield_main_thread().await;
+            }
+            return Ok(());
+        }
+        self.shutdown_complete.set(false);
+        self.begin_worker_shutdown(reason);
+        let shutdown_result = self.request_coordinator_shutdown().await;
+        if shutdown_result.is_err() {
+            self.terminate_worker(reason);
+            yield_main_thread().await;
+            return shutdown_result;
+        }
+        while !self.pending_snapshot_requests.borrow().is_empty() {
+            yield_main_thread().await;
+        }
+        self.terminate_worker(reason);
+        yield_main_thread().await;
+        shutdown_result
+    }
+
+    fn cancel_forwarded_snapshots(&self) {
+        let client_id = self.client_id.borrow().clone();
+        for request_id in self.pending_snapshot_requests.borrow().iter() {
+            let message = js_sys::Object::new();
+            if Reflect::set(
+                &message,
+                &JsValue::from_str("type"),
+                &JsValue::from_str("cancel-snapshot-request"),
+            )
+            .is_err()
+                || Reflect::set(
+                    &message,
+                    &JsValue::from_str("requesterId"),
+                    &JsValue::from_str(&client_id),
+                )
+                .is_err()
+                || Reflect::set(
+                    &message,
+                    &JsValue::from_str("queryId"),
+                    &JsValue::from_str(&format!("{client_id}:{request_id}")),
+                )
+                .is_err()
+            {
+                continue;
+            }
+            if self.coordination_channel.post_message(&message).is_err() {
+                let fallback = js_sys::Object::new();
+                let configured = Reflect::set(
+                    &fallback,
+                    &JsValue::from_str("type"),
+                    &JsValue::from_str("cancel-forwarded-snapshot"),
+                )
+                .and_then(|_| {
+                    Reflect::set(
+                        &fallback,
+                        &JsValue::from_str("requestId"),
+                        &JsValue::from_f64(*request_id as f64),
+                    )
+                });
+                if configured.is_ok() {
+                    let _ = self.worker.borrow().post_message(&fallback);
+                }
+            }
+        }
+    }
+
+    fn close_permanently(&self, reason: &str) {
+        if !self.permanently_closed.replace(true) {
+            self.advance_lifecycle_generation();
+        }
+        self.begin_worker_shutdown(reason);
+        self.terminate_worker(reason);
     }
 
     fn normalize_params(params: Option<Array>) -> Result<Array, SQLiteWasmDatabaseError> {
@@ -136,6 +421,20 @@ impl SQLiteWasmDatabase {
         })
     }
 
+    fn validate_snapshot_size(uncompressed_size: f64) -> Result<(), SQLiteWasmDatabaseError> {
+        if !uncompressed_size.is_finite()
+            || uncompressed_size < 512.0
+            || uncompressed_size.fract() != 0.0
+            || uncompressed_size > MAX_SNAPSHOT_SIZE
+        {
+            Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Snapshot uncompressed size must be a JavaScript-safe integer supported by OPFS",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     async fn wait_until_ready(&self) -> Result<(), SQLiteWasmDatabaseError> {
         match self.ready_signal.current_state() {
             InitializationState::Ready => return Ok(()),
@@ -173,6 +472,7 @@ impl SQLiteWasmDatabase {
         sql: &str,
         params: Option<Array>,
     ) -> Result<String, SQLiteWasmDatabaseError> {
+        self.ensure_open()?;
         let worker = Rc::clone(&self.worker);
         let pending_queries = Rc::clone(&self.pending_queries);
         let sql = sql.to_string();
@@ -254,6 +554,7 @@ impl SQLiteWasmDatabase {
         &self,
         statements: Array,
     ) -> Result<String, SQLiteWasmDatabaseError> {
+        self.ensure_open()?;
         let worker = Rc::clone(&self.worker);
         let pending_queries = Rc::clone(&self.pending_queries);
         let statements = Self::normalize_batch_statements(statements)?;
@@ -316,20 +617,138 @@ impl SQLiteWasmDatabase {
         Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
     }
 
+    /// Stream a SQLite snapshot into OPFS in the database worker. Only the
+    /// source URL and generic transport/validation metadata cross worker
+    /// boundaries. Supported compression values are `none` and `gzip`.
+    #[wasm_export(js_name = "installSnapshot", unchecked_return_type = "string")]
+    pub async fn install_snapshot(
+        &self,
+        url: &str,
+        #[wasm_export(unchecked_param_type = "\"none\" | \"gzip\"")] compression: &str,
+        sha256: &str,
+        uncompressed_size: f64,
+    ) -> Result<String, SQLiteWasmDatabaseError> {
+        self.ensure_open()?;
+        let url = url.trim();
+        let compression = match compression.trim().to_ascii_lowercase().as_str() {
+            "none" => "none",
+            "gzip" => "gzip",
+            _ => {
+                return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                    "Snapshot compression must be either 'none' or 'gzip'",
+                )))
+            }
+        };
+        let sha256 = sha256.trim();
+        if url.is_empty() {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Snapshot URL is required",
+            )));
+        }
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Snapshot SHA-256 must contain exactly 64 hexadecimal characters",
+            )));
+        }
+        Self::validate_snapshot_size(uncompressed_size)?;
+
+        let worker = Rc::clone(&self.worker);
+        let pending_queries = Rc::clone(&self.pending_queries);
+        let request_id = {
+            let mut n = self.next_request_id.borrow_mut();
+            let id = *n;
+            *n = n.wrapping_add(1).max(1);
+            id
+        };
+        let message = js_sys::Object::new();
+        Reflect::set(
+            &message,
+            &JsValue::from_str("type"),
+            &JsValue::from_str("install-snapshot"),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("requestId"),
+            &JsValue::from_f64(request_id as f64),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(&message, &JsValue::from_str("url"), &JsValue::from_str(url))
+            .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("compression"),
+            &JsValue::from_str(compression),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("sha256"),
+            &JsValue::from_str(sha256),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("uncompressedSize"),
+            &JsValue::from_f64(uncompressed_size),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+
+        let promise = js_sys::Promise::new(&mut |resolve, reject| match worker
+            .borrow()
+            .post_message(&message)
+        {
+            Ok(()) => {
+                pending_queries
+                    .borrow_mut()
+                    .insert(request_id, (resolve, reject));
+                self.pending_snapshot_requests
+                    .borrow_mut()
+                    .insert(request_id);
+            }
+            Err(err) => {
+                let _ = reject.call1(&JsValue::NULL, &err);
+            }
+        });
+        let result = JsFuture::from(promise).await;
+        self.pending_snapshot_requests
+            .borrow_mut()
+            .remove(&request_id);
+        let result = result.map_err(SQLiteWasmDatabaseError::JsError)?;
+        Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
+    }
+
+    /// Cancel outstanding work and terminate this database's worker.
+    /// This operation is idempotent. Callers must await it before calling
+    /// wasm-bindgen's generated `free()` or releasing any external ownership
+    /// lock so forwarded snapshot cancellation is acknowledged first.
+    #[wasm_export(js_name = "close", unchecked_return_type = "void")]
+    pub async fn close(&self) -> Result<(), SQLiteWasmDatabaseError> {
+        if self.permanently_closed.replace(true) {
+            return Ok(());
+        }
+        self.advance_lifecycle_generation();
+        self.shutdown_worker("Database closed").await
+    }
+
     #[wasm_export(js_name = "wipeAndRecreate", unchecked_return_type = "void")]
     pub async fn wipe_and_recreate(&self) -> Result<(), SQLiteWasmDatabaseError> {
-        self.worker.borrow().terminate();
+        self.ensure_open()?;
+        let wipe_generation = self.advance_lifecycle_generation();
+        self.shutdown_worker("Database wipe in progress").await?;
 
-        for (_, (_, reject)) in self.pending_queries.borrow_mut().drain() {
-            let err = JsValue::from_str("Database wipe in progress");
-            let _ = reject.call1(&JsValue::NULL, &err);
+        let deletion_result = delete_opfs_sahpool_directory_with_retries().await;
+
+        if self.permanently_closed.get() || self.lifecycle_generation.get() != wipe_generation {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Database is closed",
+            )));
         }
 
         self.ready_signal.reset();
 
-        let deletion_result = delete_opfs_sahpool_directory_with_retries().await;
-
-        let worker_code = generate_self_contained_worker(&self.db_name);
+        let client_id = self.client_id.borrow().clone();
+        let worker_code = generate_self_contained_worker(&self.db_name, &client_id);
         let new_worker =
             create_worker_from_code(&worker_code).map_err(SQLiteWasmDatabaseError::JsError)?;
 
@@ -340,10 +759,26 @@ impl SQLiteWasmDatabase {
         );
 
         *self.worker.borrow_mut() = new_worker;
+        self.worker_stopped.set(false);
+        self.shutdown_complete.set(false);
 
-        self.wait_until_ready().await?;
+        let ready_result = self.wait_until_ready().await;
+        if self.permanently_closed.get() || self.lifecycle_generation.get() != wipe_generation {
+            self.begin_worker_shutdown("Database closed");
+            self.terminate_worker("Database closed");
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Database is closed",
+            )));
+        }
+        ready_result?;
 
         deletion_result
+    }
+}
+
+impl Drop for SQLiteWasmDatabase {
+    fn drop(&mut self) {
+        self.close_permanently("Database released");
     }
 }
 
@@ -492,6 +927,14 @@ mod tests {
                 .as_deref(),
             Some("77")
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn snapshot_size_enforces_exact_opfs_and_js_boundary() {
+        assert!(SQLiteWasmDatabase::validate_snapshot_size(MAX_SNAPSHOT_SIZE).is_ok());
+        assert!(SQLiteWasmDatabase::validate_snapshot_size(MAX_SNAPSHOT_SIZE + 1.0).is_err());
+        assert!(SQLiteWasmDatabase::validate_snapshot_size(511.0).is_err());
+        assert!(SQLiteWasmDatabase::validate_snapshot_size(512.5).is_err());
     }
 
     #[wasm_bindgen_test]
@@ -686,5 +1129,19 @@ mod tests {
         arr.push(&JsValue::from_f64(f64::NEG_INFINITY));
         let res = db.query("SELECT ?", Some(arr)).await;
         assert!(res.is_err(), "-Infinity should be rejected");
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn close_is_idempotent_and_prevents_new_work() {
+        let db = SQLiteWasmDatabase::new("test_close").await.unwrap();
+        db.close().await.unwrap();
+        db.close().await.unwrap();
+        let error = db.query("SELECT 1", None).await.expect_err("closed DB");
+        match error {
+            SQLiteWasmDatabaseError::JsError(value) => {
+                assert_eq!(value.as_string().as_deref(), Some("Database is closed"));
+            }
+            other => panic!("expected closed JS error, got {other:?}"),
+        }
     }
 }
