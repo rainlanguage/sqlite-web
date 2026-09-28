@@ -1,16 +1,116 @@
 use crate::database_functions::register_custom_functions;
-use crate::messages::SqlBatchStatement;
+use crate::messages::{SqlBatchStatement, SqlImportAction};
 use crate::util::sanitize_db_filename;
 use base64::Engine;
 use sqlite_wasm_rs::export::{install_opfs_sahpool, *};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
+use uuid::Uuid;
 use wasm_bindgen::prelude::*;
+
+const MAX_IMPORT_CHUNK_BYTES: usize = 512 * 1024;
+const MAX_IMPORT_STATEMENT_BYTES: usize = 16 * 1024 * 1024;
+const IMPORT_IDLE_TIMEOUT_MS: f64 = 120_000.0;
+
+struct SqlImportState {
+    id: String,
+    pending: String,
+    scanner: SqlStatementScanner,
+    statement_count: usize,
+    saw_begin: bool,
+    saw_commit: bool,
+    last_activity_ms: f64,
+}
+
+#[derive(Default)]
+struct SqlStatementScanner {
+    offset: usize,
+    mode: SqlScanMode,
+}
+
+#[derive(Clone, Copy, Default)]
+enum SqlScanMode {
+    #[default]
+    Sql,
+    Quoted(u8),
+    Bracket,
+    LineComment,
+    BlockComment,
+}
+
+/// Find a statement boundary without treating semicolons in SQL literals or
+/// comments as delimiters. A trailing partial statement stays in `pending`.
+fn next_sql_statement_end(sql: &str, scanner: &mut SqlStatementScanner) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut i = scanner.offset;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        match scanner.mode {
+            SqlScanMode::Sql => match (byte, next) {
+                (b'\'', _) | (b'"', _) | (b'`', _) => scanner.mode = SqlScanMode::Quoted(byte),
+                (b'[', _) => scanner.mode = SqlScanMode::Bracket,
+                (b'-', Some(b'-')) => {
+                    scanner.mode = SqlScanMode::LineComment;
+                    i += 1;
+                }
+                (b'/', Some(b'*')) => {
+                    scanner.mode = SqlScanMode::BlockComment;
+                    i += 1;
+                }
+                (b'-' | b'/', None) => break,
+                (b';', _) => {
+                    // SQLite knows whether a trigger body is complete. Ordinary
+                    // INSERTs skip this extra parse in the import hot path.
+                    if SQLiteDatabase::first_sql_keyword(sql)
+                        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("CREATE"))
+                    {
+                        let Ok(candidate) = CString::new(&sql[..i + 1]) else {
+                            scanner.offset = i + 1;
+                            return Some(i + 1);
+                        };
+                        if unsafe { sqlite3_complete(candidate.as_ptr()) } == 0 {
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    scanner.offset = i + 1;
+                    return Some(i + 1);
+                }
+                _ => {}
+            },
+            SqlScanMode::Quoted(quote) if byte == quote => {
+                if next == Some(quote) {
+                    i += 1;
+                } else if next.is_none() {
+                    break;
+                } else {
+                    scanner.mode = SqlScanMode::Sql;
+                }
+            }
+            SqlScanMode::Quoted(_) => {}
+            SqlScanMode::Bracket if byte == b']' => scanner.mode = SqlScanMode::Sql,
+            SqlScanMode::Bracket => {}
+            SqlScanMode::LineComment if byte == b'\n' => scanner.mode = SqlScanMode::Sql,
+            SqlScanMode::LineComment => {}
+            SqlScanMode::BlockComment if byte == b'*' && next == Some(b'/') => {
+                scanner.mode = SqlScanMode::Sql;
+                i += 1;
+            }
+            SqlScanMode::BlockComment if byte == b'*' && next.is_none() => break,
+            SqlScanMode::BlockComment => {}
+        }
+        i += 1;
+    }
+    scanner.offset = i;
+    None
+}
 
 // Real SQLite database using sqlite-wasm-rs FFI
 pub struct SQLiteDatabase {
     db: *mut sqlite3,
     in_transaction: bool,
+    import_state: Option<SqlImportState>,
 }
 
 unsafe impl Send for SQLiteDatabase {}
@@ -68,6 +168,187 @@ enum ParamKind {
 }
 
 impl SQLiteDatabase {
+    fn reject_during_import(&self) -> Result<(), String> {
+        if self.import_state.is_some() {
+            Err("SQL dump import is in progress.".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn has_active_import(&self) -> bool {
+        self.import_state.is_some()
+    }
+
+    pub async fn expire_import_if_idle(&mut self) {
+        let expired = self.import_state.as_ref().is_some_and(|state| {
+            js_sys::Date::now() - state.last_activity_ms >= IMPORT_IDLE_TIMEOUT_MS
+        });
+        if expired {
+            self.import_state = None;
+            self.rollback_if_in_transaction().await;
+            self.refresh_transaction_state();
+        }
+    }
+
+    pub async fn import_sql_action(&mut self, action: SqlImportAction) -> Result<String, String> {
+        self.expire_import_if_idle().await;
+        match action {
+            SqlImportAction::Begin => {
+                self.reject_during_import()?;
+                self.refresh_transaction_state();
+                if self.in_transaction {
+                    return Err("Cannot import while a transaction is already open.".to_string());
+                }
+                self.exec_single_statement("BEGIN IMMEDIATE").await?;
+                self.refresh_transaction_state();
+                let id = Uuid::new_v4().to_string();
+                self.import_state = Some(SqlImportState {
+                    id: id.clone(),
+                    pending: String::new(),
+                    scanner: SqlStatementScanner::default(),
+                    statement_count: 0,
+                    saw_begin: false,
+                    saw_commit: false,
+                    last_activity_ms: js_sys::Date::now(),
+                });
+                Ok(id)
+            }
+            SqlImportAction::Chunk { id, sql } => {
+                let mut state = self
+                    .import_state
+                    .take()
+                    .ok_or("No SQL dump import is active.")?;
+                if state.id != id {
+                    self.import_state = Some(state);
+                    return Err("SQL dump import belongs to another session.".to_string());
+                }
+                if sql.len() > MAX_IMPORT_CHUNK_BYTES {
+                    self.rollback_if_in_transaction().await;
+                    self.refresh_transaction_state();
+                    return Err(format!(
+                        "SQL dump chunk exceeds {MAX_IMPORT_CHUNK_BYTES} bytes."
+                    ));
+                }
+                state.pending.push_str(&sql);
+                let result = self.execute_import_chunk(&mut state).await;
+                match result {
+                    Ok(()) => {
+                        state.last_activity_ms = js_sys::Date::now();
+                        self.import_state = Some(state);
+                        Ok("SQL dump chunk imported.".to_string())
+                    }
+                    Err(err) => {
+                        self.rollback_if_in_transaction().await;
+                        self.refresh_transaction_state();
+                        Err(err)
+                    }
+                }
+            }
+            SqlImportAction::Finish { id } => {
+                let state = self
+                    .import_state
+                    .take()
+                    .ok_or("No SQL dump import is active.")?;
+                if state.id != id {
+                    self.import_state = Some(state);
+                    return Err("SQL dump import belongs to another session.".to_string());
+                }
+                let complete_tail = CString::new(state.pending.as_str())
+                    .is_ok_and(|tail| Self::is_trivia_tail_only(tail.as_ptr()));
+                if state.statement_count == 0
+                    || state.saw_begin != state.saw_commit
+                    || !complete_tail
+                {
+                    self.rollback_if_in_transaction().await;
+                    self.refresh_transaction_state();
+                    return Err(
+                        "SQL dump ends with an incomplete statement or contains no statements."
+                            .to_string(),
+                    );
+                }
+                if let Err(err) = self.exec_single_statement("COMMIT").await {
+                    self.rollback_if_in_transaction().await;
+                    self.refresh_transaction_state();
+                    return Err(format!("SQL dump commit failed: {err}"));
+                }
+                self.refresh_transaction_state();
+                Ok(format!(
+                    "Imported {} SQL statements.",
+                    state.statement_count
+                ))
+            }
+            SqlImportAction::Cancel { id } => {
+                let state = self
+                    .import_state
+                    .take()
+                    .ok_or("No SQL dump import is active.")?;
+                if state.id != id {
+                    self.import_state = Some(state);
+                    return Err("SQL dump import belongs to another session.".to_string());
+                }
+                self.rollback_if_in_transaction().await;
+                self.refresh_transaction_state();
+                Ok("SQL dump import cancelled.".to_string())
+            }
+        }
+    }
+
+    async fn execute_import_chunk(&mut self, state: &mut SqlImportState) -> Result<(), String> {
+        let mut consumed = 0;
+        loop {
+            let remaining = &state.pending[consumed..];
+            let Some(end) = next_sql_statement_end(remaining, &mut state.scanner) else {
+                if remaining.len() > MAX_IMPORT_STATEMENT_BYTES {
+                    return Err(format!(
+                        "SQL dump statement exceeds {MAX_IMPORT_STATEMENT_BYTES} bytes."
+                    ));
+                }
+                state.pending.drain(..consumed);
+                return Ok(());
+            };
+            if end > MAX_IMPORT_STATEMENT_BYTES {
+                return Err(format!(
+                    "SQL dump statement exceeds {MAX_IMPORT_STATEMENT_BYTES} bytes."
+                ));
+            }
+            let statement = &remaining[..end];
+            let body = statement.strip_suffix(';').unwrap_or(statement);
+            if !Self::is_sql_trivia_only(body) {
+                let (keyword, tail) = Self::first_sql_keyword_and_tail(statement)
+                    .ok_or("SQL dump contains an invalid statement.")?;
+                if keyword.eq_ignore_ascii_case("BEGIN")
+                    && Self::is_outer_transaction_marker(tail, true)
+                    && !state.saw_begin
+                    && !state.saw_commit
+                {
+                    state.saw_begin = true;
+                } else if (keyword.eq_ignore_ascii_case("COMMIT")
+                    || keyword.eq_ignore_ascii_case("END"))
+                    && Self::is_outer_transaction_marker(tail, false)
+                    && !state.saw_commit
+                {
+                    state.saw_commit = true;
+                } else {
+                    if state.saw_commit || Self::is_transaction_control_statement(statement) {
+                        return Err(
+                            "SQL dump contains an unexpected transaction statement.".to_string()
+                        );
+                    }
+                    self.exec_import_statement(statement).await.map_err(|err| {
+                        format!(
+                            "SQL dump statement {} failed: {err}",
+                            state.statement_count + 1
+                        )
+                    })?;
+                    state.statement_count += 1;
+                }
+            }
+            consumed += end;
+            state.scanner = SqlStatementScanner::default();
+        }
+    }
+
     fn refresh_transaction_state(&mut self) {
         self.in_transaction = unsafe { sqlite3_get_autocommit(self.db) } == 0;
     }
@@ -600,6 +881,25 @@ impl SQLiteDatabase {
         self.exec_prepared_statement(stmt_guard.take())
     }
 
+    /// Execute one import statement without allowing result sets to allocate
+    /// unbounded row arrays (including INSERT ... RETURNING).
+    async fn exec_import_statement(&self, sql: &str) -> Result<(), String> {
+        let sql_cstr = CString::new(sql).map_err(|e| format!("Invalid SQL string: {e}"))?;
+        let ptr = sql_cstr.as_ptr();
+        let (stmt_opt, tail) = self.prepare_one(ptr)?;
+        let Some(stmt) = stmt_opt else {
+            return Err("SQL dump statement is empty.".to_string());
+        };
+        let mut guard = StmtGuard::new(stmt);
+        if !Self::is_trivia_tail_only(tail) {
+            return Err("SQL dump statement contains multiple statements.".to_string());
+        }
+        if unsafe { sqlite3_column_count(stmt) } > 0 {
+            return Err("SQL dump cannot contain row-returning statements.".to_string());
+        }
+        self.exec_prepared_statement(guard.take()).map(|_| ())
+    }
+
     fn is_transaction_control_statement(sql: &str) -> bool {
         let Some(keyword) = Self::first_sql_keyword(sql) else {
             return false;
@@ -611,7 +911,34 @@ impl SQLiteDatabase {
         )
     }
 
+    fn is_outer_transaction_marker(tail: &str, allow_mode: bool) -> bool {
+        let Some(body) = tail.trim().strip_suffix(';') else {
+            return false;
+        };
+        let mut words = body.split_ascii_whitespace().peekable();
+        if allow_mode
+            && words.peek().is_some_and(|word| {
+                ["DEFERRED", "IMMEDIATE", "EXCLUSIVE"]
+                    .iter()
+                    .any(|mode| word.eq_ignore_ascii_case(mode))
+            })
+        {
+            words.next();
+        }
+        if words
+            .peek()
+            .is_some_and(|word| word.eq_ignore_ascii_case("TRANSACTION"))
+        {
+            words.next();
+        }
+        words.next().is_none()
+    }
+
     fn first_sql_keyword(sql: &str) -> Option<&str> {
+        Self::first_sql_keyword_and_tail(sql).map(|(keyword, _)| keyword)
+    }
+
+    fn first_sql_keyword_and_tail(sql: &str) -> Option<(&str, &str)> {
         let bytes = sql.as_bytes();
         let mut i = 0;
 
@@ -656,7 +983,7 @@ impl SQLiteDatabase {
         if i == start {
             None
         } else {
-            Some(&sql[start..i])
+            Some((&sql[start..i], &sql[i..]))
         }
     }
 
@@ -753,6 +1080,7 @@ impl SQLiteDatabase {
         Ok(SQLiteDatabase {
             db,
             in_transaction: false,
+            import_state: None,
         })
     }
 
@@ -831,6 +1159,7 @@ impl SQLiteDatabase {
 
     /// Execute potentially multiple SQL statements
     pub async fn exec(&mut self, sql: &str) -> Result<String, String> {
+        self.reject_during_import()?;
         let trimmed = sql.trim();
 
         // Single-statement mode: execute only the first statement, ignore tail
@@ -923,6 +1252,7 @@ impl SQLiteDatabase {
         sql: &str,
         params: Vec<serde_json::Value>,
     ) -> Result<String, String> {
+        self.reject_during_import()?;
         let (results, affected) = self.exec_single_statement_with_params(sql, params).await?;
 
         self.refresh_transaction_state();
@@ -942,6 +1272,7 @@ impl SQLiteDatabase {
         &mut self,
         statements: Vec<SqlBatchStatement>,
     ) -> Result<String, String> {
+        self.reject_during_import()?;
         if statements.is_empty() {
             return Err("Batch must contain at least one statement.".to_string());
         }
@@ -2447,5 +2778,390 @@ mod tests {
         assert_eq!(array.len(), 2, "Trigger should have inserted two rows");
         assert_eq!(array[0]["msg"].as_str().unwrap(), "insert; happened");
         assert_eq!(array[1]["msg"].as_str().unwrap(), "second; line");
+    }
+
+    #[wasm_bindgen_test]
+    async fn sql_dump_import_accepts_split_statements_and_persists() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+        db.exec("DROP TABLE IF EXISTS dump_chunk_test")
+            .await
+            .unwrap();
+        db.exec("CREATE TABLE dump_chunk_test (id INTEGER PRIMARY KEY, value TEXT)")
+            .await
+            .unwrap();
+
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        db.import_sql_action(SqlImportAction::Chunk {
+            id: id.clone(),
+            sql: "-- dump header\nBEGIN;\nINSERT INTO dump_chunk_test VALUES (1, 'first; value');\nINS".into(),
+        })
+        .await
+        .unwrap();
+        assert!(db.exec("SELECT * FROM dump_chunk_test").await.is_err());
+        db.import_sql_action(SqlImportAction::Chunk {
+            id: id.clone(),
+            sql: "ERT INTO dump_chunk_test VALUES (2, 'second\nvalue');\n/* footer */ COMMIT;\n"
+                .into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.import_sql_action(SqlImportAction::Finish { id })
+                .await
+                .unwrap(),
+            "Imported 2 SQL statements."
+        );
+        drop(db);
+
+        let Some(mut reopened) = get_test_db().await else {
+            return;
+        };
+        let result = reopened
+            .exec("SELECT value FROM dump_chunk_test ORDER BY id")
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rows[0]["value"], "first; value");
+        assert_eq!(rows[1]["value"], "second\nvalue");
+    }
+
+    #[wasm_bindgen_test]
+    async fn sql_dump_import_accepts_cli_transaction_markers_and_empty_statements() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+        db.exec("DROP TABLE IF EXISTS dump_cli_marker_test")
+            .await
+            .unwrap();
+        db.exec("CREATE TABLE dump_cli_marker_test (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        db.import_sql_action(SqlImportAction::Chunk {
+            id: id.clone(),
+            sql: "PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n; /* empty */ ;\nINSERT INTO dump_cli_marker_test VALUES (1);\nCOMMIT;\n".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.import_sql_action(SqlImportAction::Finish { id })
+                .await
+                .unwrap(),
+            "Imported 2 SQL statements."
+        );
+
+        let rows = db
+            .exec("SELECT COUNT(*) AS count FROM dump_cli_marker_test")
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rows).unwrap();
+        assert_eq!(parsed[0]["count"], 1);
+        assert!(SQLiteDatabase::is_outer_transaction_marker(
+            " IMMEDIATE TRANSACTION;",
+            true
+        ));
+        assert!(SQLiteDatabase::is_outer_transaction_marker(
+            " TRANSACTION;",
+            false
+        ));
+    }
+
+    #[wasm_bindgen_test]
+    async fn sql_dump_import_rolls_back_on_invalid_statement() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+        db.exec("DROP TABLE IF EXISTS dump_rollback_test")
+            .await
+            .unwrap();
+        db.exec("CREATE TABLE dump_rollback_test (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        let error = db.import_sql_action(SqlImportAction::Chunk {
+            id,
+            sql: "INSERT INTO dump_rollback_test VALUES (1); INSERT INTO dump_rollback_test (missing) VALUES (2);".into(),
+        }).await.unwrap_err();
+        assert!(error.contains("statement 2 failed"), "{error}");
+        let result = db
+            .exec("SELECT COUNT(*) AS count FROM dump_rollback_test")
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rows[0]["count"], 0);
+    }
+
+    #[wasm_bindgen_test]
+    async fn sql_dump_import_rejects_other_clients_and_cancel_rolls_back() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+        db.exec("DROP TABLE IF EXISTS dump_cancel_test")
+            .await
+            .unwrap();
+        db.exec("CREATE TABLE dump_cancel_test (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        db.import_sql_action(SqlImportAction::Chunk {
+            id: id.clone(),
+            sql: "INSERT INTO dump_cancel_test VALUES (1);".into(),
+        })
+        .await
+        .unwrap();
+        assert!(db.import_sql_action(SqlImportAction::Begin).await.is_err());
+        assert!(db
+            .import_sql_action(SqlImportAction::Cancel { id: "wrong".into() })
+            .await
+            .is_err());
+        assert!(db.exec("SELECT * FROM dump_cancel_test").await.is_err());
+        db.import_sql_action(SqlImportAction::Cancel { id })
+            .await
+            .unwrap();
+        let result = db
+            .exec("SELECT COUNT(*) AS count FROM dump_cancel_test")
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rows[0]["count"], 0);
+    }
+
+    #[wasm_bindgen_test]
+    async fn sql_dump_import_rejects_incomplete_tail_and_expires() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+        db.exec("DROP TABLE IF EXISTS dump_tail_test")
+            .await
+            .unwrap();
+        db.exec("CREATE TABLE dump_tail_test (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        db.import_sql_action(SqlImportAction::Chunk {
+            id: id.clone(),
+            sql: "INSERT INTO dump_tail_test VALUES (1); INSERT INTO dump_tail_test VALUES ("
+                .into(),
+        })
+        .await
+        .unwrap();
+        assert!(db
+            .import_sql_action(SqlImportAction::Finish { id })
+            .await
+            .is_err());
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        db.import_sql_action(SqlImportAction::Chunk {
+            id: id.clone(),
+            sql: "INSERT INTO dump_tail_test VALUES (2);".into(),
+        })
+        .await
+        .unwrap();
+        db.import_state.as_mut().unwrap().last_activity_ms -= IMPORT_IDLE_TIMEOUT_MS + 1.0;
+        db.expire_import_if_idle().await;
+        assert!(db
+            .import_sql_action(SqlImportAction::Finish { id })
+            .await
+            .is_err());
+        let result = db
+            .exec("SELECT COUNT(*) AS count FROM dump_tail_test")
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rows[0]["count"], 0);
+    }
+
+    #[wasm_bindgen_test]
+    async fn sql_dump_import_handles_trigger_body_and_split_quote() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+        db.exec("DROP TABLE IF EXISTS dump_trigger_source")
+            .await
+            .unwrap();
+        db.exec("DROP TABLE IF EXISTS dump_trigger_log")
+            .await
+            .unwrap();
+        db.exec("CREATE TABLE dump_trigger_source (value TEXT)")
+            .await
+            .unwrap();
+        db.exec("CREATE TABLE dump_trigger_log (value TEXT)")
+            .await
+            .unwrap();
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        db.import_sql_action(SqlImportAction::Chunk {
+            id: id.clone(),
+            sql: "CREATE TRIGGER dump_trigger AFTER INSERT ON dump_trigger_source BEGIN INSERT INTO dump_trigger_log VALUES ('first; log'); INSERT INTO dump_trigger_log VALUES (NEW.value); END; INSERT INTO dump_trigger_source VALUES ('split'".into(),
+        }).await.unwrap();
+        db.import_sql_action(SqlImportAction::Chunk {
+            id: id.clone(),
+            sql: ");".into(),
+        })
+        .await
+        .unwrap();
+        db.import_sql_action(SqlImportAction::Finish { id })
+            .await
+            .unwrap();
+        let result = db
+            .exec("SELECT value FROM dump_trigger_log ORDER BY rowid")
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rows[0]["value"], "first; log");
+        assert_eq!(rows[1]["value"], "split");
+    }
+
+    #[wasm_bindgen_test]
+    async fn sql_dump_import_rejects_unterminated_final_comment() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+        db.exec("DROP TABLE IF EXISTS dump_comment_test")
+            .await
+            .unwrap();
+        db.exec("CREATE TABLE dump_comment_test (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        db.import_sql_action(SqlImportAction::Chunk {
+            id: id.clone(),
+            sql: "INSERT INTO dump_comment_test VALUES (1); /* incomplete".into(),
+        })
+        .await
+        .unwrap();
+        assert!(db
+            .import_sql_action(SqlImportAction::Finish { id })
+            .await
+            .is_err());
+        let result = db
+            .exec("SELECT COUNT(*) AS count FROM dump_comment_test")
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rows[0]["count"], 0);
+    }
+
+    #[wasm_bindgen_test]
+    async fn sql_dump_import_requires_closing_transaction_marker() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+        db.exec("DROP TABLE IF EXISTS dump_marker_test")
+            .await
+            .unwrap();
+        db.exec("CREATE TABLE dump_marker_test (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        db.import_sql_action(SqlImportAction::Chunk {
+            id: id.clone(),
+            sql: "BEGIN; INSERT INTO dump_marker_test VALUES (1);".into(),
+        })
+        .await
+        .unwrap();
+        assert!(db
+            .import_sql_action(SqlImportAction::Finish { id })
+            .await
+            .is_err());
+        let result = db
+            .exec("SELECT COUNT(*) AS count FROM dump_marker_test")
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rows[0]["count"], 0);
+    }
+
+    #[wasm_bindgen_test]
+    async fn sql_dump_import_rejects_row_returning_sql_without_leaking_rows() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+        db.exec("DROP TABLE IF EXISTS dump_results_test")
+            .await
+            .unwrap();
+        db.exec("CREATE TABLE dump_results_test (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        let err = db
+            .import_sql_action(SqlImportAction::Chunk {
+                id,
+                sql: "INSERT INTO dump_results_test VALUES (1); SELECT * FROM dump_results_test;"
+                    .into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("row-returning"), "{err}");
+        let result = db
+            .exec("SELECT COUNT(*) AS count FROM dump_results_test")
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rows[0]["count"], 0);
+
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        let err = db
+            .import_sql_action(SqlImportAction::Chunk {
+                id,
+                sql: "INSERT INTO dump_results_test VALUES (2) RETURNING id;".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("row-returning"), "{err}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn sql_dump_import_bounds_chunks_and_rolls_back_on_connection_close() {
+        let Some(mut db) = get_test_db().await else {
+            return;
+        };
+        db.exec("DROP TABLE IF EXISTS dump_close_test")
+            .await
+            .unwrap();
+        db.exec("CREATE TABLE dump_close_test (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        db.import_sql_action(SqlImportAction::Chunk {
+            id: id.clone(),
+            sql: "INSERT INTO dump_close_test VALUES (1);".into(),
+        })
+        .await
+        .unwrap();
+        let oversized = "x".repeat(MAX_IMPORT_CHUNK_BYTES + 1);
+        assert!(db
+            .import_sql_action(SqlImportAction::Chunk {
+                id: id.clone(),
+                sql: oversized,
+            })
+            .await
+            .unwrap_err()
+            .contains("chunk exceeds"));
+        let result = db
+            .exec("SELECT COUNT(*) AS count FROM dump_close_test")
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rows[0]["count"], 0);
+        let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+        db.import_sql_action(SqlImportAction::Chunk {
+            id,
+            sql: "INSERT INTO dump_close_test VALUES (2);".into(),
+        })
+        .await
+        .unwrap();
+        drop(db);
+
+        let Some(mut reopened) = get_test_db().await else {
+            return;
+        };
+        let result = reopened
+            .exec("SELECT COUNT(*) AS count FROM dump_close_test")
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rows[0]["count"], 0);
     }
 }

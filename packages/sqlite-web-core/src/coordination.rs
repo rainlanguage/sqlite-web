@@ -1,6 +1,6 @@
 use js_sys::{Function, Object, Promise, Reflect};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -16,8 +16,8 @@ use web_sys::{
 
 use crate::database::SQLiteDatabase;
 use crate::messages::{
-    ChannelMessage, MainThreadMessage, SqlBatchStatement, WorkerErrorPayload, WorkerMessage,
-    WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
+    ChannelMessage, MainThreadMessage, SqlBatchStatement, SqlImportAction, WorkerErrorPayload,
+    WorkerMessage, WORKER_ERROR_TYPE_INITIALIZATION_PENDING,
 };
 use crate::util::{js_value_to_string, sanitize_identifier, set_js_property};
 
@@ -99,6 +99,9 @@ pub(crate) enum DbJobPayload {
     Batch {
         statements: Vec<SqlBatchStatement>,
     },
+    Import {
+        action: SqlImportAction,
+    },
 }
 
 type DbExecFuture = Pin<Box<dyn Future<Output = Result<String, String>> + 'static>>;
@@ -141,6 +144,7 @@ pub struct CoordinatorState {
     pub db_name: String,
     db_pending: Rc<RefCell<HashMap<u32, DbRequestOrigin>>>,
     pub follower_pending: Rc<RefCell<HashMap<String, u32>>>,
+    follower_pending_imports: RefCell<HashSet<String>>,
     pub next_db_request_id: Rc<RefCell<u32>>,
     db_worker_restart_attempts: Rc<Cell<u32>>,
 }
@@ -150,6 +154,7 @@ pub struct DbWorkerState {
     pub db_name: String,
     db_queue: Rc<RefCell<VecDeque<DbJob>>>,
     db_processing: Rc<Cell<bool>>,
+    import_watchdog_running: Cell<bool>,
     hooks: DbWorkerHooks,
 }
 
@@ -174,6 +179,7 @@ impl CoordinatorState {
             db_name: config.db_name,
             db_pending: Rc::new(RefCell::new(HashMap::new())),
             follower_pending: Rc::new(RefCell::new(HashMap::new())),
+            follower_pending_imports: RefCell::new(HashSet::new()),
             next_db_request_id: Rc::new(RefCell::new(1)),
             db_worker_restart_attempts: Rc::new(Cell::new(0)),
         }))
@@ -203,6 +209,7 @@ impl CoordinatorState {
 
     fn handle_follower_forward_failure(&self, query_id: &str, request_id: u32, err: &str) {
         self.follower_pending.borrow_mut().remove(query_id);
+        self.follower_pending_imports.borrow_mut().remove(query_id);
         let _ = send_query_result_to_main(request_id, Err(err.to_string()));
     }
 
@@ -534,6 +541,46 @@ impl CoordinatorState {
                     }
                 }
             },
+            WorkerMessage::ImportSqlDump { request_id, action } => match *self.role.borrow() {
+                LeadershipRole::Leader => {
+                    if !*self.db_worker_ready.borrow() {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                        );
+                        return;
+                    }
+                    self.forward_import_to_db(DbRequestOrigin::Local { request_id }, action);
+                }
+                LeadershipRole::Follower => {
+                    if !*self.leader_ready.borrow() {
+                        let _ = send_query_result_to_main(
+                            request_id,
+                            Err(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                        );
+                        return;
+                    }
+                    let query_id = Uuid::new_v4().to_string();
+                    self.follower_pending
+                        .borrow_mut()
+                        .insert(query_id.clone(), request_id);
+                    self.follower_pending_imports
+                        .borrow_mut()
+                        .insert(query_id.clone());
+                    // An import request must resolve from the DB worker. A follower-side
+                    // timeout could report failure while a delayed finish still commits.
+                    if let Err(err) = send_channel_message(
+                        &self.channel,
+                        &ChannelMessage::ImportRequest {
+                            query_id: query_id.clone(),
+                            action,
+                        },
+                    ) {
+                        self.handle_follower_forward_failure(&query_id, request_id, &err);
+                        let _ = send_worker_error_message(&err);
+                    }
+                }
+            },
         }
     }
 
@@ -610,12 +657,29 @@ impl CoordinatorState {
                     self.forward_batch_to_db(DbRequestOrigin::Forwarded { query_id }, statements);
                 }
             }
+            ChannelMessage::ImportRequest { query_id, action } => {
+                if matches!(*self.role.borrow(), LeadershipRole::Leader) {
+                    if !*self.db_worker_ready.borrow() {
+                        let _ = send_channel_message(
+                            &self.channel,
+                            &ChannelMessage::QueryResponse {
+                                query_id,
+                                result: None,
+                                error: Some(WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string()),
+                            },
+                        );
+                        return;
+                    }
+                    self.forward_import_to_db(DbRequestOrigin::Forwarded { query_id }, action);
+                }
+            }
             ChannelMessage::QueryResponse {
                 query_id,
                 result,
                 error,
             } => {
                 if let Some(request_id) = self.follower_pending.borrow_mut().remove(&query_id) {
+                    self.follower_pending_imports.borrow_mut().remove(&query_id);
                     let outcome = match (result, error) {
                         (Some(res), _) => Ok(res),
                         (_, Some(err)) => Err(err),
@@ -721,6 +785,32 @@ impl CoordinatorState {
         self.post_db_worker_message(worker, db_request_id, msg);
     }
 
+    fn forward_import_to_db(self: &Rc<Self>, origin: DbRequestOrigin, action: SqlImportAction) {
+        let worker = {
+            let borrow = self.db_worker.borrow();
+            let Some(worker) = borrow.as_ref() else {
+                self.fail_origin(origin, WORKER_ERROR_TYPE_INITIALIZATION_PENDING.to_string());
+                return;
+            };
+            worker.clone()
+        };
+        let db_request_id = {
+            let mut next = self.next_db_request_id.borrow_mut();
+            let id = *next;
+            *next = next.wrapping_add(1).max(1);
+            id
+        };
+        self.db_pending.borrow_mut().insert(db_request_id, origin);
+        self.post_db_worker_message(
+            worker,
+            db_request_id,
+            WorkerMessage::ImportSqlDump {
+                request_id: db_request_id,
+                action,
+            },
+        );
+    }
+
     fn post_db_worker_message(&self, worker: Worker, db_request_id: u32, msg: WorkerMessage) {
         match serde_wasm_bindgen::to_value(&msg) {
             Ok(val) => {
@@ -805,6 +895,24 @@ impl CoordinatorState {
     }
 
     fn mark_leader_known(&self, leader_id: String) {
+        if self
+            .leader_id
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current != &leader_id)
+        {
+            for query_id in self.follower_pending_imports.borrow_mut().drain() {
+                if let Some(request_id) = self.follower_pending.borrow_mut().remove(&query_id) {
+                    let _ = send_query_result_to_main(
+                        request_id,
+                        Err(
+                            "Leader changed before SQL dump import response; outcome unknown."
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+        }
         *self.leader_id.borrow_mut() = Some(leader_id);
     }
 
@@ -830,6 +938,7 @@ impl DbWorkerState {
             db_name: config.db_name,
             db_queue: Rc::new(RefCell::new(VecDeque::new())),
             db_processing: Rc::new(Cell::new(false)),
+            import_watchdog_running: Cell::new(false),
             hooks,
         })
     }
@@ -844,6 +953,28 @@ impl DbWorkerState {
                 }
                 Err(err) => {
                     let _ = send_worker_error_message(&js_value_to_string(&err));
+                }
+            }
+        });
+    }
+
+    fn start_import_watchdog(self: &Rc<Self>) {
+        if self.import_watchdog_running.replace(true) {
+            return;
+        }
+        let state = Rc::clone(self);
+        spawn_local(async move {
+            loop {
+                sleep_ms(30_000).await;
+                let db = state.db.borrow_mut().take();
+                if let Some(mut database) = db {
+                    database.expire_import_if_idle().await;
+                    let active = database.has_active_import();
+                    *state.db.borrow_mut() = Some(database);
+                    if !active {
+                        state.import_watchdog_running.set(false);
+                        break;
+                    }
                 }
             }
         });
@@ -864,10 +995,28 @@ impl DbWorkerState {
             } => {
                 self.enqueue_job(request_id, DbJobPayload::Batch { statements });
             }
+            WorkerMessage::ImportSqlDump { request_id, action } => {
+                self.enqueue_job(request_id, DbJobPayload::Import { action });
+            }
         }
     }
 
     fn enqueue_job(self: &Rc<Self>, request_id: u32, payload: DbJobPayload) {
+        if matches!(&payload, DbJobPayload::Import { .. })
+            && self
+                .db_queue
+                .borrow()
+                .iter()
+                .any(|job| matches!(&job.payload, DbJobPayload::Import { .. }))
+        {
+            if let Ok(response) = make_query_result_message(
+                request_id,
+                Err("Wait for the previous SQL dump import request to finish".to_string()),
+            ) {
+                (self.hooks.deliver)(&response);
+            }
+            return;
+        }
         self.db_queue.borrow_mut().push_back(DbJob {
             request_id,
             payload,
@@ -891,7 +1040,16 @@ impl DbWorkerState {
                 let db = Rc::clone(&state.db);
                 let exec = Rc::clone(&hooks.exec);
                 let deliver = Rc::clone(&hooks.deliver);
+                let starts_import = matches!(
+                    &job.payload,
+                    DbJobPayload::Import {
+                        action: SqlImportAction::Begin
+                    }
+                );
                 let result = exec.as_ref()(db, job.payload).await;
+                if starts_import && result.is_ok() {
+                    state.start_import_watchdog();
+                }
                 match make_query_result_message(job.request_id, result) {
                     Ok(resp) => deliver.as_ref()(&resp),
                     Err(err) => {
@@ -1044,12 +1202,14 @@ async fn exec_on_db(
     let db_opt = db.borrow_mut().take();
     let result = match db_opt {
         Some(mut database) => {
+            database.expire_import_if_idle().await;
             let result = match payload {
                 DbJobPayload::Query { sql, params } => match params {
                     Some(p) => database.exec_with_params(&sql, p).await,
                     None => database.exec(&sql).await,
                 },
                 DbJobPayload::Batch { statements } => database.exec_batch(statements).await,
+                DbJobPayload::Import { action } => database.import_sql_action(action).await,
             };
             *db.borrow_mut() = Some(database);
             result
@@ -1062,7 +1222,7 @@ async fn exec_on_db(
 pub async fn sleep_ms(ms: i32) {
     let promise = js_sys::Promise::new(&mut |resolve, _| {
         let resolve_for_timeout = resolve.clone();
-        let closure = Closure::once(move || {
+        let callback = Closure::once_into_js(move || {
             let _ = resolve_for_timeout.call0(&JsValue::NULL);
         });
 
@@ -1072,7 +1232,7 @@ pub async fn sleep_ms(ms: i32) {
             .and_then(|scope| {
                 scope
                     .set_timeout_with_callback_and_timeout_and_arguments_0(
-                        closure.as_ref().unchecked_ref(),
+                        callback.unchecked_ref(),
                         ms,
                     )
                     .map(|_| ())
@@ -1081,7 +1241,7 @@ pub async fn sleep_ms(ms: i32) {
             .or_else(|_| {
                 web_sys::window().ok_or(()).and_then(|win| {
                     win.set_timeout_with_callback_and_timeout_and_arguments_0(
-                        closure.as_ref().unchecked_ref(),
+                        callback.unchecked_ref(),
                         ms,
                     )
                     .map(|_| ())
@@ -1090,10 +1250,8 @@ pub async fn sleep_ms(ms: i32) {
             });
 
         if timeout_result.is_err() {
-            let _ = resolve.call0(&JsValue::NULL);
+            let _ = callback.unchecked_ref::<Function>().call0(&JsValue::NULL);
         }
-
-        closure.forget();
     });
     let _ = JsFuture::from(promise).await;
 }
@@ -1181,6 +1339,35 @@ mod tests {
             !state.follower_pending.borrow().contains_key("query-1"),
             "failed follower forwards should not wait for timeout cleanup"
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn leader_change_clears_pending_imports_only() {
+        let state = CoordinatorState::new(WorkerConfig {
+            db_name: "testdb-import-leader-change".to_string(),
+            follower_timeout_ms: 10.0,
+            query_timeout_ms: 50.0,
+        })
+        .expect("state");
+        state.mark_leader_known("old-leader".to_string());
+        state
+            .follower_pending
+            .borrow_mut()
+            .insert("import-1".to_string(), 42);
+        state
+            .follower_pending_imports
+            .borrow_mut()
+            .insert("import-1".to_string());
+        state
+            .follower_pending
+            .borrow_mut()
+            .insert("query-1".to_string(), 43);
+
+        state.mark_leader_known("new-leader".to_string());
+
+        assert!(!state.follower_pending.borrow().contains_key("import-1"));
+        assert!(state.follower_pending_imports.borrow().is_empty());
+        assert!(state.follower_pending.borrow().contains_key("query-1"));
     }
 
     #[wasm_bindgen_test(async)]

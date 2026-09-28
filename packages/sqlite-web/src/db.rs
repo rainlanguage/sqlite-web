@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -25,6 +25,7 @@ pub struct SQLiteWasmDatabase {
     db_name: String,
     pending_queries: Rc<RefCell<HashMap<u32, (js_sys::Function, js_sys::Function)>>>,
     next_request_id: Rc<RefCell<u32>>,
+    import_request_in_flight: Cell<bool>,
     ready_signal: ReadySignal,
 }
 
@@ -70,6 +71,7 @@ impl SQLiteWasmDatabase {
             db_name: db_name.to_string(),
             pending_queries,
             next_request_id,
+            import_request_in_flight: Cell::new(false),
             ready_signal,
         })
     }
@@ -314,6 +316,139 @@ impl SQLiteWasmDatabase {
             }
         };
         Ok(result.as_string().unwrap_or_else(|| format!("{result:?}")))
+    }
+
+    /// Begin an atomic SQL dump import. Append bounded text chunks, then finish
+    /// to commit. A failure or cancellation rolls the entire import back.
+    #[wasm_export(js_name = "beginSqlDumpImport", unchecked_return_type = "string")]
+    pub async fn begin_sql_dump_import(&self) -> Result<String, SQLiteWasmDatabaseError> {
+        self.send_import_action("begin", None, None).await
+    }
+
+    /// Append up to 512 KiB of SQL text. Chunks may split a SQL statement.
+    /// The dump's outer BEGIN/COMMIT statements are accepted but owned by the worker.
+    #[wasm_export(js_name = "appendSqlDumpChunk", unchecked_return_type = "string")]
+    pub async fn append_sql_dump_chunk(
+        &self,
+        id: &str,
+        sql: JsValue,
+    ) -> Result<String, SQLiteWasmDatabaseError> {
+        if self.import_request_in_flight.get() {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Wait for the previous SQL dump import request to finish",
+            )));
+        }
+        if !sql.is_string() {
+            let _ = self.cancel_sql_dump_import(id).await;
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "SQL dump chunk must be a string",
+            )));
+        }
+        if js_sys::JsString::from(sql.clone()).length() > 512 * 1024 {
+            let _ = self.cancel_sql_dump_import(id).await;
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "SQL dump chunk exceeds 512 KiB",
+            )));
+        }
+        if sql.as_string().is_some_and(|text| text.len() > 512 * 1024) {
+            let _ = self.cancel_sql_dump_import(id).await;
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "SQL dump chunk exceeds 512 KiB",
+            )));
+        }
+        self.send_import_action("chunk", Some(id), Some(sql)).await
+    }
+
+    /// Commit all imported statements. A partial trailing statement rolls back.
+    #[wasm_export(js_name = "finishSqlDumpImport", unchecked_return_type = "string")]
+    pub async fn finish_sql_dump_import(
+        &self,
+        id: &str,
+    ) -> Result<String, SQLiteWasmDatabaseError> {
+        self.send_import_action("finish", Some(id), None).await
+    }
+
+    /// Roll back the active import.
+    #[wasm_export(js_name = "cancelSqlDumpImport", unchecked_return_type = "string")]
+    pub async fn cancel_sql_dump_import(
+        &self,
+        id: &str,
+    ) -> Result<String, SQLiteWasmDatabaseError> {
+        self.send_import_action("cancel", Some(id), None).await
+    }
+
+    async fn send_import_action(
+        &self,
+        kind: &str,
+        id: Option<&str>,
+        sql: Option<JsValue>,
+    ) -> Result<String, SQLiteWasmDatabaseError> {
+        if let InitializationState::Failed(reason) = self.ready_signal.current_state() {
+            return Err(SQLiteWasmDatabaseError::InitializationFailed(reason));
+        }
+        let action = js_sys::Object::new();
+        Reflect::set(
+            &action,
+            &JsValue::from_str("kind"),
+            &JsValue::from_str(kind),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        if let Some(id) = id {
+            Reflect::set(&action, &JsValue::from_str("id"), &JsValue::from_str(id))
+                .map_err(SQLiteWasmDatabaseError::JsError)?;
+        }
+        if let Some(sql) = sql {
+            Reflect::set(&action, &JsValue::from_str("sql"), &sql)
+                .map_err(SQLiteWasmDatabaseError::JsError)?;
+        }
+        let message = js_sys::Object::new();
+        Reflect::set(
+            &message,
+            &JsValue::from_str("type"),
+            &JsValue::from_str("import-sql-dump"),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        let request_id = {
+            let mut next = self.next_request_id.borrow_mut();
+            let id = *next;
+            *next = next.wrapping_add(1).max(1);
+            id
+        };
+        Reflect::set(
+            &message,
+            &JsValue::from_str("requestId"),
+            &JsValue::from_f64(request_id as f64),
+        )
+        .map_err(SQLiteWasmDatabaseError::JsError)?;
+        Reflect::set(&message, &JsValue::from_str("action"), &action)
+            .map_err(SQLiteWasmDatabaseError::JsError)?;
+        if self.import_request_in_flight.replace(true) {
+            return Err(SQLiteWasmDatabaseError::JsError(JsValue::from_str(
+                "Wait for the previous SQL dump import request to finish",
+            )));
+        }
+        let worker = Rc::clone(&self.worker);
+        let pending = Rc::clone(&self.pending_queries);
+        let promise = js_sys::Promise::new(&mut |resolve, reject| match worker
+            .borrow()
+            .post_message(&message)
+        {
+            Ok(()) => {
+                pending.borrow_mut().insert(request_id, (resolve, reject));
+            }
+            Err(err) => {
+                let _ = reject.call1(&JsValue::NULL, &err);
+            }
+        });
+        let outcome = JsFuture::from(promise).await;
+        self.import_request_in_flight.set(false);
+        match outcome {
+            Ok(value) => Ok(value.as_string().unwrap_or_else(|| format!("{value:?}"))),
+            Err(err) if is_initialization_pending_error(&err) => {
+                Err(SQLiteWasmDatabaseError::InitializationPending)
+            }
+            Err(err) => Err(SQLiteWasmDatabaseError::JsError(err)),
+        }
     }
 
     #[wasm_export(js_name = "wipeAndRecreate", unchecked_return_type = "void")]
