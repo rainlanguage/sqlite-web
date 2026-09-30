@@ -21,6 +21,15 @@ pub struct SqlBatchStatement {
     pub params: Option<Vec<serde_json::Value>>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum SqlImportAction {
+    Begin,
+    Chunk { id: String, sql: String },
+    Finish { id: String },
+    Cancel { id: String },
+}
+
 // Message types for BroadcastChannel communication
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type")]
@@ -49,6 +58,12 @@ pub enum ChannelMessage {
         #[serde(rename = "queryId")]
         query_id: String,
         statements: Vec<SqlBatchStatement>,
+    },
+    #[serde(rename = "import-request")]
+    ImportRequest {
+        #[serde(rename = "queryId")]
+        query_id: String,
+        action: SqlImportAction,
     },
     #[serde(rename = "query-response")]
     QueryResponse {
@@ -82,6 +97,12 @@ pub enum WorkerMessage {
         #[serde(rename = "requestId")]
         request_id: u32,
         statements: Vec<SqlBatchStatement>,
+    },
+    #[serde(rename = "import-sql-dump")]
+    ImportSqlDump {
+        #[serde(rename = "requestId")]
+        request_id: u32,
+        action: SqlImportAction,
     },
 }
 
@@ -240,6 +261,31 @@ mod tests {
             }
             other => panic!("expected ExecuteBatch, got {other:?}"),
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn test_import_message_wire_format() {
+        let begin = WorkerMessage::ImportSqlDump {
+            request_id: 5,
+            action: SqlImportAction::Begin,
+        };
+        assert_serialization_roundtrip(begin, "import-sql-dump", |json| {
+            assert!(json.contains("\"requestId\":5"));
+            assert!(json.contains("\"kind\":\"begin\""));
+        });
+
+        let chunk = ChannelMessage::ImportRequest {
+            query_id: "query-1".to_string(),
+            action: SqlImportAction::Chunk {
+                id: "import-1".to_string(),
+                sql: "INSERT INTO data VALUES (1);".to_string(),
+            },
+        };
+        assert_serialization_roundtrip(chunk, "import-request", |json| {
+            assert!(json.contains("\"queryId\":\"query-1\""));
+            assert!(json.contains("\"kind\":\"chunk\""));
+            assert!(json.contains("\"id\":\"import-1\""));
+        });
     }
 
     #[wasm_bindgen_test]
