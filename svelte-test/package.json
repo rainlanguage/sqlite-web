@@ -32,6 +32,7 @@
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"test": "vitest run",
+		"test:benchmark": "vitest run --config vitest.benchmark.config.js",
 		"test:browser": "vitest --browser",
 		"test:ui": "vitest --ui --browser",
 		"lint": "eslint --fix src",

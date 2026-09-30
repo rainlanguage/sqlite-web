@@ -345,7 +345,9 @@ impl SQLiteWasmDatabase {
     }
 
     /// Begin an atomic SQL dump import. Append bounded text chunks, then finish
-    /// to commit. A failure or cancellation rolls the entire import back.
+    /// to commit. SQL validation/execution failures and cancellation roll back.
+    /// Worker loss during finish can leave the commit outcome unknown, including
+    /// when the coordinator returns an error; check or reset before retrying.
     #[wasm_export(js_name = "beginSqlDumpImport", unchecked_return_type = "string")]
     pub async fn begin_sql_dump_import(&self) -> Result<String, SQLiteWasmDatabaseError> {
         self.send_import_action("begin", None, None).await

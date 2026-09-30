@@ -1002,21 +1002,6 @@ impl DbWorkerState {
     }
 
     fn enqueue_job(self: &Rc<Self>, request_id: u32, payload: DbJobPayload) {
-        if matches!(&payload, DbJobPayload::Import { .. })
-            && self
-                .db_queue
-                .borrow()
-                .iter()
-                .any(|job| matches!(&job.payload, DbJobPayload::Import { .. }))
-        {
-            if let Ok(response) = make_query_result_message(
-                request_id,
-                Err("Wait for the previous SQL dump import request to finish".to_string()),
-            ) {
-                (self.hooks.deliver)(&response);
-            }
-            return;
-        }
         self.db_queue.borrow_mut().push_back(DbJob {
             request_id,
             payload,

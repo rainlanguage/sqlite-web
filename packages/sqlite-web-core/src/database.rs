@@ -256,16 +256,19 @@ impl SQLiteDatabase {
                 }
                 let complete_tail = CString::new(state.pending.as_str())
                     .is_ok_and(|tail| Self::is_trivia_tail_only(tail.as_ptr()));
-                if state.statement_count == 0
-                    || state.saw_begin != state.saw_commit
-                    || !complete_tail
-                {
+                let validation_error = if state.saw_begin != state.saw_commit {
+                    Some("SQL dump contains unmatched transaction markers.")
+                } else if !complete_tail {
+                    Some("SQL dump ends with an incomplete statement.")
+                } else if state.statement_count == 0 {
+                    Some("SQL dump contains no executable statements.")
+                } else {
+                    None
+                };
+                if let Some(error) = validation_error {
                     self.rollback_if_in_transaction().await;
                     self.refresh_transaction_state();
-                    return Err(
-                        "SQL dump ends with an incomplete statement or contains no statements."
-                            .to_string(),
-                    );
+                    return Err(error.to_string());
                 }
                 if let Err(err) = self.exec_single_statement("COMMIT").await {
                     self.rollback_if_in_transaction().await;
@@ -360,8 +363,8 @@ impl SQLiteDatabase {
                                 state.statement_count + 1
                             )
                         })?;
+                        state.statement_count += 1;
                     }
-                    state.statement_count += 1;
                 }
             }
             consumed += end;
@@ -2903,7 +2906,7 @@ mod tests {
             db.import_sql_action(SqlImportAction::Finish { id })
                 .await
                 .unwrap(),
-            "Imported 2 SQL statements."
+            "Imported 1 SQL statements."
         );
 
         let rows = db
@@ -2920,6 +2923,66 @@ mod tests {
             " TRANSACTION;",
             false
         ));
+    }
+
+    #[wasm_bindgen_test]
+    async fn sql_dump_import_rejects_empty_dumps_and_unmatched_markers() {
+        let mut db =
+            get_import_test_db("sql_dump_import_rejects_empty_dumps_and_unmatched_markers");
+        for sql in [
+            "",
+            "; /* empty */ ;",
+            "BEGIN; COMMIT;",
+            "PRAGMA foreign_keys=OFF; BEGIN TRANSACTION; COMMIT;",
+        ] {
+            let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+            db.import_sql_action(SqlImportAction::Chunk {
+                id: id.clone(),
+                sql: sql.into(),
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                db.import_sql_action(SqlImportAction::Finish { id })
+                    .await
+                    .unwrap_err(),
+                "SQL dump contains no executable statements.",
+                "{sql}"
+            );
+            assert!(!db.has_active_import());
+            assert_eq!(unsafe { sqlite3_get_autocommit(db.db) }, 1);
+        }
+
+        db.exec("DROP TABLE IF EXISTS dump_unmatched_marker_test")
+            .await
+            .unwrap();
+        for sql in [
+            "COMMIT;",
+            "BEGIN; CREATE TABLE dump_unmatched_marker_test (id INTEGER);",
+        ] {
+            let id = db.import_sql_action(SqlImportAction::Begin).await.unwrap();
+            db.import_sql_action(SqlImportAction::Chunk {
+                id: id.clone(),
+                sql: sql.into(),
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                db.import_sql_action(SqlImportAction::Finish { id })
+                    .await
+                    .unwrap_err(),
+                "SQL dump contains unmatched transaction markers.",
+                "{sql}"
+            );
+            assert!(!db.has_active_import());
+            assert_eq!(unsafe { sqlite3_get_autocommit(db.db) }, 1);
+            assert_eq!(
+                db.exec("SELECT name FROM sqlite_master WHERE name = 'dump_unmatched_marker_test'")
+                    .await
+                    .unwrap(),
+                "[]"
+            );
+        }
     }
 
     #[wasm_bindgen_test]
