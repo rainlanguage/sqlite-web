@@ -6,6 +6,9 @@ on:
 jobs:
   release:
     if: ${{ github.ref == 'refs/heads/main' && !startsWith(github.event.head_commit.message, 'NPM Package Release') }}
+    concurrency:
+      group: sqlite-web-npm-release
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -70,14 +73,14 @@ jobs:
       - name: Get Old Hash
         run: |
           OLD_HASH=$(npm view @rainlanguage/sqlite-web dist.shasum 2>/dev/null || echo "none")
-          echo "OLD_HASH=$OLD_HASH" >> $GITHUB_ENV
+          echo "OLD_HASH=$OLD_HASH" >> "$GITHUB_ENV"
           echo "old hash: $OLD_HASH"
       # Build the package and calc hash
       - name: Build and Get New Hash
         run: |
           nix develop -c local-bundle
           NEW_HASH=$(cd pkg && npm pack --silent | xargs shasum | cut -c1-40)
-          echo "NEW_HASH=$NEW_HASH" >> $GITHUB_ENV
+          echo "NEW_HASH=$NEW_HASH" >> "$GITHUB_ENV"
           echo "new hash: $NEW_HASH"
           rm -f pkg/*.tgz
       # from here on, we'll skip if OLD_HASH and NEW_HASH are the same (ie no publish)
@@ -86,9 +89,10 @@ jobs:
       - name: Set Version
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
-          NEW_NPM_VERSION=$(npm --prefix pkg version patch --no-git-tag-version)
-          NEW_VERSION=${NEW_NPM_VERSION#v}
-          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+          PUBLISHED_VERSIONS=$(npm view @rainlanguage/sqlite-web versions --json)
+          NEW_VERSION=$(node scripts/next-release-version.mjs "$PUBLISHED_VERSIONS")
+          npm --prefix pkg version "$NEW_VERSION" --no-git-tag-version
+          echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
           for manifest in packages/sqlite-web/Cargo.toml packages/sqlite-web-core/Cargo.toml; do
             sed -i.bak "s/^version = \".*\"/version = \"$NEW_VERSION\"/" "$manifest"
             rm "$manifest".bak
@@ -99,7 +103,7 @@ jobs:
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: |
           cd pkg
-          echo "NPM_PACKAGE=$(npm pack --silent)" >> $GITHUB_ENV
+          echo "NPM_PACKAGE=$(npm pack --silent)" >> "$GITHUB_ENV"
       - name: Rename sqlite-web NPM Package Tarball
         if: ${{ env.OLD_HASH != env.NEW_HASH }}
         run: mv pkg/${{ env.NPM_PACKAGE }} sqlite_web_npm_package_${{ env.NEW_VERSION }}.tgz

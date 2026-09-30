@@ -1,10 +1,8 @@
 name: Test WASM
 on: [push]
-
 concurrency:
   group: ${{ github.ref }}-wasm
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
 jobs:
   test:
     permissions:
@@ -18,7 +16,6 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-
       - uses: nixbuild/nix-quick-install-action@v30
         with:
           nix_conf: |
@@ -35,11 +32,9 @@ jobs:
           # before trying to save a new cache
           # 1G = 1073741824
           gc-max-store-size-linux: 1G
-
+      - name: Test release version selection
+        run: nix develop -c node --test scripts/next-release-version.test.mjs
       - run: nix develop -c build-submodules
-
       - run: nix develop -c local-bundle
-
       - run: nix develop -c rainix-rs-static
-
       - run: nix develop -c test-wasm
